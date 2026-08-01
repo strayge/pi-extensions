@@ -1,0 +1,44 @@
+{
+  "name": "pi-usage",
+  "version": "0.1.0",
+  "description": "Pi extension that shows current-account usage for the active model provider.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "usage",
+    "quota",
+    "codex",
+    "openrouter"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "biome check . && tsc --noEmit && npm test",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.6",
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@earendil-works/pi-tui": "0.82.1",
+    "@types/node": "26.1.1",
+    "typescript": "7.0.2"
+  }
+}

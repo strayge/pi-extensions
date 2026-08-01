@@ -1,0 +1,37 @@
+{
+  "name": "pi-attention",
+  "version": "0.1.0",
+  "description": "Pi extension that chimes when a turn finishes while the terminal is unfocused.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "notification"
+  ],
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "biome check . && tsc --noEmit",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.6",
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@types/node": "26.1.1",
+    "typescript": "7.0.2"
+  }
+}

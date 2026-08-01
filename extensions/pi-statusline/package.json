@@ -1,0 +1,40 @@
+{
+  "name": "pi-statusline",
+  "version": "0.1.0",
+  "description": "Pi extension that replaces the footer with a configurable, text-only statusline.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "statusline",
+    "footer"
+  ],
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "biome check . && tsc --noEmit && npm test",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.6",
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@earendil-works/pi-tui": "0.82.1",
+    "@types/node": "26.1.1",
+    "typescript": "7.0.2"
+  }
+}

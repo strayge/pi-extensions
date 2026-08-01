@@ -1,0 +1,197 @@
+/**
+ * A configurable, text-only statusline for pi.
+ *
+ * Replaces the built-in footer with a layout the user owns: lines of items,
+ * separators, and a left/right splitter, all described by a JSON file. The
+ * shipped default reproduces pi's own footer exactly, so installing this
+ * extension is visually a no-op until the layout is edited.
+ *
+ * Other extensions can publish their own items over pi's event bus — see
+ * `slots.ts` for the protocol.
+ */
+
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ReadonlyFooterDataProvider,
+} from "@earendil-works/pi-coding-agent";
+import { configPath, loadConfig } from "./config.ts";
+import { runEditor } from "./editor.ts";
+import { createFooterFactory } from "./footer.ts";
+import { type GitStatus, gitStatusEqual, readGitStatus } from "./git-status.ts";
+import { createRuntime, resetRuntime, toolEnded, toolStarted } from "./runtime.ts";
+import { SlotRegistry } from "./slots.ts";
+import type { StatuslineConfig } from "./types.ts";
+
+const GIT_STATUS_DEBOUNCE_MS = 400;
+
+export default function statusline(pi: ExtensionAPI) {
+  const runtime = createRuntime();
+  let config: StatuslineConfig = loadConfig().config;
+  let activeContext: ExtensionContext | undefined;
+  let requestRender: (() => void) | undefined;
+  let footerData: ReadonlyFooterDataProvider | undefined;
+
+  const refresh = () => requestRender?.();
+  const slots = new SlotRegistry(pi, refresh);
+  slots.listen();
+
+  // Git status is the one item that costs a subprocess, so it is only kept up
+  // to date while something in the layout actually asks for it.
+  let gitTimer: ReturnType<typeof setTimeout> | undefined;
+  let gitInFlight = false;
+  let gitPending = false;
+
+  const wantsGitStatus = () =>
+    config.lines.some((line) =>
+      line.some((item) => item.type === "git_status" && item.hidden !== true),
+    );
+
+  const setGitStatus = (status: GitStatus | undefined) => {
+    if (gitStatusEqual(runtime.gitStatus, status)) return;
+    runtime.gitStatus = status;
+    refresh();
+  };
+
+  const runGitStatus = async () => {
+    const ctx = activeContext;
+    if (!ctx || !wantsGitStatus()) return;
+    if (gitInFlight) {
+      gitPending = true;
+      return;
+    }
+    gitInFlight = true;
+    try {
+      setGitStatus(await readGitStatus(pi, ctx.cwd));
+    } catch {
+      setGitStatus(undefined);
+    } finally {
+      gitInFlight = false;
+      if (gitPending) {
+        gitPending = false;
+        void runGitStatus();
+      }
+    }
+  };
+
+  const scheduleGitStatus = () => {
+    if (!wantsGitStatus()) return;
+    if (gitTimer) clearTimeout(gitTimer);
+    gitTimer = setTimeout(() => {
+      gitTimer = undefined;
+      void runGitStatus();
+    }, GIT_STATUS_DEBOUNCE_MS);
+  };
+
+  const reloadConfig = (): string[] => {
+    const loaded = loadConfig();
+    config = loaded.config;
+    refresh();
+    scheduleGitStatus();
+    return loaded.warnings;
+  };
+
+  const footerFactory = createFooterFactory({
+    getConfig: () => config,
+    getContext: () => activeContext,
+    runtime,
+    slots,
+    onRequestRender: (request) => {
+      requestRender = request;
+    },
+    onFooterData: (data) => {
+      footerData = data;
+    },
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    activeContext = ctx;
+    resetRuntime(runtime);
+
+    if (!ctx.hasUI || ctx.mode !== "tui") return;
+
+    // Re-installed per session rather than once: pi disposes the previous
+    // component before calling the factory again, so this also re-arms the
+    // render hook if anything else took the footer away in between.
+    ctx.ui.setFooter(footerFactory);
+
+    const warnings = reloadConfig();
+    for (const warning of warnings) ctx.ui.notify(`statusline: ${warning}`, "warning");
+
+    // Producers may have loaded before this extension; ask them to re-publish.
+    slots.request();
+    void runGitStatus();
+  });
+
+  pi.on("session_shutdown", () => {
+    if (gitTimer) clearTimeout(gitTimer);
+    gitTimer = undefined;
+    slots.clear();
+    activeContext = undefined;
+  });
+
+  pi.on("turn_start", () => {
+    runtime.turnCount += 1;
+    runtime.isStreaming = true;
+    refresh();
+  });
+
+  pi.on("turn_end", () => {
+    runtime.isStreaming = false;
+    refresh();
+  });
+
+  pi.on("message_end", () => refresh());
+  pi.on("model_select", () => refresh());
+  pi.on("thinking_level_select", () => refresh());
+  pi.on("session_info_changed", () => refresh());
+  pi.on("session_compact", () => refresh());
+
+  pi.on("tool_execution_start", (event) => {
+    toolStarted(runtime, event.toolName);
+    refresh();
+  });
+
+  pi.on("tool_execution_end", (event) => {
+    toolEnded(runtime, event.toolName);
+    refresh();
+    scheduleGitStatus();
+  });
+
+  pi.on("agent_settled", () => {
+    runtime.isStreaming = false;
+    refresh();
+    scheduleGitStatus();
+  });
+
+  pi.registerCommand("statusline", {
+    description: "Edit the statusline layout",
+    handler: async (args, ctx) => {
+      const trimmed = args.trim();
+
+      if (trimmed === "reload") {
+        const warnings = reloadConfig();
+        for (const warning of warnings) ctx.ui.notify(`statusline: ${warning}`, "warning");
+        ctx.ui.notify(`Reloaded ${configPath()}`, "info");
+        return;
+      }
+
+      if (trimmed === "path") {
+        ctx.ui.notify(configPath(), "info");
+        return;
+      }
+
+      await runEditor(ctx, {
+        getConfig: () => config,
+        setConfig: (next) => {
+          config = next;
+          refresh();
+          scheduleGitStatus();
+        },
+        slots,
+        runtime,
+        getFooterData: () => footerData,
+      });
+    },
+  });
+}
