@@ -37,6 +37,9 @@ import {
   type ItemColor,
   type ItemConfig,
   type ItemType,
+  type SlotFieldSpec,
+  type SlotItemConfig,
+  type SlotRegistration,
   type StatuslineConfig,
   TIME_FORMATS,
 } from "./types.ts";
@@ -239,6 +242,11 @@ interface FieldSpec {
   options?: readonly string[];
   /** Shown when the value is unset, i.e. the built-in behaviour. */
   fallback: string;
+  /** Where the value is written. Options a producer declared live under the
+   *  item's `options`, out of the way of `icon`, `color` and the rest. */
+  container?: "options";
+  min?: number;
+  max?: number;
 }
 
 export async function runEditor(ctx: ExtensionCommandContext, deps: EditorDeps): Promise<void> {
@@ -398,6 +406,7 @@ export class LayoutEditor {
       runtime: this.deps.runtime,
       usage: collectUsage(this.ctx),
       slots: this.deps.slots,
+      preview: true,
       now: Date.now(),
     };
   }
@@ -500,11 +509,24 @@ export class LayoutEditor {
       for (const [id, text] of footerData.getExtensionStatuses()) found.set(id, sanitize(text));
     }
     for (const slot of this.deps.slots.all()) found.set(slot.id, slot.text);
+    // A producer that registered but has not published yet still belongs in the
+    // catalog: `render` is what a placed item would draw from anyway.
+    for (const registration of this.deps.slots.registered()) {
+      const rendered = this.deps.slots.render(registration.id, {}, { preview: true });
+      if (rendered) {
+        found.set(registration.id, rendered.segments.map((segment) => segment.text).join(""));
+      } else if (!found.has(registration.id)) {
+        found.set(registration.id, "");
+      }
+    }
 
     return [...found]
-      .filter(([, text]) => text.length > 0)
+      .filter(([id, text]) => text.length > 0 || this.deps.slots.registration(id) !== undefined)
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([id, text]) => [id, truncateToWidth(text, CATALOG_HINT_WIDTH, ELLIPSIS)]);
+      .map(([id, text]) => [
+        id,
+        text.length > 0 ? truncateToWidth(text, CATALOG_HINT_WIDTH, ELLIPSIS) : "(no value yet)",
+      ]);
   }
 
   private chip(text: string, style: (value: string) => string): Chip {
@@ -778,9 +800,29 @@ export class LayoutEditor {
   private openFields(): void {
     const item = this.currentItem();
     if (!item) return;
-    this.fields = fieldsFor(item.type);
+    this.fields = fieldsFor(item, this.deps.slots);
     this.fieldIndex = 0;
     this.mode = "fields";
+  }
+
+  /**
+   * The record a field writes to, creating `options` on demand.
+   *
+   * Empty option bags are pruned by `commitInput` and `activateField` so a slot
+   * the user opened and left alone does not gain an `"options": {}` in the file.
+   */
+  private fieldTarget(item: ItemConfig, field: FieldSpec): Record<string, unknown> {
+    const record = item as unknown as Record<string, unknown>;
+    if (field.container !== "options") return record;
+    if (!isRecord(record.options)) record.options = {};
+    return record.options as Record<string, unknown>;
+  }
+
+  private pruneOptions(item: ItemConfig): void {
+    const record = item as unknown as Record<string, unknown>;
+    if (isRecord(record.options) && Object.keys(record.options).length === 0) {
+      delete record.options;
+    }
   }
 
   private handleFieldsInput(data: string): void {
@@ -807,7 +849,7 @@ export class LayoutEditor {
     const field = this.fields[this.fieldIndex];
     if (!item || !field) return;
 
-    const target = item as unknown as Record<string, unknown>;
+    const target = this.fieldTarget(item, field);
 
     if (field.kind === "boolean") {
       target[field.key] = !(target[field.key] === true);
@@ -823,11 +865,13 @@ export class LayoutEditor {
       const next = field.options[(at + 1) % field.options.length];
       if (next === "auto" && field.key === "color") delete target[field.key];
       else target[field.key] = next;
+      this.pruneOptions(item);
       return;
     }
 
     this.inputField = field;
     this.inputBuffer = target[field.key] === undefined ? "" : String(target[field.key]);
+    this.pruneOptions(item);
     this.pasting = false;
     this.pasteBuffer = "";
     this.mode = "input";
@@ -898,13 +942,14 @@ export class LayoutEditor {
     this.inputField = undefined;
     if (!item || !field) return;
 
-    const target = item as unknown as Record<string, unknown>;
+    const target = this.fieldTarget(item, field);
 
     if (field.kind === "number") {
       const value = Number.parseFloat(this.inputBuffer);
       if (this.inputBuffer.trim().length === 0) delete target[field.key];
-      else if (Number.isFinite(value)) target[field.key] = value;
+      else if (Number.isFinite(value)) target[field.key] = clampField(value, field);
       else this.message = `${field.label} must be a number`;
+      this.pruneOptions(item);
       return;
     }
 
@@ -912,11 +957,12 @@ export class LayoutEditor {
     // says so: validation drops an item whose `id` is empty, so accepting the
     // blank would make the item disappear later, at save time, unexplained.
     if (this.inputBuffer.length === 0) {
-      if (field.key === "text" || field.key === "id") {
+      if (field.container !== "options" && (field.key === "text" || field.key === "id")) {
         this.message = `${field.label} cannot be empty`;
         return;
       }
       delete target[field.key];
+      this.pruneOptions(item);
       return;
     }
     target[field.key] = this.inputBuffer;
@@ -978,7 +1024,12 @@ const COMMON_FIELDS: FieldSpec[] = [
   { key: "priority", label: "priority", kind: "number", fallback: "50" },
 ];
 
-function fieldsFor(type: ItemType): FieldSpec[] {
+/**
+ * The option rows for one item: its own type's settings, then anything the
+ * extension behind a `slot` registered, then the settings every item shares.
+ */
+function fieldsFor(item: ItemConfig, slots: SlotRegistry): FieldSpec[] {
+  const type = item.type;
   const specific: FieldSpec[] = [];
   switch (type) {
     case "cwd":
@@ -1058,11 +1109,74 @@ function fieldsFor(type: ItemType): FieldSpec[] {
   if (type === "split") return [];
   // A separator's text is emitted verbatim, so decoration would do nothing.
   if (type === "sep") return [...specific, ...COMMON_FIELDS.filter((f) => !SEP_IGNORES.has(f.key))];
+  if (type === "slot") {
+    const registration = slots.registration((item as SlotItemConfig).id);
+    return [...specific, ...schemaFields(registration), ...COMMON_FIELDS];
+  }
   return [...specific, ...COMMON_FIELDS];
 }
 
+/**
+ * Turn a producer's declared schema into editor rows.
+ *
+ * The "unset" text comes from the values the producer announced, so a field
+ * nobody has touched reads as whatever its own config currently says — and
+ * keeps reading that way when the producer's config changes underneath.
+ */
+function schemaFields(registration: SlotRegistration | undefined): FieldSpec[] {
+  if (!registration) return [];
+  return registration.fields.map((field) => {
+    const announced = registration.defaults?.[field.key];
+    const spec: FieldSpec = {
+      key: field.key,
+      label: field.label,
+      kind: field.kind,
+      container: "options",
+      // Spelled the way the row's own value will be, so an unset field and a
+      // set one read alike: `(on)` against `on`, never `(true)`.
+      fallback:
+        announced === undefined
+          ? unsetText(field)
+          : typeof announced === "boolean"
+            ? announced
+              ? "on"
+              : "off"
+            : String(announced),
+    };
+    if (field.options) spec.options = field.options;
+    if (field.min !== undefined) spec.min = field.min;
+    if (field.max !== undefined) spec.max = field.max;
+    return spec;
+  });
+}
+
+/** What a field with no announced default behaves as, spelled for the editor. */
+function unsetText(field: SlotFieldSpec): string {
+  if (field.kind === "boolean") return "off";
+  if (field.kind === "enum") return field.options?.[0] ?? "";
+  return "none";
+}
+
+function clampField(value: number, field: FieldSpec): number {
+  let result = value;
+  if (field.min !== undefined) result = Math.max(field.min, result);
+  if (field.max !== undefined) result = Math.min(field.max, result);
+  return result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function fieldValueText(item: ItemConfig, field: FieldSpec): string {
-  const value = (item as unknown as Record<string, unknown>)[field.key];
+  const record = item as unknown as Record<string, unknown>;
+  const container =
+    field.container === "options" && isRecord(record.options)
+      ? (record.options as Record<string, unknown>)
+      : field.container === "options"
+        ? {}
+        : record;
+  const value = container[field.key];
   if (value === undefined) return `(${field.fallback})`;
   if (typeof value === "boolean") return value ? "on" : "off";
   if (typeof value === "string") return field.key === "text" ? `"${value}"` : value;

@@ -15,6 +15,9 @@ export function formatTokens(count: number): string {
   return `${Math.round(count / 1_000_000)}M`;
 }
 
+const ESCAPE = 0x1b;
+const CSI_PARAMETER = /[0-9;?]/;
+
 /** Eight fill levels in one column. Block elements, so never double-width. */
 const GAUGE_LEVELS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
@@ -68,6 +71,33 @@ export function sanitize(text: string): string {
     .replace(/[\r\n\t]/g, " ")
     .replace(/ +/g, " ")
     .trim();
+}
+
+/**
+ * Remove ANSI escape sequences outright, parameters included.
+ *
+ * Applied to text another extension rendered, where `sanitizeLiteral`'s visible
+ * residue would be the wrong answer: a producer is handed a `color` per segment,
+ * so an escape it emitted anyway is a mistake, and the reset at the end of one
+ * would cancel the styling of everything after it on the line.
+ */
+export function stripAnsi(text: string): string {
+  const characters = [...text];
+  let result = "";
+  for (let index = 0; index < characters.length; index += 1) {
+    if ((characters[index]?.codePointAt(0) ?? 0) !== ESCAPE) {
+      result += characters[index];
+      continue;
+    }
+    // CSI is `ESC [ params intermediates final`; the final byte is dropped by
+    // the loop's own increment. Any other escape loses its introducer, which
+    // covers everything a status producer can plausibly emit.
+    index += 1;
+    if (characters[index] !== "[") continue;
+    index += 1;
+    while (index < characters.length && CSI_PARAMETER.test(characters[index] ?? "")) index += 1;
+  }
+  return result;
 }
 
 /**

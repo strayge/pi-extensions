@@ -20,7 +20,13 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { SlotItem } from "./types.ts";
+import type {
+  SlotFieldSpec,
+  SlotItem,
+  SlotOptions,
+  SlotRenderEnv,
+  SlotRenderResult,
+} from "./types.ts";
 
 export type SlotDefinition = Omit<SlotItem, "text">;
 
@@ -50,4 +56,75 @@ export function publishStatuslineItem(
     current = text;
     send();
   };
+}
+
+export interface SlotSchemaDefinition extends SlotDefinition {
+  /** Bump when the meaning of a key changes, so a stored shape is detectable. */
+  version: number;
+  fields: SlotFieldSpec[];
+  /** Read at announce time, so the editor's "unset" text follows your config. */
+  defaults?: () => SlotOptions;
+  render?: (options: SlotOptions, env: SlotRenderEnv) => SlotRenderResult;
+  /** The layout's values for this slot, sent when the user changes them.
+   *  `instances` holds every placement; the first is the conventional one. */
+  onOptions?: (options: SlotOptions, instances: SlotOptions[]) => void;
+}
+
+/**
+ * Register an option schema and a renderer for one slot.
+ *
+ * `render` is called synchronously while the statusline paints, and again while
+ * the user cycles options in the layout editor — with the *pending* values, so
+ * the preview is exact and nothing has to be persisted to try a setting out.
+ * Keep it pure and quick: no I/O, no awaiting, and no throwing, though a throw
+ * costs the slot rather than the session.
+ *
+ *   const slot = registerStatuslineSlot(pi, {
+ *     id: "usage",
+ *     version: 1,
+ *     fields: [{ key: "barWidth", label: "bar width", kind: "number", min: 1, max: 40 }],
+ *     defaults: () => ({ barWidth: config.barWidth }),
+ *     render: (options, env) => draw(options, env.preview),
+ *     onOptions: (options) => save({ ...config, ...options }),
+ *   });
+ */
+export function registerStatuslineSlot(
+  pi: ExtensionAPI,
+  definition: SlotSchemaDefinition,
+): { dispose: () => void; refresh: () => void } {
+  const { defaults, onOptions, ...rest } = definition;
+
+  const announce = () => {
+    pi.events.emit("statusline:register", { ...rest, defaults: defaults?.() });
+  };
+
+  const unsubscribeRequest = pi.events.on("statusline:request", announce);
+  const unsubscribeOptions = pi.events.on("statusline:options", (data) => {
+    if (!onOptions || !isRecord(data) || data.id !== definition.id) return;
+    const instances = Array.isArray(data.instances)
+      ? data.instances
+          .filter(isRecord)
+          .map((entry) => (isRecord(entry.options) ? (entry.options as SlotOptions) : {}))
+      : [];
+    onOptions(instances[0] ?? {}, instances);
+    // The handler just changed the config `defaults` reads from, and those are
+    // what an unset field shows: re-announce so it keeps naming the truth.
+    announce();
+  });
+
+  announce();
+
+  return {
+    dispose: () => {
+      unsubscribeRequest();
+      unsubscribeOptions();
+      pi.events.emit("statusline:unregister", { id: definition.id });
+    },
+    /** Call when your own config changed elsewhere, so the defaults follow. */
+    refresh: announce,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

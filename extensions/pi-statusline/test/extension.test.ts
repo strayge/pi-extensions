@@ -59,9 +59,14 @@ test("it subscribes to the slot bus at activation, before any session starts", (
   const pi = stubPi();
   statusline(pi.api);
 
-  // Producers may publish before the first session_start; if the registry only
-  // listened from then on, those items would be lost until a republish.
-  assert.deepEqual(pi.busChannels().sort(), ["statusline:clear", "statusline:publish"]);
+  // Producers may publish or register before the first session_start; if the
+  // registry only listened from then on, those would be lost until a republish.
+  assert.deepEqual(pi.busChannels().sort(), [
+    "statusline:clear",
+    "statusline:publish",
+    "statusline:register",
+    "statusline:unregister",
+  ]);
 });
 
 test("a publish before any session does not throw", () => {

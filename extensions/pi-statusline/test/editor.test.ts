@@ -737,3 +737,109 @@ test("anything validation drops on save is reported rather than swallowed", () =
   assert.deepEqual(shape(result() as StatuslineConfig), [[]]);
   assert.match(warnings().join(" "), /slot item without "id"/);
 });
+
+/** A producer's schema, as it arrives over the bus. */
+function usageRegistration(extra: Record<string, unknown> = {}) {
+  return {
+    id: "usage",
+    version: 1,
+    fields: [
+      { key: "quota", label: "quota", kind: "enum", options: ["bar+%", "% only", "off"] },
+      { key: "barWidth", label: "bar width", kind: "number", min: 1, max: 40 },
+      { key: "reset", label: "reset time", kind: "boolean" },
+    ],
+    defaults: { quota: "bar+%", barWidth: 8, reset: true },
+    render: (options: Record<string, unknown>) =>
+      `${options.quota ?? "bar+%"}/${options.barWidth ?? 8}`,
+    ...extra,
+  };
+}
+
+test("a slot's option screen lists what its extension registered", () => {
+  const start = validateConfig({ lines: [[{ type: "slot", id: "usage" }]] }).config;
+  const { editor, press } = harness(start, true, { registrations: [usageRegistration()] });
+
+  press(ENTER);
+  const screen = editor.render(80).join("\n");
+
+  // Each row reads as the producer's own label, and an untouched field shows the
+  // value that producer announced — so it tracks its own config, not a copy.
+  assert.match(screen, /quota: \(bar\+%\)/);
+  assert.match(screen, /bar width: \(8\)/);
+  assert.match(screen, /reset time: \(on\)/);
+});
+
+test("editing a registered option writes it under the item's options", () => {
+  const start = validateConfig({ lines: [[{ type: "slot", id: "usage" }]] }).config;
+  const { press, result } = harness(start, true, { registrations: [usageRegistration()] });
+
+  // The `id` row comes first, so the producer's own fields start one below;
+  // `w` only saves from the layout screen, hence the escape on the way out.
+  press(ENTER, DOWN, ENTER, ESC, "w");
+
+  const item = (result() as StatuslineConfig).lines[0]?.[0] as {
+    options?: Record<string, unknown>;
+  };
+  // Cycling starts from the first declared value, so one press moves past it.
+  assert.deepEqual(item.options, { quota: "% only" });
+});
+
+test("a registered option never collides with the item's own settings", () => {
+  const registration = usageRegistration({
+    fields: [{ key: "color", label: "their color", kind: "enum", options: ["red", "green"] }],
+    defaults: { color: "red" },
+  });
+  const start = validateConfig({ lines: [[{ type: "slot", id: "usage" }]] }).config;
+  const { press, result } = harness(start, true, { registrations: [registration] });
+
+  // The producer's `color` is the second row (after `id`); the item's own
+  // `color` lives further down among the common fields.
+  press(ENTER, DOWN, ENTER, ESC, "w");
+
+  const item = (result() as StatuslineConfig).lines[0]?.[0] as {
+    color?: string;
+    options?: Record<string, unknown>;
+  };
+  assert.deepEqual(item.options, { color: "green" });
+  assert.equal(item.color, undefined);
+});
+
+test("the option preview redraws from values that were never saved", () => {
+  const start = validateConfig({ lines: [[{ type: "slot", id: "usage" }]] }).config;
+  const { editor, press } = harness(start, true, { registrations: [usageRegistration()] });
+
+  assert.match(editor.render(80).join("\n"), /bar\+%\/8/);
+  press(ENTER, DOWN, ENTER);
+  assert.match(editor.render(80).join("\n"), /% only\/8/);
+
+  // Discarding leaves the layout as it was, preview included.
+  press(ESC, ESC);
+});
+
+test("opening and leaving an option screen adds no empty options bag", () => {
+  const start = validateConfig({ lines: [[{ type: "slot", id: "usage" }]] }).config;
+  const { press, result } = harness(start, true, { registrations: [usageRegistration()] });
+
+  press(ENTER, ESC, "w");
+  assert.deepEqual((result() as StatuslineConfig).lines[0]?.[0], { type: "slot", id: "usage" });
+});
+
+test("a slot with no registration still offers the shared settings", () => {
+  const start = validateConfig({ lines: [[{ type: "slot", id: "usage" }]] }).config;
+  const { editor, press } = harness(start, true);
+
+  press(ENTER);
+  const screen = editor.render(80).join("\n");
+  assert.match(screen, /id: usage/);
+  assert.match(screen, /priority: \(50\)/);
+});
+
+test("the catalog lists a producer that registered but has not published", () => {
+  const { editor, press } = harness(defaultConfig(), true, {
+    registrations: [usageRegistration({ render: () => undefined })],
+  });
+
+  // Extension entries sit after every built-in type, past the catalog window.
+  press("a", ...new Array(ITEM_TYPES.length).fill(DOWN));
+  assert.match(editor.render(80).join("\n"), /slot:usage\s+\(no value yet\)/);
+});

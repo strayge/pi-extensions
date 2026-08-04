@@ -45,6 +45,11 @@ export interface FakeOptions {
   usage?: Partial<UsageTotals>;
   statuses?: Record<string, string>;
   slots?: SlotItem[];
+  /** Producers announcing an option schema and a `render` function. */
+  registrations?: unknown[];
+  /** Supply one to keep a handle on the bus after building the env. */
+  registry?: SlotRegistry;
+  preview?: boolean;
   runtime?: Partial<RuntimeState>;
 }
 
@@ -84,8 +89,9 @@ export function fakeEnv(options: FakeOptions = {}): Omit<RenderEnv, "placedStatu
     onBranchChange: () => () => {},
   } as unknown as ReadonlyFooterDataProvider;
 
-  const slots = createRegistry();
+  const slots = options.registry ?? createRegistry();
   for (const slot of options.slots ?? []) publish(slots, slot);
+  for (const registration of options.registrations ?? []) register(slots, registration);
 
   return {
     ctx,
@@ -100,6 +106,7 @@ export function fakeEnv(options: FakeOptions = {}): Omit<RenderEnv, "placedStatu
       ...options.usage,
     },
     slots,
+    preview: options.preview ?? false,
     now: Date.UTC(2026, 0, 2, 3, 4, 5),
   };
 }
@@ -108,6 +115,15 @@ export function fakeEnv(options: FakeOptions = {}): Omit<RenderEnv, "placedStatu
 export function publish(registry: SlotRegistry, slot: SlotItem): void {
   const bus = busFor(registry);
   bus.emit("statusline:publish", slot);
+}
+
+/** The same for the schema half: a producer announcing its options and renderer. */
+export function register(registry: SlotRegistry, registration: unknown): void {
+  busFor(registry).emit("statusline:register", registration);
+}
+
+export function unregister(registry: SlotRegistry, id: string): void {
+  busFor(registry).emit("statusline:unregister", { id });
 }
 
 export function clearSlot(registry: SlotRegistry, id: string): void {

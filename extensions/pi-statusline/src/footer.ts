@@ -69,6 +69,7 @@ export function createFooterFactory(deps: FooterDeps) {
           runtime: deps.runtime,
           usage: collectUsage(ctx),
           slots: deps.slots,
+          preview: false,
           now: Date.now(),
         });
       },

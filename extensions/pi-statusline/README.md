@@ -248,6 +248,65 @@ publish(undefined);   // hide
 to type that by hand: any extension currently saying something appears at the end
 of the `a` catalog in the editor as `slot:<id>`, with its current text alongside.
 
+### Extension-owned options
+
+A producer can go further and register an option schema plus the function that
+draws with it. Its settings then appear in `/statusline` alongside the built-in
+ones, and the preview at the top updates as you cycle them — because the
+statusline calls back into the extension with the values you have not saved yet.
+
+```typescript
+const slot = registerStatuslineSlot(pi, {
+  id: "usage",
+  version: 1,
+  fields: [
+    { key: "quota", label: "quota", kind: "enum", options: ["bar+%", "% only", "off"] },
+    { key: "barWidth", label: "bar width", kind: "number", min: 1, max: 40 },
+  ],
+  defaults: () => ({ quota: currentQuotaMode(), barWidth: config.barWidth }),
+  render: (options, env) => [
+    { text: bar(options), color: "warning" },
+    { text: ` ${percent(options)}` },
+  ],
+  onOptions: (options) => save({ ...config, ...options }),
+});
+```
+
+Values live in the item, so two placements of the same slot can differ:
+
+```jsonc
+{ "type": "slot", "id": "usage", "options": { "quota": "% only", "barWidth": 20 } }
+```
+
+| Piece | What it does |
+| --- | --- |
+| `fields` | The rows the editor shows. `string`, `number`, `boolean`, `enum` |
+| `defaults` | Your current values. An untouched field reads `(8)` and follows them |
+| `render` | Called on every paint, and per keypress while editing. Must be pure |
+| `onOptions` | The saved values, so your own config can mirror them |
+| `version` | Bump when a key changes meaning |
+
+`render` returns a string, a list of `{ text, color }` segments, or
+`{ segments, icon }` — `undefined` hides the item. It runs inside pi's paint
+path, so it is held to that: escapes are stripped, control characters removed,
+colors checked against the palette, and a throw costs the slot rather than the
+session (reported the next time you open `/statusline`). Set `color` on the item
+itself and it overrides every segment; leave it `auto` and the producer's
+tinting shows through.
+
+`env.preview` is true while the editor is drawing, which lets an extension stand
+in for data it has not fetched yet — `pi-usage` shows a sample quota so its
+options are legible before the first query returns.
+
+An option you have not set is simply absent, and the extension applies its own
+default, so a bare `{ "type": "slot", "id": "usage" }` tracks whatever `/usage`
+is set to. Set one and it wins for that item, and is pushed back to the
+extension on save so its other surfaces agree. Options are only pushed when they
+actually change: a reload that read the same file back rewrites nothing.
+
+A slot in the `extensions` catch-all has nowhere to carry options, so it renders
+with the extension's own defaults.
+
 Placement rules, in order:
 
 1. A `{ "type": "slot", "id": "usage" }` item in your config wins outright.

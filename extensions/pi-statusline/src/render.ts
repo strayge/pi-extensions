@@ -14,6 +14,7 @@ import type {
   SepItemConfig,
   SlotItem,
   SlotItemConfig,
+  SlotSegment,
   StatuslineConfig,
 } from "./types.ts";
 
@@ -127,19 +128,25 @@ function buildCell(item: ItemConfig, theme: Theme, env: RenderEnv): LayoutCell |
     };
   }
 
-  const text = decorate(value.text, item);
+  const segments = decorate(value.segments ?? [{ text: value.text }], item);
   return {
     key: keyOf(item),
-    text,
-    styled: style(text, item, value.color, theme),
+    text: segments.map((segment) => segment.text).join(""),
+    styled: styleSegments(segments, item, value.color, theme),
     kind: "item",
     priority: priorityOf(item),
   };
 }
 
-function decorate(value: string, item: ItemConfig): string {
-  const icon = item.icon ? `${item.icon} ` : "";
-  return `${item.prefix ?? ""}${icon}${value}${item.suffix ?? ""}`;
+/** Prefix and icon lead, suffix trails; all three are the user's own text and
+ *  so carry no color of their own. */
+function decorate(segments: SlotSegment[], item: ItemConfig): SlotSegment[] {
+  const lead = `${item.prefix ?? ""}${item.icon ? `${item.icon} ` : ""}`;
+  return [
+    ...(lead.length > 0 ? [{ text: lead }] : []),
+    ...segments,
+    ...(item.suffix ? [{ text: item.suffix }] : []),
+  ];
 }
 
 /**
@@ -157,6 +164,26 @@ function style(
   const color = configured ?? valueColor ?? DEFAULT_COLOR;
   const colored = theme.fg(color, text);
   return item.bold ? theme.bold(colored) : colored;
+}
+
+/**
+ * The same rules per segment, so a producer can tint one part of its value.
+ *
+ * An explicit `color` on the item flattens the producer's choices deliberately:
+ * the user asked for one color. A single uncolored segment — which is every
+ * item that is not a slot — produces exactly what `style` did before.
+ */
+function styleSegments(
+  segments: SlotSegment[],
+  item: ItemConfig,
+  valueColor: ThemeColor | undefined,
+  theme: Theme,
+): string {
+  const configured = item.color && item.color !== "auto" ? item.color : undefined;
+  return segments
+    .filter((segment) => segment.text.length > 0)
+    .map((segment) => style(segment.text, item, configured ?? segment.color ?? valueColor, theme))
+    .join("");
 }
 
 function priorityOf(item: ItemConfig): number {

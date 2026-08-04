@@ -46,16 +46,63 @@ export function formatUsageReport(
   return lines.join("\n").trimEnd();
 }
 
+/**
+ * A run of statusline text sharing one color, named from the statusline's
+ * palette. Only the quota itself is ever tinted: a bar and a percentage say
+ * nothing about urgency on their own.
+ */
+export interface UsageSegment {
+  text: string;
+  color?: "warning" | "error";
+}
+
+/**
+ * The statusline value, split so a statusline that understands segments can
+ * tint the quota without touching the rest.
+ *
+ * Joining the segments with nothing reproduces `formatUsageStatusline` exactly;
+ * that function is defined that way, so the two cannot drift.
+ */
+export function formatUsageSegments(
+  report: UsageReport,
+  model?: UsageModel,
+  config: UsageDisplayConfig = defaultDisplayConfig(),
+  now: number = Date.now(),
+): UsageSegment[] | undefined {
+  if (report.providerId === "openai-codex") return codexSegments(report, config, now, model);
+  if (report.providerId === "openrouter") return openRouterSegments(report, config, now);
+  return undefined;
+}
+
 export function formatUsageStatusline(
   report: UsageReport,
   model?: UsageModel,
   config: UsageDisplayConfig = defaultDisplayConfig(),
   now: number = Date.now(),
 ): string | undefined {
-  if (report.providerId === "openai-codex")
-    return formatCodexStatusline(report, config, now, model);
-  if (report.providerId === "openrouter") return formatOpenRouterStatusline(report, config, now);
+  const segments = formatUsageSegments(report, model, config, now);
+  if (!segments) return undefined;
+  const text = segments.map((segment) => segment.text).join("");
+  return text.length > 0 ? text : undefined;
+}
+
+/**
+ * How close this window is to being spent, whichever way the user reads it.
+ *
+ * Always measured as consumption: `remaining` flips what the number says, not
+ * whether running out is worth a warning.
+ */
+function bucketAlert(bucket: UsageBucket): UsageSegment["color"] {
+  const share = bucketPercentOfLimit(bucket, "used");
+  if (share === undefined) return undefined;
+  if (share >= 90) return "error";
+  if (share >= 70) return "warning";
   return undefined;
+}
+
+/** Interleave single spaces, the way the parts of a cell have always joined. */
+function spaced(parts: UsageSegment[]): UsageSegment[] {
+  return parts.flatMap((part, index) => (index === 0 ? [part] : [{ text: " " }, part]));
 }
 
 export function formatProviderState(
@@ -141,14 +188,14 @@ function formatGenericReport(
   }
 }
 
-function formatCodexStatusline(
+function codexSegments(
   report: UsageReport,
   config: UsageDisplayConfig,
   now: number,
   model?: UsageModel,
-): string | undefined {
+): UsageSegment[] | undefined {
   const group = selectCodexGroup(report, model);
-  if (!group) return formatCodexCreditsStatus(report);
+  if (!group) return [{ text: formatCodexCreditsStatus(report) }];
 
   const buckets = report.buckets.filter((bucket) => (bucket.groupId ?? bucket.id) === group);
   const labelBucket = buckets[0];
@@ -156,12 +203,16 @@ function formatCodexStatusline(
     group === "codex" ? "codex" : `codex ${compactLimitLabel(labelBucket?.groupLabel ?? group)}`;
 
   const cells = selectStatuslineBuckets(buckets, config.statusline, now)
-    .map((bucket) => formatStatuslineCell(bucket, config, now))
+    .map((bucket) => statuslineCellSegments(bucket, config, now))
     .filter((cell) => cell.length > 0);
   // Nothing rendered because every field is switched off is a display choice,
   // not missing data: hide the entry rather than claim usage is unavailable.
   if (cells.length === 0) return undefined;
-  return `${prefix} ${cells.join(config.statusline.separator)}`;
+
+  return cells.flatMap((cell, index) => [
+    { text: index === 0 ? `${prefix} ` : config.statusline.separator },
+    ...cell,
+  ]);
 }
 
 /**
@@ -180,27 +231,28 @@ function selectStatuslineBuckets(
   return [primary, ...buckets.slice(1).filter((bucket) => isAtRisk(bucket, now))];
 }
 
-function formatStatuslineCell(
+function statuslineCellSegments(
   bucket: UsageBucket,
   config: UsageDisplayConfig,
   now: number,
-): string {
-  const parts: string[] = [];
+): UsageSegment[] {
+  const alert = bucketAlert(bucket);
+  const parts: UsageSegment[] = [];
   for (const field of config.statusline.fields) {
     switch (field) {
       case "window": {
         const fallback = bucket.id.endsWith(":secondary") ? "weekly" : "5h";
-        parts.push(formatWindowLabel(bucket.windowMinutes, fallback, true));
+        parts.push({ text: formatWindowLabel(bucket.windowMinutes, fallback, true) });
         break;
       }
       case "bar": {
         const bar = renderBucketBar(bucket, config, config.statusline, now);
-        if (bar) parts.push(bar);
+        if (bar) parts.push({ text: bar, color: alert });
         break;
       }
       case "percent": {
         const amount = formatBucketAmount(bucket, config);
-        if (amount) parts.push(amount);
+        if (amount) parts.push({ text: amount, color: alert });
         break;
       }
       case "reset": {
@@ -208,17 +260,17 @@ function formatStatuslineCell(
         // lapsed does not restart until the next message, so there is nothing
         // to count down to.
         const left = minutesUntilReset(bucket, now);
-        if (left !== undefined) parts.push(formatDuration(left, config.spacedDuration));
+        if (left !== undefined) parts.push({ text: formatDuration(left, config.spacedDuration) });
         break;
       }
       case "projection": {
         const projection = formatProjection(bucket, config, now, false);
-        if (projection) parts.push(projection);
+        if (projection) parts.push({ text: projection });
         break;
       }
     }
   }
-  return parts.join(" ");
+  return spaced(parts);
 }
 
 /** Exported for the display-options preview, which renders a cell without its label column. */
@@ -298,26 +350,34 @@ function formatProjection(
   return verbose ? `empty in ~${duration}` : `empty ${duration}`;
 }
 
-function formatOpenRouterStatusline(
+function openRouterSegments(
   report: UsageReport,
   config: UsageDisplayConfig,
   now: number,
-): string | undefined {
+): UsageSegment[] | undefined {
   const limit = report.buckets.find((bucket) => bucket.id === "key-limit");
   if (limit) {
     const amount = formatBucketAmount(limit, config);
     if (amount) {
+      const alert = bucketAlert(limit);
       // Per-token billing has no window, so the time fields have nothing to add:
       // a spend cap can still fill a bar, but never carries a pace tick.
       const bar = config.statusline.fields.includes("bar")
         ? renderBucketBar(limit, config, config.statusline, now)
         : undefined;
-      return ["openrouter", bar, amount, valueWord(config)].filter(Boolean).join(" ");
+      return spaced([
+        { text: "openrouter" },
+        ...(bar ? [{ text: bar, color: alert }] : []),
+        { text: amount, color: alert },
+        { text: valueWord(config) },
+      ]);
     }
   }
   // Spend without a cap: the total is the only honest number available.
   const total = report.metrics.find((metric) => metric.id === "usage-total");
-  if (typeof total?.value === "number") return `openrouter ${formatUsd(total.value)} used`;
+  if (typeof total?.value === "number") {
+    return [{ text: `openrouter ${formatUsd(total.value)} used` }];
+  }
   return undefined;
 }
 

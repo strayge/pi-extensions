@@ -23,19 +23,22 @@ import {
 } from "./config.ts";
 import { awaitWithDeadline, errorMessage, sanitizeDisplayText, UsageCache } from "./core.ts";
 import { showDisplayMenu } from "./display-menu.ts";
-import { formatProviderState, formatUsageStatusline } from "./format.ts";
+import { formatProviderState, formatUsageSegments, formatUsageStatusline } from "./format.ts";
 import {
   adapterForProvider,
   isStaleExtensionContextError,
   queryProviderUsage,
   resolveUsageAuth,
 } from "./query.ts";
-import { publishStatuslineItem } from "./statusline-slot.ts";
+import { sampleUsageReport } from "./sample.ts";
+import { applyUsageSlotOptions, usageSlotDefaults, usageSlotFields } from "./statusline-schema.ts";
+import { publishStatuslineItem, registerStatuslineSlot } from "./statusline-slot.ts";
 import type {
   PiModel,
   ProviderUsageState,
   UsageDisplayConfig,
   UsageProviderAdapter,
+  UsageReport,
 } from "./types.ts";
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -84,6 +87,47 @@ export default function usageExtension(pi: ExtensionAPI) {
     text: undefined,
     model: undefined,
   };
+  /** The last reading, kept so the statusline can re-render it under different
+   *  options without a query — `render` is called on every paint. */
+  let latest: { report: UsageReport; model: PiModel | undefined } | undefined;
+
+  /**
+   * Offer the display options to a statusline that can edit them.
+   *
+   * `render` is pure and synchronous by contract — it draws the last reading,
+   * never queries — because the statusline calls it on every paint and again
+   * for each keypress in its layout editor, with values the user has not
+   * committed yet. Substituting the sample report while previewing is what makes
+   * that editor usable before the first query has come back.
+   */
+  const statuslineSlot = registerStatuslineSlot(pi, {
+    id: STATUS_KEY,
+    version: 1,
+    fields: usageSlotFields(),
+    defaults: () => usageSlotDefaults(display),
+    render: (options, env) => {
+      const report = latest?.report ?? (env.preview ? sampleUsageReport() : undefined);
+      if (!report) return undefined;
+      return formatUsageSegments(
+        report,
+        latest?.model,
+        applyUsageSlotOptions(display, options),
+        Date.now(),
+      );
+    },
+    // The statusline owns the values; this keeps `usage.json` in step so the
+    // `/usage` report and a stock pi footer agree with what the bar shows.
+    onOptions: (options) => {
+      const next = applyUsageSlotOptions(display, options);
+      display = next;
+      try {
+        saveDisplayConfig(next);
+      } catch {
+        // A read-only config directory costs the persistence, not the session:
+        // the values are still live, and the statusline holds its own copy.
+      }
+    },
+  });
   /** Monotonic: only the newest refresh may publish its result. */
   let refreshId = 0;
   let refreshController: AbortController | undefined;
@@ -266,6 +310,7 @@ export default function usageExtension(pi: ExtensionAPI) {
   const publishStatus = (ctx: ExtensionContext, outcome: QueryOutcome, model: PiModel) => {
     if (outcome.state.status === "unsupported") {
       clearRefreshTimer();
+      latest = undefined;
       safeSetStatus(ctx, undefined);
       return false;
     }
@@ -274,6 +319,9 @@ export default function usageExtension(pi: ExtensionAPI) {
         outcome.state.status === "auth-unavailable" ? "auth unavailable" : "usage error";
       return safeSetStatus(ctx, label, model);
     }
+    // Kept for the statusline's own renderer, which redraws this reading under
+    // whatever options its config carries.
+    latest = { report: outcome.state.report, model };
     return safeSetStatus(ctx, formatUsageStatusline(outcome.state.report, model, display), model);
   };
 
@@ -369,6 +417,7 @@ export default function usageExtension(pi: ExtensionAPI) {
     } catch (error) {
       ctx.ui.notify(`Could not save usage display options: ${errorMessage(error)}`, "warning");
     }
+    statuslineSlot.refresh();
     if (outcome && model && modelIdentity(ctx.model) === modelIdentity(model)) {
       publishStatus(ctx, outcome, model);
     }
@@ -462,6 +511,9 @@ export default function usageExtension(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     sessionActive = true;
     reloadDisplayConfig();
+    // The file may have changed since the last session, and a statusline that
+    // asked for our schema before this ran would be holding the older defaults.
+    statuslineSlot.refresh();
     for (const warning of displayWarnings) {
       ctx.ui.notify(`${CONFIG_FILE_NAME}: ${warning}`, "warning");
     }

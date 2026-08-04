@@ -41,7 +41,14 @@ const QUOTA_VALUES: QuotaMode[] = ["bar+%", "% only", "bar only", "off"];
 
 type PanelTheme = Pick<Theme, "fg" | "bold">;
 
-interface Setting {
+/**
+ * One row of the display menu.
+ *
+ * Exported along with `buildSettings` because the statusline slot schema is
+ * generated from the same list: the two editors then cannot disagree about what
+ * a setting is called, what it may be set to, or how far a change reaches.
+ */
+export interface Setting {
   id: string;
   name: string;
   description?: string;
@@ -203,7 +210,7 @@ function previewReport(report: UsageReport | undefined, now: number): UsageRepor
   return report && report.buckets.length > 0 ? report : sampleUsageReport(now);
 }
 
-function buildSettings(): Setting[] {
+export function buildSettings(): Setting[] {
   return [
     {
       id: "preset",

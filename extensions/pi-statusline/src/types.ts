@@ -57,6 +57,72 @@ export const ITEM_COLORS = [
 
 export type ItemColor = (typeof ITEM_COLORS)[number];
 
+/**
+ * Options an extension declares for its own slot.
+ *
+ * Scalars only: these are edited by cycling and typing in the layout editor and
+ * round-trip through the config file as JSON. A producer holding an ordered set
+ * expresses it as several scalars, the way `/usage` already reduces its field
+ * list to a `quota` mode and a `reset` toggle.
+ */
+export type SlotOptionValue = string | number | boolean;
+export type SlotOptions = Record<string, SlotOptionValue>;
+
+export const SLOT_FIELD_KINDS = ["string", "number", "boolean", "enum"] as const;
+export type SlotFieldKind = (typeof SLOT_FIELD_KINDS)[number];
+
+export interface SlotFieldSpec {
+  key: string;
+  label: string;
+  kind: SlotFieldKind;
+  /** `enum` only. The first entry is what an unset field behaves as. */
+  options?: string[];
+  /** `number` only. */
+  min?: number;
+  max?: number;
+  description?: string;
+}
+
+/** A run of slot text sharing one color. */
+export interface SlotSegment {
+  text: string;
+  color?: ItemColor;
+}
+
+/** A bare string is one uncolored segment; the object form can add an icon. */
+export type SlotRenderResult =
+  | string
+  | SlotSegment[]
+  | { segments: SlotSegment[]; icon?: string }
+  | undefined;
+
+export interface SlotRenderEnv {
+  /** True when the editor is drawing a preview rather than the footer painting.
+   *  Lets a producer stand in for data it has not fetched yet. */
+  preview: boolean;
+}
+
+/** A producer's option schema plus the function that draws with it. */
+export interface SlotRegistration {
+  id: string;
+  /** Schema version, so an option shape stored by another build is detectable. */
+  version: number;
+  fields: SlotFieldSpec[];
+  /** The producer's own current values, shown as the editor's "unset" text. */
+  defaults?: SlotOptions;
+  render?: (options: SlotOptions, env: SlotRenderEnv) => SlotRenderResult;
+  icon?: string;
+  color?: ItemColor;
+  priority?: number;
+  defaultPlacement?: SlotPlacement;
+}
+
+/** What `render` produced, once normalized and made safe to print. */
+export interface RenderedSlot {
+  segments: SlotSegment[];
+  icon?: string;
+}
+
 export const CWD_STYLES = ["home", "basename", "full"] as const;
 export type CwdStyle = (typeof CWD_STYLES)[number];
 
@@ -152,6 +218,9 @@ export interface SepItemConfig extends BaseItemConfig {
 export interface SlotItemConfig extends BaseItemConfig {
   type: "slot";
   id: string;
+  /** Values for the options the producer registered. Absent keys fall back to
+   *  the producer's own config, so an untouched item tracks whatever it says. */
+  options?: SlotOptions;
 }
 
 export interface ExtensionsItemConfig extends BaseItemConfig {
@@ -184,10 +253,17 @@ export interface StatuslineConfig {
   lines: ItemConfig[][];
 }
 
-/** What an item builder produces: a bare value plus an optional color override. */
+/**
+ * What an item builder produces: a bare value plus an optional color override.
+ *
+ * `text` is always the whole value, so width math and emptiness checks read one
+ * field whatever produced it. `segments` is set only by a slot whose producer
+ * colored its own parts, and carries the same characters split up.
+ */
 export interface ItemValue {
   text: string;
   color?: ThemeColor;
+  segments?: SlotSegment[];
 }
 
 /** An item published over the event bus by another extension. */

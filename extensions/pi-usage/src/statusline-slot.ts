@@ -13,6 +13,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const PUBLISH_CHANNEL = "statusline:publish";
 const CLEAR_CHANNEL = "statusline:clear";
 const REQUEST_CHANNEL = "statusline:request";
+const REGISTER_CHANNEL = "statusline:register";
+const UNREGISTER_CHANNEL = "statusline:unregister";
+const OPTIONS_CHANNEL = "statusline:options";
 
 export interface SlotDefinition {
   id: string;
@@ -24,6 +27,52 @@ export interface SlotDefinition {
     side?: "left" | "center" | "right";
     order?: number;
   };
+}
+
+/** Scalars only: these are cycled and typed in the statusline's own editor. */
+export type SlotOptionValue = string | number | boolean;
+export type SlotOptions = Record<string, SlotOptionValue>;
+
+export interface SlotFieldSpec {
+  key: string;
+  label: string;
+  kind: "string" | "number" | "boolean" | "enum";
+  /** `enum` only. The first entry is what an unset field behaves as. */
+  options?: string[];
+  /** `number` only. */
+  min?: number;
+  max?: number;
+  description?: string;
+}
+
+/** A run of text sharing one color, named from the statusline's palette. */
+export interface SlotSegment {
+  text: string;
+  color?: "dim" | "muted" | "text" | "accent" | "success" | "warning" | "error";
+}
+
+export type SlotRenderResult =
+  | string
+  | SlotSegment[]
+  | { segments: SlotSegment[]; icon?: string }
+  | undefined;
+
+export interface SlotRenderEnv {
+  /** True while the layout editor draws a preview, so a producer can stand in
+   *  for data it has not fetched yet. */
+  preview: boolean;
+}
+
+export interface SlotSchemaDefinition extends SlotDefinition {
+  /** Bump when the meaning of a key changes, so a stored shape is detectable. */
+  version: number;
+  fields: SlotFieldSpec[];
+  /** Read at announce time, so the editor's "unset" text follows your config. */
+  defaults?: () => SlotOptions;
+  render?: (options: SlotOptions, env: SlotRenderEnv) => SlotRenderResult;
+  /** The layout's values for this slot, sent when the user changes them.
+   *  `instances` holds every placement; the first is the conventional one. */
+  onOptions?: (options: SlotOptions, instances: SlotOptions[]) => void;
 }
 
 /**
@@ -53,4 +102,56 @@ export function publishStatuslineItem(
     current = text;
     send();
   };
+}
+
+/**
+ * Register an option schema and a renderer for one slot.
+ *
+ * `render` is called synchronously while the statusline paints, and again while
+ * the user cycles options in its layout editor — with the *pending* values, so
+ * the preview is exact and nothing has to be saved to try a setting out. Keep
+ * it pure and quick: no I/O, no awaiting, and no throwing, though a throw costs
+ * the slot rather than the session.
+ *
+ * With no statusline installed the events go nowhere and this costs nothing.
+ */
+export function registerStatuslineSlot(
+  pi: ExtensionAPI,
+  definition: SlotSchemaDefinition,
+): { dispose: () => void; refresh: () => void } {
+  const { defaults, onOptions, ...rest } = definition;
+
+  const announce = () => {
+    pi.events.emit(REGISTER_CHANNEL, { ...rest, defaults: defaults?.() });
+  };
+
+  const unsubscribeRequest = pi.events.on(REQUEST_CHANNEL, announce);
+  const unsubscribeOptions = pi.events.on(OPTIONS_CHANNEL, (data) => {
+    if (!onOptions || !isRecord(data) || data.id !== definition.id) return;
+    const instances = Array.isArray(data.instances)
+      ? data.instances
+          .filter(isRecord)
+          .map((entry) => (isRecord(entry.options) ? (entry.options as SlotOptions) : {}))
+      : [];
+    onOptions(instances[0] ?? {}, instances);
+    // The handler just changed the config `defaults` reads from, and those are
+    // what an unset field shows: re-announce so it keeps naming the truth.
+    announce();
+  });
+
+  announce();
+
+  return {
+    dispose: () => {
+      unsubscribeRequest();
+      unsubscribeOptions();
+      pi.events.emit(UNREGISTER_CHANNEL, { id: definition.id });
+    },
+    /** Call when your own config changed elsewhere, so the defaults follow. */
+    refresh: announce,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

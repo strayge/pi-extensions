@@ -49,6 +49,9 @@ export interface RenderEnv {
   /** Status keys and slot ids the layout places explicitly, so the `extensions`
    *  catch-all does not render them a second time. */
   placedStatusKeys: Set<string>;
+  /** True while the editor draws its preview, so a producer can stand in for
+   *  data it has not fetched yet. */
+  preview: boolean;
   now: number;
 }
 
@@ -264,12 +267,17 @@ function buildExtensions(item: ExtensionsItemConfig, env: RenderEnv): string {
 
   for (const slot of env.slots.all()) {
     if (!wanted(slot.id)) continue;
-    if (slot.text.length === 0) {
+    // No per-item options exist down here, so a producer that registered one is
+    // asked for its own defaults — which is what its own config file says.
+    // Segment colors are lost either way: the catch-all is one item.
+    const rendered = env.slots.render(slot.id, {}, { preview: env.preview });
+    const text = rendered ? rendered.segments.map((segment) => segment.text).join("") : slot.text;
+    if (text.length === 0) {
       entries.delete(slot.id);
       continue;
     }
-    const icon = slot.icon ?? icons[slot.id];
-    entries.set(slot.id, icon ? `${icon} ${slot.text}` : slot.text);
+    const icon = rendered?.icon ?? slot.icon ?? icons[slot.id];
+    entries.set(slot.id, icon ? `${icon} ${text}` : text);
   }
 
   return [...entries]
@@ -279,19 +287,38 @@ function buildExtensions(item: ExtensionsItemConfig, env: RenderEnv): string {
 }
 
 /**
- * Resolve a named slot, falling back to a `ctx.ui.setStatus` key of the same
- * name. The fallback is what lets any existing extension — one that knows
- * nothing about this statusline — be placed at an exact spot by the user.
+ * Resolve a named slot, in three descending steps: the producer's own `render`
+ * with this item's options, then the text it last published, then a
+ * `ctx.ui.setStatus` key of the same name.
+ *
+ * The last of those is what lets any existing extension — one that knows
+ * nothing about this statusline — be placed at an exact spot by the user. The
+ * first is what lets a producer be configured from the layout editor, and it
+ * works before anything has been published, so an explicitly placed slot draws
+ * from the first frame.
  */
 function buildSlot(item: SlotItemConfig, env: RenderEnv): ItemValue | undefined {
   const slot = env.slots.get(item.id);
+  const registration = env.slots.registration(item.id);
+  const rendered = env.slots.render(item.id, item.options ?? {}, { preview: env.preview });
+
+  if (rendered) {
+    // The renderer applies `item.icon`; the producer's is only the fallback.
+    const icon = item.icon ? undefined : (rendered.icon ?? registration?.icon ?? slot?.icon);
+    const segments = icon ? [{ text: `${icon} ` }, ...rendered.segments] : rendered.segments;
+    return {
+      text: segments.map((segment) => segment.text).join(""),
+      segments,
+      color: registration?.color ?? slot?.color,
+    };
+  }
+
   if (!slot) {
     const status = env.footerData.getExtensionStatuses().get(item.id);
     const clean = status ? sanitize(status) : "";
     return clean.length > 0 ? { text: clean } : undefined;
   }
   if (slot.text.length === 0) return undefined;
-  // The renderer applies `item.icon`; the publisher's icon is only the fallback.
   const icon = item.icon ? undefined : slot.icon;
   return { text: icon ? `${icon} ${slot.text}` : slot.text, color: slot.color };
 }

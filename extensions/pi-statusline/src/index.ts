@@ -19,6 +19,7 @@ import { configPath, loadConfig } from "./config.ts";
 import { runEditor } from "./editor.ts";
 import { createFooterFactory } from "./footer.ts";
 import { type GitStatus, gitStatusEqual, readGitStatus } from "./git-status.ts";
+import { changedSlotOptions } from "./options-sync.ts";
 import { createRuntime, resetRuntime, toolEnded, toolStarted } from "./runtime.ts";
 import { SlotRegistry } from "./slots.ts";
 import type { StatuslineConfig } from "./types.ts";
@@ -83,11 +84,24 @@ export default function statusline(pi: ExtensionAPI) {
     }, GIT_STATUS_DEBOUNCE_MS);
   };
 
-  const reloadConfig = (): string[] => {
-    const loaded = loadConfig();
-    config = loaded.config;
+  /**
+   * Adopt a layout, telling producers about any option they now own differently.
+   *
+   * The push is deliberately driven by the diff rather than by the act of
+   * saving: a reload that read the same file back changes nothing, and a
+   * producer's own config should not be rewritten because a session started.
+   */
+  const applyConfig = (next: StatuslineConfig) => {
+    const changed = changedSlotOptions(config, next);
+    config = next;
+    for (const [id, instances] of changed) slots.pushOptions(id, instances);
     refresh();
     scheduleGitStatus();
+  };
+
+  const reloadConfig = (): string[] => {
+    const loaded = loadConfig();
+    applyConfig(loaded.config);
     return loaded.warnings;
   };
 
@@ -181,13 +195,16 @@ export default function statusline(pi: ExtensionAPI) {
         return;
       }
 
+      // Surfaced here rather than from the paint path, which is no place to
+      // write to the terminal: a producer whose `render` threw is reported the
+      // next time the user comes to look at the layout.
+      for (const failure of slots.takeRenderFailures()) {
+        ctx.ui.notify(`statusline: ${failure}`, "warning");
+      }
+
       await runEditor(ctx, {
         getConfig: () => config,
-        setConfig: (next) => {
-          config = next;
-          refresh();
-          scheduleGitStatus();
-        },
+        setConfig: applyConfig,
         slots,
         runtime,
         getFooterData: () => footerData,

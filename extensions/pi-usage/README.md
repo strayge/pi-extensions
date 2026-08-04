@@ -68,6 +68,22 @@ statuses appear. Both channels carry identical text; a statusline that reads the
 slot renders one entry, not two, and footers that know nothing about slots keep
 working off `ctx.ui.setStatus` unchanged.
 
+The display options below are also **offered to the statusline**, so every one
+of them can be set from `/statusline` with a live preview, per placement:
+
+```jsonc
+{ "type": "slot", "id": "usage", "options": { "quota": "% only", "bar-width": 20 } }
+```
+
+An option you do not set follows `usage.json`, so an untouched slot shows
+whatever `/usage` is set to. One you do set wins for that item and is written
+back into `usage.json` when you save, keeping the `/usage` report and a stock pi
+footer in step with the bar — a change reaches exactly as far as making the same
+change in `/usage` does, because it runs the same code.
+
+The quota itself is tinted past 70% and 90% spent, which a statusline that
+understands per-segment colors will show; the countdown beside it is left alone.
+
 ## Display options
 
 A percentage alone is ambiguous: 95% used with four hours to go is trouble, 95%

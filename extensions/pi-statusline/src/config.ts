@@ -11,6 +11,7 @@ import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { defaultConfig } from "./defaults.ts";
 import { sanitizeLiteral } from "./format.ts";
+import { parseOptions } from "./slots.ts";
 import {
   CWD_STYLES,
   ITEM_COLORS,
@@ -208,6 +209,24 @@ function validateItem(input: unknown, where: string, warnings: string[]): ItemCo
         return undefined;
       }
       item.id = id;
+      // Only the shape is checked here, never the keys: the config is read
+      // before producers have necessarily registered, so what is declared is
+      // unknowable yet. Anything the schema does not cover is dropped on its
+      // way to `render` instead, and survives in the file meanwhile.
+      if (record.options !== undefined) {
+        if (isRecord(record.options)) {
+          const options = parseOptions(record.options);
+          if (options) item.options = options;
+          const dropped = Object.keys(record.options).length - Object.keys(options ?? {}).length;
+          if (dropped > 0) {
+            warnings.push(
+              `${where} dropped ${dropped} option(s) that are not text, numbers or flags`,
+            );
+          }
+        } else {
+          warnings.push(`${where} has "options" that is not an object; ignored`);
+        }
+      }
       break;
     }
     case "extensions":
