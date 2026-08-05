@@ -6,10 +6,15 @@
  * noise. Focus is tracked via xterm focus reporting, so this needs a terminal
  * that supports it (Kitty, Ghostty, iTerm2, WezTerm, Windows Terminal, foot,
  * Alacritty, ...).
+ *
+ * Every handler is gated on the session owning the terminal. Extensions load
+ * into nested agent sessions too (subagent runners bind all discovered
+ * extensions), and those sessions emit their own session_start/agent_settled —
+ * ungated, a finishing subagent would chime as if the user's turn had ended.
  */
 
 import { spawn } from "node:child_process";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type FocusState = "unknown" | "focused" | "blurred";
 
@@ -49,8 +54,18 @@ function notify(): void {
   playSound();
 }
 
+/**
+ * True only for the session driving the terminal. Nested sessions (subagents)
+ * bind no UI context and stay in "print" mode, so this also keeps the focus
+ * escape sequences and the terminal-input subscription out of their hands.
+ */
+function ownsTerminal(ctx: Pick<ExtensionContext, "mode">): boolean {
+  return ctx.mode === "tui";
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
+    if (!ownsTerminal(ctx)) return;
     process.stdout.write("\x1b[?1004h");
 
     unsubTerminalInput = ctx.ui.onTerminalInput((data) => {
@@ -65,7 +80,8 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (!ownsTerminal(ctx)) return;
     unsubTerminalInput?.();
     unsubTerminalInput = undefined;
     process.stdout.write("\x1b[?1004l");
@@ -73,6 +89,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    if (!ownsTerminal(ctx)) return;
     if (ctx.isIdle()) notify();
   });
 

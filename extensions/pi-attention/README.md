@@ -7,6 +7,12 @@ Focus is tracked through xterm focus reporting (`CSI ?1004h`), so the terminal
 must support it: Kitty, Ghostty, iTerm2, WezTerm, Windows Terminal, foot,
 Alacritty, and most other modern emulators do.
 
+Only the session that owns the terminal chimes. Subagent runners (for example
+`@tintinweb/pi-subagents`) load every discovered extension into each nested
+session, and those sessions emit their own `agent_settled` — the chime is gated
+on `ctx.mode === "tui"` so a finishing subagent stays silent and only your turn
+ending pulls you back.
+
 ## Install
 
 ```bash
