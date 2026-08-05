@@ -44,7 +44,7 @@ Smoke-test a real load before calling an extension done. This runs it under
 pi's own loader and exits, catching import errors and registration failures:
 
 ```sh
-pi -e "$PWD/extensions/pi-<name>/src/index.ts" --no-session -p 'reply with just: ok'
+pi -e "$PWD/extensions/pi-<name>/src/index.ts" --no-session --model openai-codex/gpt-5.6-luna:low -p 'reply with just: ok'
 ```
 
 ## Rendering: an over-wide line kills the session
