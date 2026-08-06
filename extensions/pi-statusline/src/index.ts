@@ -15,6 +15,7 @@ import type {
   ExtensionContext,
   ReadonlyFooterDataProvider,
 } from "@earendil-works/pi-coding-agent";
+import { lastResponseFromEntries } from "./cache-age.ts";
 import { configPath, loadConfig } from "./config.ts";
 import { runEditor } from "./editor.ts";
 import { createFooterFactory } from "./footer.ts";
@@ -121,6 +122,10 @@ export default function statusline(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     activeContext = ctx;
     resetRuntime(runtime);
+    // A resumed session carries a prompt cache that expired while it was closed,
+    // and that is precisely when saying so is worth something. Nothing in this
+    // process has seen a response yet, so the clock starts from what is on disk.
+    runtime.lastResponseAt = lastResponseFromEntries(ctx);
 
     if (!ctx.hasUI || ctx.mode !== "tui") return;
 
@@ -155,7 +160,12 @@ export default function statusline(pi: ExtensionAPI) {
     refresh();
   });
 
-  pi.on("message_end", () => refresh());
+  // Assistant messages only: `message_end` also fires for user and tool-result
+  // messages, and it is the response that writes the prompt cache.
+  pi.on("message_end", (event) => {
+    if (event.message?.role === "assistant") runtime.lastResponseAt = Date.now();
+    refresh();
+  });
   pi.on("model_select", () => refresh());
   pi.on("thinking_level_select", () => refresh());
   pi.on("session_info_changed", () => refresh());

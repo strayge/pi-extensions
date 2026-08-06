@@ -9,10 +9,12 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_COLD_AFTER_MINUTES } from "./cache-age.ts";
 import { defaultConfig } from "./defaults.ts";
 import { sanitizeLiteral } from "./format.ts";
 import { parseOptions } from "./slots.ts";
 import {
+  COLD_STYLES,
   CWD_STYLES,
   ITEM_COLORS,
   ITEM_TYPES,
@@ -25,6 +27,9 @@ import {
 export const CONFIG_FILE_NAME = "statusline.json";
 
 const MAX_SEPARATOR_CHARS = 5;
+const MAX_MARKER_CHARS = 5;
+/** A day: past that the marker would never appear within a working session. */
+const MAX_COLD_MINUTES = 1440;
 
 export interface LoadedConfig {
   config: StatuslineConfig;
@@ -179,6 +184,27 @@ function validateItem(input: unknown, where: string, warnings: string[]): ItemCo
       if (typeof record.windowSeparator === "string") {
         const separator = sanitizeLiteral(record.windowSeparator);
         item.windowSeparator = separator.slice(0, MAX_SEPARATOR_CHARS);
+      }
+      if (isOneOf(record.coldStyle, COLD_STYLES)) item.coldStyle = record.coldStyle;
+      if (record.coldAfterMinutes !== undefined) {
+        item.coldAfterMinutes = clampInteger(
+          record.coldAfterMinutes,
+          DEFAULT_COLD_AFTER_MINUTES,
+          1,
+          MAX_COLD_MINUTES,
+        );
+      }
+      // The trailing space in `"❄ "` is what separates the glyph from the value.
+      if (typeof record.coldMarker === "string") {
+        item.coldMarker = sanitizeLiteral(record.coldMarker).slice(0, MAX_MARKER_CHARS);
+      }
+      if (record.coldColor !== undefined) {
+        if (isOneOf(record.coldColor, ITEM_COLORS)) item.coldColor = record.coldColor;
+        else {
+          warnings.push(
+            `${where} has unknown coldColor ${JSON.stringify(record.coldColor)}; ignored`,
+          );
+        }
       }
       break;
     case "time":

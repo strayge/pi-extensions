@@ -129,6 +129,10 @@ export type CwdStyle = (typeof CWD_STYLES)[number];
 export const TIME_FORMATS = ["clock", "elapsed"] as const;
 export type TimeFormat = (typeof TIME_FORMATS)[number];
 
+/** How a context item marks a prompt cache that has gone cold. */
+export const COLD_STYLES = ["off", "symbol", "color", "both"] as const;
+export type ColdStyle = (typeof COLD_STYLES)[number];
+
 /**
  * Options shared by every item. `color: "auto"` defers to the item's own
  * default, which is `dim` for everything except the context meter, which tints
@@ -198,6 +202,20 @@ export interface ContextItemConfig extends BaseItemConfig {
   threshold?: boolean;
   /** Drop the whole item while the context is still empty. */
   hideWhenZero?: boolean;
+  /**
+   * Mark the context once the prompt cache has likely expired, so the cost of
+   * the next request is visible before it is paid.
+   *
+   * Off by default: an existing layout must look the same after an upgrade.
+   * `color` and `both` outrank `threshold`, since a cache about to be re-written
+   * is news the fill level is not.
+   */
+  coldStyle?: ColdStyle;
+  /** Idle minutes after the last response before the cache counts as cold. */
+  coldAfterMinutes?: number;
+  /** Leading glyph for `symbol` and `both`. Its trailing space is preserved. */
+  coldMarker?: string;
+  coldColor?: ItemColor;
 }
 
 export interface TimeItemConfig extends BaseItemConfig {
@@ -264,6 +282,14 @@ export interface ItemValue {
   text: string;
   color?: ThemeColor;
   segments?: SlotSegment[];
+  /**
+   * A color that outranks even an explicit `color` on the item.
+   *
+   * For a state the user asked to be told about by another key, which a resting
+   * color would otherwise swallow: setting `color` on a context item must not
+   * quietly disable the `coldColor` set right next to it.
+   */
+  overrideColor?: ThemeColor;
 }
 
 /** An item published over the event bus by another extension. */

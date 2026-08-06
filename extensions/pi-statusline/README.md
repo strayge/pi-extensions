@@ -178,6 +178,56 @@ the meter appears with the first response. The window goes with it: with nothing
 in the context there is no count for it to qualify. An unknown count is not a
 zero one, so the `?` after a compaction is unaffected.
 
+#### Marking a cold prompt cache
+
+Leave a session idle long enough and the provider drops its prompt cache, so the
+next message pays to write the whole context again instead of reading it back.
+`coldStyle` marks that on the meter *before* the cost is paid:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `coldStyle` | `"off"` | `"off"`, `"symbol"`, `"color"`, or `"both"` |
+| `coldAfterMinutes` | `60` | Idle minutes before the cache counts as cold (1–1440) |
+| `coldMarker` | `"❄ "` | The leading glyph for `symbol` and `both` |
+| `coldColor` | `"accent"` | The tint for `color` and `both` |
+
+```
+{ "coldStyle": "symbol" }                            ❄ 51.1%/272k
+{ "coldStyle": "color" }                             51.1%/272k     (in accent)
+{ "coldStyle": "both" }                              ❄ 51.1%/272k   (in accent)
+{ "coldStyle": "symbol", "coldMarker": "~" }         ~51.1%/272k
+```
+
+`color` and `both` outrank both `threshold` and the item's own `color`: those
+describe how the meter looks at rest, while a cache that just expired is news
+about what the next request costs. (Ranking `coldColor` below `color` would mean
+it did nothing at all on any item that set one — a trap rather than a precedence
+rule, given the two keys sit next to each other in the editor.) `symbol` says it
+without spending the color, so a full-and-cold context can read `❄ 95.0%/272k`
+in threshold red.
+
+Off by default, so an existing layout looks the same after an upgrade. All four
+are editable from `/statusline`.
+
+The clock starts at the last assistant message, and a resumed session reads that
+from its own entries — reopening yesterday's session shows the marker on the
+first frame, which is the case it exists for. Nothing is marked before a session's
+first response, or while the context is still empty: there is no cache yet to
+expire. Going cold is the one thing here that happens while nothing else is
+going on, so a single timer is armed for the exact moment of the transition
+rather than polling.
+
+`coldAfterMinutes` is a guess about someone else's cache, not a fact. An hour
+matches what Anthropic and Codex retain. Note that pi's own built-in
+`showCacheMissNotices` setting measures the same gap against a hard-coded five
+minutes, so with both switched on the two can disagree about what counts as a
+miss.
+
+The default `❄` (U+2744, no variation selector) measures one column under pi's
+`visibleWidth`, so `"❄ "` costs two. Adding a variation selector (`❄️`) makes it
+two columns on its own — if a terminal draws the bare glyph wide, set
+`coldMarker` to something like `"~"` or `"° "` instead.
+
 ### Item options
 
 Every item accepts `icon`, `prefix`, `suffix`, `color`, `bold`, `hidden` and

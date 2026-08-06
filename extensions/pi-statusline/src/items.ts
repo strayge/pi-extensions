@@ -10,6 +10,7 @@
 
 import { basename } from "node:path";
 import type { ExtensionContext, ReadonlyFooterDataProvider } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_COLD_COLOR, DEFAULT_COLD_MARKER, isCacheCold } from "./cache-age.ts";
 import {
   formatBar,
   formatCwd,
@@ -167,6 +168,12 @@ function buildCacheHit(env: RenderEnv): string {
  * or gauge cannot say that, so they drop out and the whole value group collapses
  * to a single `?` — two unknowns side by side would only be noise. The window is
  * a property of the model, not of the count, so it still renders.
+ *
+ * A cold prompt cache is marked on top of all that, and its color outranks both
+ * the fill threshold and the item's own `color`: those two describe how the meter
+ * looks at rest, while an expired cache is news about what the next request will
+ * cost. Ranking it below `color` would mean `coldColor` did nothing at all on any
+ * item that set one, which is a trap rather than a precedence rule.
  */
 function buildContext(item: ContextItemConfig, env: RenderEnv): ItemValue {
   const usage = env.ctx.getContextUsage();
@@ -213,7 +220,19 @@ function buildContext(item: ContextItemConfig, env: RenderEnv): ItemValue {
   if (afterWindow && percentText) tail = tail ? `${tail} ${percentText}` : percentText;
   if (tail) parts.push(tail);
 
-  const text = parts.join(" ");
+  // An empty context has no cache to have gone cold, whatever the clock says.
+  const cold = isCacheCold(item, env.runtime, env.now) && !(known && (tokens ?? percent) === 0);
+  const coldStyle = item.coldStyle ?? "off";
+
+  let text = parts.join(" ");
+  // Never on an empty value: the marker would resurrect an item that had
+  // nothing to say, and a lone glyph explains nothing anyway.
+  if (cold && text.length > 0 && (coldStyle === "symbol" || coldStyle === "both")) {
+    text = `${item.coldMarker ?? DEFAULT_COLD_MARKER}${text}`;
+  }
+  if (cold && (coldStyle === "color" || coldStyle === "both")) {
+    return { text, overrideColor: item.coldColor ?? DEFAULT_COLD_COLOR };
+  }
   if (!(item.threshold ?? true) || !known) return { text };
   if (percent > 90) return { text, color: "error" };
   if (percent > 70) return { text, color: "warning" };

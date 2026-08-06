@@ -115,6 +115,38 @@ test("an unknown color is dropped with a warning, keeping the item", () => {
   assert.match(warnings.join(" "), /unknown color/);
 });
 
+test("cache-cold settings are validated like the rest of the context item", () => {
+  const cold = (item: Record<string, unknown>) =>
+    validateConfig({ lines: [[{ type: "context", ...item }]] });
+
+  const accepted = cold({ coldStyle: "both", coldAfterMinutes: 5, coldMarker: "❄ " });
+  assert.deepEqual(accepted.warnings, []);
+  assert.deepEqual(accepted.config.lines[0]?.[0], {
+    type: "context",
+    coldStyle: "both",
+    coldAfterMinutes: 5,
+    coldMarker: "❄ ",
+  });
+
+  // A bad style is simply not adopted, leaving the item at its "off" default.
+  assert.deepEqual(cold({ coldStyle: "sometimes" }).config.lines[0]?.[0], { type: "context" });
+  // A bad color, though, is worth saying out loud: it would have been visible.
+  const badColor = cold({ coldColor: "ice-blue" });
+  assert.deepEqual(badColor.config.lines[0]?.[0], { type: "context" });
+  assert.match(badColor.warnings.join(" "), /unknown coldColor/);
+
+  // Out-of-range minutes clamp rather than disable the marker outright.
+  const clamped = (minutes: unknown) =>
+    (
+      cold({ coldAfterMinutes: minutes }).config.lines[0]?.[0] as
+        | { coldAfterMinutes?: number }
+        | undefined
+    )?.coldAfterMinutes;
+  assert.equal(clamped(0), 1);
+  assert.equal(clamped(99_999), 1440);
+  assert.equal(clamped("soon"), 60);
+});
+
 test("every documented color is accepted, as is auto", () => {
   for (const color of [...ITEM_COLORS, "auto"]) {
     const { config, warnings } = validateConfig({ lines: [[{ type: "cwd", color }]] });

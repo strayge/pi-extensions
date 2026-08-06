@@ -12,6 +12,12 @@ export interface RuntimeState {
   isStreaming: boolean;
   gitStatus?: GitStatus;
   sessionStartedAt: number;
+  /**
+   * When the last assistant message landed, which is when the prompt cache was
+   * last written. Undefined until the first response of a session, or until a
+   * resumed session's entries have been read.
+   */
+  lastResponseAt?: number;
 }
 
 export function createRuntime(): RuntimeState {
@@ -29,6 +35,7 @@ export function resetRuntime(runtime: RuntimeState): void {
   runtime.isStreaming = false;
   runtime.gitStatus = undefined;
   runtime.sessionStartedAt = Date.now();
+  runtime.lastResponseAt = undefined;
 }
 
 export function toolStarted(runtime: RuntimeState, name: string): void {

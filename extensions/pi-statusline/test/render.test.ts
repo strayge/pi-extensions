@@ -215,6 +215,139 @@ test("hideWhenZero drops the meter until the context has something in it", () =>
   );
 });
 
+/** The instant `fakeEnv` renders at, so a test can place a response before it. */
+const NOW = Date.UTC(2026, 0, 2, 3, 4, 5);
+const MINUTE = 60_000;
+
+test("the cache-cold marker stays off until a layout asks for it", () => {
+  const idle = { runtime: { lastResponseAt: NOW - 5 * 60 * MINUTE } };
+
+  // The shipped default is stock pi, and an upgrade must not change it.
+  assert.equal(render(defaultConfig(), idle)[1]?.trimEnd().endsWith("72.3%/200k"), false);
+  assert.equal(render(defaultConfig(), idle)[1]?.includes("❄"), false);
+  assert.equal(render(layout([[{ type: "context" }]]), idle)[0]?.trimEnd(), "72.3%/200k");
+});
+
+test("a cold cache is marked once the idle allowance has passed", () => {
+  const meter = (item: Record<string, unknown>, minutesIdle: number) =>
+    render(layout([[{ type: "context", coldStyle: "symbol", ...item }]]), {
+      runtime: { lastResponseAt: NOW - minutesIdle * MINUTE },
+    })[0]?.trimEnd();
+
+  // An hour by default: Anthropic and Codex both retain the cache that long.
+  assert.equal(meter({}, 59), "72.3%/200k");
+  assert.equal(meter({}, 60), "❄ 72.3%/200k");
+  assert.equal(meter({}, 600), "❄ 72.3%/200k");
+
+  assert.equal(meter({ coldAfterMinutes: 5 }, 4), "72.3%/200k");
+  assert.equal(meter({ coldAfterMinutes: 5 }, 6), "❄ 72.3%/200k");
+  assert.equal(meter({ coldMarker: "~" }, 90), "~72.3%/200k");
+});
+
+test("nothing is marked cold before the first response of a session", () => {
+  const config = layout([[{ type: "context", coldStyle: "both" }]]);
+  // No response behind it means no cache to have gone cold, however long the
+  // session has been sitting there.
+  assert.equal(
+    render(config, { runtime: { lastResponseAt: undefined } })[0]?.trimEnd(),
+    "72.3%/200k",
+  );
+});
+
+test("an empty context is never cold: there is nothing cached to expire", () => {
+  const config = layout([[{ type: "context", coldStyle: "symbol" }]]);
+  const lines = render(config, {
+    contextPercent: 0,
+    contextTokens: 0,
+    runtime: { lastResponseAt: NOW - 2 * 60 * MINUTE },
+  });
+  assert.equal(lines[0]?.trimEnd(), "0.0%/200k");
+});
+
+test("the cold tint outranks the fill threshold, and both styles combine", () => {
+  const at = (coldStyle: string, percent: number, minutesIdle: number) =>
+    renderStatusline(
+      WIDTH,
+      layout([[{ type: "context", coldStyle }]]),
+      markupTheme(),
+      fakeEnv({ contextPercent: percent, runtime: { lastResponseAt: NOW - minutesIdle * MINUTE } }),
+    )[0];
+
+  // Warm, so the threshold keeps its say.
+  assert.equal(at("both", 95, 10), "<error>95.0%/200k</error>");
+  // Cold: a nearly full context is a standing condition, an expired cache is news.
+  assert.equal(at("color", 95, 90), "<accent>95.0%/200k</accent>");
+  assert.equal(at("both", 95, 90), "<accent>❄ 95.0%/200k</accent>");
+  // `symbol` says it without spending the color, so the threshold survives.
+  assert.equal(at("symbol", 95, 90), "<error>❄ 95.0%/200k</error>");
+  assert.equal(at("both", 10, 90), "<accent>❄ 10.0%/200k</accent>");
+});
+
+test("the cold tint outranks an explicit color on the item", () => {
+  // Otherwise `coldColor` is dead on any item that sets `color` — which is a
+  // trap, not a precedence rule: the two keys sit next to each other.
+  const at = (minutesIdle: number) =>
+    renderStatusline(
+      WIDTH,
+      layout([[{ type: "context", coldStyle: "both", coldColor: "error", color: "accent" }]]),
+      markupTheme(),
+      fakeEnv({ runtime: { lastResponseAt: NOW - minutesIdle * MINUTE } }),
+    )[0];
+
+  assert.equal(at(10), "<accent>72.3%/200k</accent>");
+  assert.equal(at(90), "<error>❄ 72.3%/200k</error>");
+});
+
+test("a full context item keeps its shape while cold", () => {
+  // Every part switched on at once, the way a real layout arrives.
+  const config = layout([
+    [
+      {
+        type: "context",
+        showGauge: true,
+        showTokens: true,
+        showWindow: false,
+        percentAfterWindow: true,
+        percentParens: true,
+        hideWhenZero: true,
+        coldStyle: "both",
+        coldColor: "error",
+        color: "accent",
+        priority: 85,
+      },
+    ],
+  ]);
+  const at = (minutesIdle: number) =>
+    renderStatusline(
+      WIDTH,
+      config,
+      markupTheme(),
+      fakeEnv({
+        contextPercent: 51.1,
+        contextTokens: 139_000,
+        contextWindow: 272_000,
+        runtime: { lastResponseAt: NOW - minutesIdle * MINUTE },
+      }),
+    )[0];
+
+  assert.equal(at(10), "<accent>▅ 139k (51.1%)</accent>");
+  assert.equal(at(90), "<error>❄ ▅ 139k (51.1%)</error>");
+});
+
+test("the cold marker never resurrects a meter that had nothing to say", () => {
+  const config = layout([
+    [
+      {
+        type: "context",
+        coldStyle: "symbol",
+        showPercent: false,
+        showWindow: false,
+      },
+    ],
+  ]);
+  assert.equal(render(config, { runtime: { lastResponseAt: NOW - 90 * MINUTE } })[0], undefined);
+});
+
 test("an explicit color overrides the threshold tint", () => {
   const config = layout([[{ type: "context", color: "accent" }]]);
   const line = renderStatusline(WIDTH, config, markupTheme(), fakeEnv({ contextPercent: 95 }))[0];

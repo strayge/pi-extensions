@@ -22,6 +22,11 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+import {
+  DEFAULT_COLD_AFTER_MINUTES,
+  DEFAULT_COLD_COLOR,
+  DEFAULT_COLD_MARKER,
+} from "./cache-age.ts";
 import { configPath, saveConfig, validateConfig } from "./config.ts";
 import { defaultConfig } from "./defaults.ts";
 import { sanitize } from "./format.ts";
@@ -31,6 +36,7 @@ import { renderStatusline } from "./render.ts";
 import type { RuntimeState } from "./runtime.ts";
 import type { SlotRegistry } from "./slots.ts";
 import {
+  COLD_STYLES,
   CWD_STYLES,
   ITEM_COLORS,
   ITEM_TYPES,
@@ -1079,6 +1085,34 @@ function fieldsFor(item: ItemConfig, slots: SlotRegistry): FieldSpec[] {
         { key: "windowSeparator", label: "window separator", kind: "string", fallback: "/" },
         { key: "threshold", label: "threshold colors", kind: "boolean", fallback: "on" },
         { key: "hideWhenZero", label: "hide when zero", kind: "boolean", fallback: "off" },
+        {
+          key: "coldStyle",
+          label: "cache-cold style",
+          kind: "enum",
+          options: COLD_STYLES,
+          fallback: "off",
+        },
+        {
+          key: "coldAfterMinutes",
+          label: "cache-cold after (min)",
+          kind: "number",
+          fallback: String(DEFAULT_COLD_AFTER_MINUTES),
+          min: 1,
+          max: 1440,
+        },
+        {
+          key: "coldMarker",
+          label: "cache-cold marker",
+          kind: "string",
+          fallback: DEFAULT_COLD_MARKER,
+        },
+        {
+          key: "coldColor",
+          label: "cache-cold color",
+          kind: "enum",
+          options: ITEM_COLORS,
+          fallback: DEFAULT_COLD_COLOR,
+        },
       );
       break;
     case "time":

@@ -122,7 +122,7 @@ function buildCell(item: ItemConfig, theme: Theme, env: RenderEnv): LayoutCell |
     return {
       key: "sep",
       text,
-      styled: style(text, item, value.color, theme),
+      styled: style(text, item, value.color, theme, value.overrideColor),
       kind: "sep",
       priority: priorityOf(item),
     };
@@ -132,7 +132,7 @@ function buildCell(item: ItemConfig, theme: Theme, env: RenderEnv): LayoutCell |
   return {
     key: keyOf(item),
     text: segments.map((segment) => segment.text).join(""),
-    styled: styleSegments(segments, item, value.color, theme),
+    styled: styleSegments(segments, item, value.color, theme, value.overrideColor),
     kind: "item",
     priority: priorityOf(item),
   };
@@ -159,9 +159,10 @@ function style(
   item: ItemConfig,
   valueColor: ThemeColor | undefined,
   theme: Theme,
+  overrideColor?: ThemeColor,
 ): string {
   const configured = item.color && item.color !== "auto" ? item.color : undefined;
-  const color = configured ?? valueColor ?? DEFAULT_COLOR;
+  const color = overrideColor ?? configured ?? valueColor ?? DEFAULT_COLOR;
   const colored = theme.fg(color, text);
   return item.bold ? theme.bold(colored) : colored;
 }
@@ -171,18 +172,22 @@ function style(
  *
  * An explicit `color` on the item flattens the producer's choices deliberately:
  * the user asked for one color. A single uncolored segment — which is every
- * item that is not a slot — produces exactly what `style` did before.
+ * item that is not a slot — produces exactly what `style` did before. An
+ * override flattens them too, and outranks the explicit color as well.
  */
 function styleSegments(
   segments: SlotSegment[],
   item: ItemConfig,
   valueColor: ThemeColor | undefined,
   theme: Theme,
+  overrideColor?: ThemeColor,
 ): string {
   const configured = item.color && item.color !== "auto" ? item.color : undefined;
   return segments
     .filter((segment) => segment.text.length > 0)
-    .map((segment) => style(segment.text, item, configured ?? segment.color ?? valueColor, theme))
+    .map((segment) =>
+      style(segment.text, item, configured ?? segment.color ?? valueColor, theme, overrideColor),
+    )
     .join("");
 }
 
