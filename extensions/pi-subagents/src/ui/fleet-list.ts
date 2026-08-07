@@ -152,7 +152,11 @@ export class FleetList {
         this.widgetRegistered = false;
         this.tui = undefined;
       }
-      if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+      // Nothing to show is not the same as nothing coming: a just-spawned agent
+      // has no session for a moment and a queued one has none until it starts,
+      // and neither re-enters this method on its own. Stopping the timer here
+      // would leave the list invisible until an unrelated keypress revived it.
+      if (!this.hasLiveAgents() && this.timer) { clearInterval(this.timer); this.timer = undefined; }
       this.active = false;
       this.selectedIndex = 0;
       return;
@@ -194,6 +198,16 @@ export class FleetList {
         || (a.completedAt != null && now - a.completedAt < FINISHED_LINGER_MS)
       ))
       .sort((a, b) => a.startedAt - b.startedAt);
+  }
+
+  /**
+   * Any top-level agent still in flight, whether or not it is renderable yet.
+   * Unlike `agentRecords()` this ignores the session check, so it answers "could
+   * a row still appear?" rather than "is there a row now?".
+   */
+  private hasLiveAgents(): boolean {
+    return this.enabled && this.manager.listAgents()
+      .some(a => !a.parentAgentId && (a.status === "running" || a.status === "queued"));
   }
 
   private roster(): FleetEntry[] {

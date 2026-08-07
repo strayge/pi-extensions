@@ -138,6 +138,40 @@ describe("FleetList navigation", () => {
     expect(h.render()).toEqual([]);
   });
 
+  // A spawn calls update() before the agent's session exists, so the roster is
+  // momentarily empty. Killing the tick there stranded the list until an
+  // unrelated keypress revived it — the agent never showed up on its own.
+  it("keeps ticking for a spawned agent whose session has not arrived yet", () => {
+    vi.useFakeTimers();
+    try {
+      const pending = makeRecord({ session: undefined });
+      const h = harness([pending]);      // mirrors spawn: ensureTimer() then update()
+      h.fleet.ensureTimer();
+      h.fleet.update();
+      expect(h.render()).toEqual([]);    // nothing renderable yet
+
+      (pending as any).session = FAKE_SESSION;
+      vi.advanceTimersByTime(500);       // the surviving tick picks it up, unaided
+      expect(h.render().some(l => l.includes("Sleep then report 1"))).toBe(true);
+      h.fleet.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops ticking once no agent can still appear", () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([makeRecord({ status: "completed", completedAt: 0, session: undefined })]);
+      h.fleet.ensureTimer();
+      h.fleet.update();
+      expect(vi.getTimerCount()).toBe(0);
+      h.fleet.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("hides nested child records from the coordinator fleet", () => {
     const h = harness([
       makeRecord({ id: "top", description: "top-level" }),
