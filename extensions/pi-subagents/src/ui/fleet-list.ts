@@ -361,8 +361,10 @@ export class FleetList {
       ? "↑↓ select · enter view · esc back"
       : "esc to interrupt · ← for agents · ↓ to manage";
     const lines: string[] = [];
-    lines.push(truncateToWidth("  " + theme.fg("dim", hint), width));
-    lines.push("");
+    // Flush left, unlike the rows below it: the indent is what marks a line as
+    // part of the roster, so the hint giving it up keeps the two apart now that
+    // no blank line does.
+    lines.push(truncateToWidth(theme.fg("dim", hint), width));
     lines.push(truncateToWidth(`  ${this.bullet(0, sel, theme)} main`, width));
 
     // Window the agent rows so the selected one stays visible.

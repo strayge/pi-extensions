@@ -116,8 +116,7 @@ The token field is annotated with two optional signals inside parens:
 While subagents are running, a Claude Code-style navigable list renders **below** the editor:
 
 ```
-  esc to interrupt · ← for agents · ↓ to manage
-
+esc to interrupt · ← for agents · ↓ to manage
   ● main
   ○ general-purpose  Sleep then report 1                                11s · ↓ 13.1k tokens
   ○ general-purpose  Sleep then report 2                                11s · ↓ 13.1k tokens
