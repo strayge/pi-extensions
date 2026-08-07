@@ -15,6 +15,16 @@ export interface ModelRegistry {
 }
 
 /**
+ * Display label for a resolved model, e.g. "deepseek-v4-flash". Taken verbatim
+ * from the registry so the label matches what the user picked and what the
+ * statusline shows — no vendor-specific rewriting, since pi's registry spans
+ * every provider and a rule tuned to one of them just makes the rest inconsistent.
+ */
+export function shortModelName(model: { id?: string; name?: string } | undefined): string | undefined {
+  return model?.name ?? model?.id ?? undefined;
+}
+
+/**
  * Resolve a model string to a Model instance.
  * Tries exact match first ("provider/modelId"), then fuzzy match against all available models.
  * Returns the Model on success, or an error message string on failure.

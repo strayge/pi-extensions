@@ -12,7 +12,8 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { normalizeMaxTurns, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { shortModelName } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
@@ -121,6 +122,26 @@ interface SpawnOptions {
   rootSessionId?: string;
 }
 
+/**
+ * Fallback UI snapshot for spawn paths that don't build one themselves. Only
+ * fields the options already carry — nothing is re-resolved here, so a derived
+ * snapshot can never disagree with what the runner actually starts.
+ */
+function deriveInvocation(ctx: ExtensionContext, options: SpawnOptions): AgentInvocation {
+  const parentModel = (ctx as { model?: Model<any> }).model;
+  const inherited = options.model === undefined || options.model.id === parentModel?.id;
+  return {
+    modelName: shortModelName(options.model ?? parentModel),
+    modelInherited: inherited,
+    thinking: options.thinkingLevel,
+    maxTurns: normalizeMaxTurns(options.maxTurns),
+    isolated: options.isolated,
+    inheritContext: options.inheritContext,
+    runInBackground: options.isBackground,
+    isolation: options.isolation,
+  };
+}
+
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
@@ -197,7 +218,11 @@ export class AgentManager {
       // only filter excludes only explicit `false`, so undefined agents — which
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
-      invocation: options.invocation,
+      // Callers that build a richer snapshot (the Agent tool, nested delegation)
+      // pass one; the scheduler and the RPC layer do not, and their agents would
+      // otherwise render as blank rows in the fleet list. Derive it from the
+      // options every path already supplies so no spawn is anonymous.
+      invocation: options.invocation ?? deriveInvocation(ctx, options),
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
       maxSubagentDepth: options.maxSubagentDepth,

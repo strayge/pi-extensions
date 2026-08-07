@@ -76,6 +76,27 @@ beforeEach(() => {
 });
 
 describe("ConversationViewer", () => {
+  describe("invocation line", () => {
+    it("shows the model even when it is the parent's, ahead of the config tags", () => {
+      const viewer = new ConversationViewer(
+        mockTui(30, 100),
+        mockSession([]),
+        mockRecord({ invocation: { modelName: "deepseek-v4-flash", modelInherited: true, runInBackground: true } }),
+        undefined, ansiTheme(), vi.fn(),
+      );
+      const line = viewer.render(100).find(l => l.includes("↳"))!;
+      expect(line).toContain("deepseek-v4-flash");
+      expect(line.indexOf("deepseek-v4-flash")).toBeLessThan(line.indexOf("background"));
+    });
+
+    it("renders no invocation row when the agent has no snapshot", () => {
+      const viewer = new ConversationViewer(
+        mockTui(30, 100), mockSession([]), mockRecord(), undefined, ansiTheme(), vi.fn(),
+      );
+      expect(viewer.render(100).some(l => l.includes("↳"))).toBe(false);
+    });
+  });
+
   describe("render width safety", () => {
     const widths = [40, 80, 120, 216];
 

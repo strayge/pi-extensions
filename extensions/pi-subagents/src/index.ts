@@ -24,7 +24,7 @@ import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
-import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { type ModelRegistry, resolveModel, shortModelName } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
@@ -1136,12 +1136,12 @@ Terse command-style prompts produce shallow, generic work.
 
       const parentModelId = ctx.model?.id;
       const effectiveModelId = model?.id;
-      const modelName = effectiveModelId && effectiveModelId !== parentModelId
-        ? (model?.name ?? effectiveModelId).replace(/^Claude\s+/i, "").toLowerCase()
-        : undefined;
+      const modelName = shortModelName(model);
+      const modelInherited = effectiveModelId === undefined || effectiveModelId === parentModelId;
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const agentInvocation: AgentInvocation = {
         modelName,
+        modelInherited,
         thinking,
         // Explicit value only — the default fallback would just add noise.
         // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".
@@ -1159,7 +1159,9 @@ Terse command-style prompts produce shallow, generic work.
         displayName,
         description: params.description,
         subagentType,
-        modelName,
+        // Inline tool-result line only: an inherited model is the session model
+        // shown in the footer, so labelling every call with it is pure repetition.
+        modelName: modelInherited ? undefined : modelName,
         tags: agentTags.length > 0 ? agentTags : undefined,
       };
 

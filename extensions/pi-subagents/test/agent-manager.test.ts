@@ -3,7 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
 import type { AgentRecord } from "../src/types.js";
 
-vi.mock("../src/agent-runner.js", () => ({
+vi.mock("../src/agent-runner.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../src/agent-runner.js")>()),
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
 }));
@@ -208,6 +209,57 @@ describe("AgentManager — spawnAndWait onSpawned + foreground output file wirin
     expect(completedRecord!.status).toBe("error");
     expect(completedRecord!.resultConsumed).toBe(true);
     expect(record).toBe(completedRecord);
+  });
+});
+
+describe("AgentManager — derived invocation snapshot", () => {
+  const ctxWithModel = { cwd: "/tmp", model: { id: "deepseek-v4-flash", name: "deepseek-v4-flash" } } as any;
+
+  afterEach(() => vi.clearAllMocks());
+
+  // Scheduler and RPC spawns pass no `invocation`; without a fallback their
+  // agents render as model-less rows in the fleet list.
+  it("derives a snapshot from the spawn options when the caller supplies none", () => {
+    const manager = new AgentManager();
+    const id = manager.spawn(mockPi, ctxWithModel, "general-purpose", "p", {
+      description: "scheduled job",
+      isBackground: true,
+      thinkingLevel: "high",
+      maxTurns: 30,
+    });
+    expect(manager.getRecord(id)!.invocation).toMatchObject({
+      modelName: "deepseek-v4-flash",
+      modelInherited: true,
+      thinking: "high",
+      maxTurns: 30,
+      runInBackground: true,
+    });
+    manager.dispose();
+  });
+
+  it("marks an explicit model override as not inherited", () => {
+    const manager = new AgentManager();
+    const id = manager.spawn(mockPi, ctxWithModel, "general-purpose", "p", {
+      description: "override",
+      model: { id: "gpt-5.6-luna", name: "gpt-5.6-luna" } as any,
+    });
+    expect(manager.getRecord(id)!.invocation).toMatchObject({
+      modelName: "gpt-5.6-luna",
+      modelInherited: false,
+    });
+    manager.dispose();
+  });
+
+  it("keeps a caller-supplied snapshot instead of deriving over it", () => {
+    const manager = new AgentManager();
+    const invocation = { modelName: "explicit", modelInherited: false, thinking: "low" as const };
+    const id = manager.spawn(mockPi, ctxWithModel, "general-purpose", "p", {
+      description: "agent tool",
+      invocation,
+      thinkingLevel: "high",
+    });
+    expect(manager.getRecord(id)!.invocation).toBe(invocation);
+    manager.dispose();
   });
 });
 

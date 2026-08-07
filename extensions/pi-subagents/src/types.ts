@@ -148,8 +148,15 @@ export interface AgentRecord {
 }
 
 export interface AgentInvocation {
-  /** Short display name, e.g. "haiku" — only set when different from parent. */
+  /** Short display name, e.g. "haiku" — set for every spawn, inherited or not. */
   modelName?: string;
+  /**
+   * The agent runs on the parent's model rather than an override. Surfaces that
+   * would only be repeating the session model (the inline tool-result line) skip
+   * the label; the fleet list and viewer show it regardless, since there the
+   * question "what is this one running on?" has no other answer on screen.
+   */
+  modelInherited?: boolean;
   thinking?: ThinkingLevel;
   maxTurns?: number;
   isolated?: boolean;

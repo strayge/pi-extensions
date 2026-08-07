@@ -315,6 +315,16 @@ describe("FleetList rendering", () => {
     expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
   });
 
+  // The model belongs to the viewer header, not here: these rows are a picker,
+  // and a per-row model only makes every line noisier without answering a
+  // question the list is asked. Keep the stats to elapsed + tokens.
+  it("keeps the row stats to elapsed and tokens, with no model label", () => {
+    const record = makeRecord({ invocation: { modelName: "deepseek-v4-flash", modelInherited: true } });
+    const lines = harness([record]).render(120);
+    expect(lines.find(l => l.includes("Sleep then report 1"))).not.toContain("deepseek-v4-flash");
+    expect(lines.find(l => l.includes("main"))).not.toContain("deepseek-v4-flash");
+  });
+
   it("orders agents earliest-launched first (top)", () => {
     const agents = [
       makeRecord({ id: "new", description: "newest", startedAt: 2000 }),
