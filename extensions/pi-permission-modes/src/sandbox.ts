@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import { type SandboxConfig, canonicalizeSandboxPaths, profileToConfig, readOnlyOverride } from "./config-load.ts";
 import { gitFileBlocksSandbox, removeSandboxPlaceholders } from "./paths.ts";
+import { withProxyReady } from "./proxy-wait.ts";
 import type { SandboxProfile } from "./schema.ts";
 import { isModuleNotFound } from "./util.ts";
 
@@ -54,7 +55,7 @@ export function createSandboxedBashOps(
       // mandatory-deny paths (a stale .git would also break this run).
       removeSandboxPlaceholders(cwd);
       try {
-        const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, customConfig as never);
+        const wrapped = await SandboxManager.wrapWithSandbox(withProxyReady(command), undefined, customConfig as never);
         // `await` so the finally runs after the child exits, not after the
         // Promise is constructed — otherwise cleanup would race the run.
         return await new Promise((resolve, reject) => {
