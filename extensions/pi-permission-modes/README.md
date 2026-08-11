@@ -148,6 +148,18 @@ and runs **unsandboxed** once you approve it; and `edit`/`write` to
 > instead of letting every command fail with `bwrap: ... Not a directory`. Use a
 > normal clone for full Build-mode sandboxing.
 
+> **Symlinked sandbox paths:** a mount point that *is* a symlink aborts the whole
+> sandbox — and with it every command — because bubblewrap resolves destinations
+> inside its own pivoted root, where an absolute link target doesn't exist:
+> `bwrap: Can't mount tmpfs on /newroot/home/you/.aws: No such file or directory`.
+> This hits the stock `denyRead` set whenever a home dotfile points at another
+> filesystem (`~/.aws -> /mnt/c/Users/you/.aws` under WSL), and `allowWrite` when
+> the project is reached through a symlink. The extension canonicalizes every
+> `denyRead`/`allowWrite`/`denyWrite` entry first, so the mount lands on the link's
+> target — which covers access through the link too. An entry whose target would
+> *broaden* the mount (a link to an ancestor or a top-level directory) is dropped
+> with a notification instead.
+
 ### Network
 
 In the sandboxed modes, bash network traffic is filtered by the mode's **domain

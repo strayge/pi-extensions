@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  canonicalizeSandboxPaths,
   FALLBACK_CONFIG,
   isUnsafeDomain,
   loadModeConfig,
@@ -230,6 +231,36 @@ test("readOnlyOverride drops allowWrite; profileToConfig maps fields; isUnsafeDo
   assert.equal(c.filesystem?.allowWrite?.[0], ".");
   assert.ok(isUnsafeDomain("*") && isUnsafeDomain("*.com") && isUnsafeDomain("http://x"));
   assert.ok(!isUnsafeDomain("*.github.com") && !isUnsafeDomain("github.com"));
+});
+
+test("canonicalizeSandboxPaths: resolves symlinked mount points, drops widening ones", () => {
+  const tmp = realpathSync(mkdtempSync(path.join(os.tmpdir(), "permmode-fs-")));
+  try {
+    const store = path.join(tmp, "store");
+    mkdirSync(store, { recursive: true });
+    const link = path.join(tmp, "link");
+    symlinkSync(store, link);
+    const wide = path.join(tmp, "sub", "wide");
+    mkdirSync(path.dirname(wide), { recursive: true });
+    symlinkSync(tmp, wide);
+
+    const errors: string[] = [];
+    const out = canonicalizeSandboxPaths(
+      { filesystem: { denyRead: [link, wide], allowWrite: [store], denyWrite: [] } },
+      (m) => errors.push(m),
+    );
+    assert.deepEqual(out.filesystem?.denyRead, [store]); // symlink resolved, widening entry dropped
+    assert.deepEqual(out.filesystem?.allowWrite, [store]);
+    assert.deepEqual(out.filesystem?.denyWrite, []);
+    assert.ok(errors.some((e) => e.includes(wide) && /denyRead/.test(e)));
+
+    // Nothing to canonicalize when a config carries no filesystem section.
+    assert.deepEqual(canonicalizeSandboxPaths({ network: { allowedDomains: ["x.dev"] } }), {
+      network: { allowedDomains: ["x.dev"] },
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test("persistModeRule: creates the global file with the learned rule, round-trips", () => {

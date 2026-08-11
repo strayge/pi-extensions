@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
-import { type SandboxConfig, profileToConfig, readOnlyOverride } from "./config-load.ts";
+import { type SandboxConfig, canonicalizeSandboxPaths, profileToConfig, readOnlyOverride } from "./config-load.ts";
 import { gitFileBlocksSandbox, removeSandboxPlaceholders } from "./paths.ts";
 import type { SandboxProfile } from "./schema.ts";
 import { isModuleNotFound } from "./util.ts";
@@ -155,7 +155,11 @@ export class SandboxController {
    */
   bashOps(opts: { readOnly?: boolean } = {}): BashOperations | null {
     if (!this.manager || !this.profile) return null;
-    const customConfig = opts.readOnly ? readOnlyOverride(profileToConfig(this.profile)) : undefined;
+    // Dropped paths were already reported when the profile was applied, so this
+    // per-command path stays quiet.
+    const customConfig = opts.readOnly
+      ? canonicalizeSandboxPaths(readOnlyOverride(profileToConfig(this.profile)))
+      : undefined;
     return createSandboxedBashOps(this.manager, customConfig, this.drainBlockedHosts);
   }
 
@@ -244,7 +248,8 @@ export class SandboxController {
     if (this.degraded || !this.manager) return;
     if (!profile.enabled) return; // non-sandboxing mode (e.g. YOLO): keep prior init
 
-    const cfg = profileToConfig(profile);
+    const dropped: string[] = [];
+    const cfg = canonicalizeSandboxPaths(profileToConfig(profile), (m) => dropped.push(m));
     const key = JSON.stringify({ n: cfg.network, f: cfg.filesystem });
     if (this.ready && key === this.appliedKey) return;
 
@@ -261,6 +266,7 @@ export class SandboxController {
       this.ready = true;
       this.appliedKey = key;
       this.warn = undefined;
+      if (dropped.length > 0 && this.hasUI) this.notifyFn(dropped.join("\n"));
     } catch (err) {
       this.ready = false;
       this.warn = `sandbox init failed: ${err instanceof Error ? err.message : String(err)}`;

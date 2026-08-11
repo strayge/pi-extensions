@@ -12,6 +12,7 @@
  */
 
 import { realpathSync, rmSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 
 /** Device pseudo-files that are "outside" the project but harmless to allow. */
@@ -76,6 +77,58 @@ export function resolvePlanPath(raw: unknown): string {
   return String(raw ?? "")
     .trim()
     .replace(/^@/, "");
+}
+
+const GLOB_CHARS = /[*?[\]]/;
+
+/** Expand a leading `~` the way the sandbox runtime does. */
+function expandHome(p: string, home: string): string {
+  if (p === "~") return home;
+  if (p.startsWith("~/")) return home + p.slice(1);
+  return p;
+}
+
+/**
+ * True when resolving `original` to `resolved` broadens what a mount would cover:
+ * the link escapes upward (`~/.aws` → `/home/user`) or lands on the root / a
+ * single top-level directory. Mounting there would hide or expose far more than
+ * the configured path, so such an entry is dropped instead.
+ */
+function widensScope(original: string, resolved: string): boolean {
+  if (resolved === original) return false;
+  if (resolved === "/") return true;
+  if (resolved.split("/").filter(Boolean).length <= 1) return true;
+  return original.startsWith(`${resolved}/`);
+}
+
+/**
+ * Rewrite one configured sandbox path into a form bubblewrap can mount, or null
+ * when it must be dropped.
+ *
+ * bwrap resolves every mount destination inside its own pivoted root, where an
+ * absolute symlink target does not exist — so a mount point that *is* a symlink
+ * aborts the whole sandbox (`Can't mount tmpfs on /newroot/…: No such file or
+ * directory`) and with it every command of the session. sandbox-runtime
+ * canonicalizes mount points itself, but only while the link stays inside its own
+ * tree; a home dotfile pointing at another filesystem (`~/.aws` →
+ * `/mnt/c/Users/me/.aws`, common under WSL) still reaches bwrap as a symlink.
+ *
+ * Denying/allowing the canonical target covers access through the symlink too, so
+ * this is a rewrite, not a weakening. Glob patterns keep their pattern tail and
+ * only have their static directory prefix canonicalized.
+ */
+export function sandboxMountPath(pattern: string, cwd: string = process.cwd(), home: string = homedir()): string | null {
+  const abs = path.resolve(cwd, expandHome(pattern, home));
+  const globAt = abs.search(GLOB_CHARS);
+  if (globAt === -1) {
+    const real = canonicalize(abs);
+    return widensScope(abs, real) ? null : real;
+  }
+  const cut = abs.lastIndexOf("/", globAt);
+  if (cut <= 0) return abs; // pattern starts at the root: nothing to canonicalize
+  const dir = abs.slice(0, cut);
+  const real = canonicalize(dir);
+  return widensScope(dir, real) ? null : real + abs.slice(cut);
 }
 
 /**

@@ -23,6 +23,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { sandboxMountPath } from "./paths.ts";
 import {
   type Action,
   type ModeDef,
@@ -91,6 +92,41 @@ export function profileToConfig(p: SandboxProfile): SandboxConfig {
     enabled: p.enabled,
     network: p.network,
     filesystem: { denyRead: p.denyRead, allowWrite: p.allowWrite, denyWrite: p.denyWrite },
+  };
+}
+
+/**
+ * Apply `sandboxMountPath` to every filesystem list before the config reaches the
+ * sandbox runtime; entries it rejects are dropped and reported through `onError`.
+ *
+ * A list that was undefined stays undefined rather than becoming `[]`: the runtime
+ * reads a per-command override as `custom ?? session config`, so an empty array
+ * would replace the session's restrictions instead of inheriting them.
+ */
+export function canonicalizeSandboxPaths(config: Partial<SandboxConfig>, onError: OnError = noop): Partial<SandboxConfig> {
+  const fs = config.filesystem;
+  if (!fs) return config;
+  const resolveList = (list: string[] | undefined, kind: string): string[] | undefined => {
+    if (!list) return undefined;
+    const out: string[] = [];
+    for (const entry of list) {
+      const resolved = sandboxMountPath(entry);
+      if (resolved === null) {
+        onError(`permission-mode: dropping sandbox ${kind} path "${entry}" — it resolves to a broader directory`);
+        continue;
+      }
+      if (!out.includes(resolved)) out.push(resolved);
+    }
+    return out;
+  };
+  return {
+    ...config,
+    filesystem: {
+      ...fs,
+      denyRead: resolveList(fs.denyRead, "denyRead"),
+      allowWrite: resolveList(fs.allowWrite, "allowWrite"),
+      denyWrite: resolveList(fs.denyWrite, "denyWrite"),
+    },
   };
 }
 

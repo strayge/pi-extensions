@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,6 +14,7 @@ import {
   resolvePlanPath,
   SAFE_OUTSIDE_RE,
   SANDBOX_PLACEHOLDER_PATHS,
+  sandboxMountPath,
 } from "./paths.ts";
 
 const ROOT = "/home/proj";
@@ -87,6 +88,42 @@ test("gitFileBlocksSandbox distinguishes 0-byte stub vs real gitfile", () => {
     mkdirSync(wt, { recursive: true });
     writeFileSync(path.join(wt, ".git"), "gitdir: /elsewhere\n");
     assert.equal(gitFileBlocksSandbox(wt), true);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("sandboxMountPath: canonicalizes symlinked mount points bwrap can't mount on", () => {
+  const t = tmpdir();
+  if (!existsSync(t)) mkdirSync(t, { recursive: true });
+  const base = realpathSync(mkdtempSync(path.join(t, "perm-mnt-")));
+  try {
+    const home = path.join(base, "home");
+    const store = path.join(base, "elsewhere", "secrets");
+    mkdirSync(store, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    // The reported WSL shape: ~/.aws is a symlink onto another filesystem.
+    symlinkSync(store, path.join(home, ".aws"));
+    assert.equal(sandboxMountPath("~/.aws", base, home), store);
+    // Paths under the symlink resolve through it too.
+    assert.equal(sandboxMountPath("~/.aws/credentials", base, home), path.join(store, "credentials"));
+
+    // A plain directory is returned as-is; relative entries resolve against cwd.
+    const proj = path.join(base, "proj");
+    mkdirSync(proj, { recursive: true });
+    assert.equal(sandboxMountPath(".", proj, home), proj);
+    assert.equal(sandboxMountPath("~", base, home), home);
+
+    // Missing paths keep their (absolute) form — the runtime skips or stubs them.
+    assert.equal(sandboxMountPath("~/.gnupg", base, home), path.join(home, ".gnupg"));
+
+    // Glob patterns: only the static directory prefix is canonicalized.
+    assert.equal(sandboxMountPath("~/.aws/*.json", base, home), path.join(store, "*.json"));
+    assert.equal(sandboxMountPath("/*/etc", base, home), "/*/etc"); // glob in the first segment
+
+    // A link that escapes upward would mount over a far broader tree → dropped.
+    symlinkSync(base, path.join(home, ".wide"));
+    assert.equal(sandboxMountPath("~/.wide", base, home), null);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
