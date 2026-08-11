@@ -290,7 +290,7 @@ test("bash: session grant covers the same command, not a longer chain", { skip }
     h.ctx.answers.push("Allow for session");
     assert.equal(await h.call("bash", { command: "git status" }), undefined);
     assert.equal(h.ctx.prompts.length, 1);
-    assert.ok(!h.ctx.prompts[0].options.includes("Always allow…"));
+    assert.ok(!h.ctx.prompts[0].options.some((option) => option.startsWith("Always allow")));
 
     // Same command again: covered by the session grant, no new prompt.
     assert.equal(await h.call("bash", { command: "git status" }), undefined);
@@ -306,44 +306,50 @@ test("bash: session grant covers the same command, not a longer chain", { skip }
   }
 });
 
-test("bash: Always allow opens explicit narrow choices and persists both narrow patterns", { skip }, async () => {
+test("bash: flattened global choices persist both narrow patterns", { skip }, async () => {
   const h = await setup();
   try {
     await useUnsandboxedAskMode(h);
-    h.ctx.answers.push("Always allow…", "git fetch * — all projects", "Allow once");
+    h.ctx.answers.push("Always allow: git fetch *", "Allow once");
     assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
+    assert.deepEqual(h.ctx.prompts[0].options, [
+      "Allow once",
+      "Allow for session",
+      "Always allow: git fetch *",
+      "Always allow: git *",
+      "Deny",
+    ]);
     const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
     assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch"], "allow");
     assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch *"], "allow");
     assert.equal(saved.modes["confirm-unsandboxed"].permission.bash.git, undefined);
     assert.equal(await h.call("bash", { command: "git fetch-pack origin" }), undefined);
-    assert.equal(h.ctx.prompts.length, 3);
+    assert.equal(h.ctx.prompts.length, 2);
   } finally {
     h.cleanup();
   }
 });
 
-test("bash: dismissing the persistence submenu returns to the main prompt", { skip }, async () => {
+test("bash: dismissing the flattened prompt denies", { skip }, async () => {
   const h = await setup();
   try {
     await useUnsandboxedAskMode(h);
-    h.ctx.answers.push("Always allow…", undefined, "Allow once");
-    assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
-    assert.equal(h.ctx.prompts.length, 3);
-    assert.equal(h.ctx.prompts[2].title, h.ctx.prompts[0].title);
-    assert.deepEqual(h.ctx.prompts[2].options, h.ctx.prompts[0].options);
+    h.ctx.answers.push(undefined);
+    const result = await h.call("bash", { command: "git fetch origin" });
+    assert.equal(result?.block, true);
+    assert.equal(h.ctx.prompts.length, 1);
   } finally {
     h.cleanup();
   }
 });
 
-test("bash: multi-command persistence displays each broad scope once", { skip }, async () => {
+test("bash: multi-command persistence displays one flattened global scope", { skip }, async () => {
   const h = await setup();
   try {
     await useUnsandboxedAskMode(h);
-    h.ctx.answers.push("Always allow…", "git, npm — all projects");
+    h.ctx.answers.push("Always allow: git, npm");
     assert.equal(await h.call("bash", { command: "git status && npm test" }), undefined);
-    assert.deepEqual(h.ctx.prompts[1].options, ["git, npm — all projects"]);
+    assert.deepEqual(h.ctx.prompts[0].options, ["Allow once", "Allow for session", "Always allow: git, npm", "Deny"]);
 
     const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
     const bash = saved.modes["confirm-unsandboxed"].permission.bash;
@@ -356,24 +362,33 @@ test("bash: multi-command persistence displays each broad scope once", { skip },
   }
 });
 
-test("bash: trusted project rule reloads and remains subcommand-scoped", { skip }, async () => {
+test("bash: flattened project/global choices persist a project subcommand scope", { skip }, async () => {
   const h = await setup({ trusted: true });
   try {
     await useUnsandboxedAskMode(h);
-    h.ctx.answers.push("Always allow…", "git fetch * — this project");
+    h.ctx.answers.push("Always allow for project: git fetch *");
     assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
+    assert.deepEqual(h.ctx.prompts[0].options, [
+      "Allow once",
+      "Allow for session",
+      "Always allow for project: git fetch *",
+      "Always allow: git fetch *",
+      "Always allow for project: git *",
+      "Always allow: git *",
+      "Deny",
+    ]);
     const file = path.join(h.root, ".pi", "permission-mode.json");
     const saved = JSON.parse(readFileSync(file, "utf-8"));
     assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch"], "allow");
     assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch *"], "allow");
 
     assert.equal(await h.call("bash", { command: "git fetch upstream" }), undefined);
-    assert.equal(h.ctx.prompts.length, 2);
+    assert.equal(h.ctx.prompts.length, 1);
 
     h.ctx.answers.push("Deny");
     const sibling = await h.call("bash", { command: "git push origin main" });
     assert.equal(sibling?.block, true);
-    assert.equal(h.ctx.prompts.length, 3);
+    assert.equal(h.ctx.prompts.length, 2);
   } finally {
     h.cleanup();
   }
@@ -388,9 +403,15 @@ test("bash: a trusted project ask offers only project persistence", { skip }, as
     writeFileSync(file, JSON.stringify({ modes: { "confirm-unsandboxed": { permission: { bash: { "git *": "ask" } } } } }));
     await h.pi.emit("session_start", {}, h.ctx);
 
-    h.ctx.answers.push("Always allow…", "git fetch * — this project");
+    h.ctx.answers.push("Always allow for project: git fetch *");
     assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
-    assert.deepEqual(h.ctx.prompts[1].options, ["git fetch * — this project", "git * — this project"]);
+    assert.deepEqual(h.ctx.prompts[0].options, [
+      "Allow once",
+      "Allow for session",
+      "Always allow for project: git fetch *",
+      "Always allow for project: git *",
+      "Deny",
+    ]);
   } finally {
     h.cleanup();
   }

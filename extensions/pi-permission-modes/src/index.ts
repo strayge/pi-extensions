@@ -47,7 +47,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { CONFIG_DIR_NAME, createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { ALWAYS_ALLOW, type ApprovalScope, askApproval, askWithSession, SessionApprovals } from "./approvals.ts";
+import { ALLOW_ONCE, ALLOW_SESSION, askWithSession, DENY, SessionApprovals } from "./approvals.ts";
 import { sandboxAwarenessPrompt } from "./awareness.ts";
 import { bashExecPlan, bashGate, bashPromptTitle, bashSubject } from "./bash-enforce.ts";
 import { analyzeBash } from "./bash-parse.ts";
@@ -751,57 +751,55 @@ export default async function (pi: ExtensionAPI) {
         const globalEligible = persistenceBase && policyAsks.every((c) => isPersistableBashAsk(m, c, "global"));
         const projectEligible =
           persistenceBase && isTrustedProject(ctx) && policyAsks.every((c) => isPersistableBashAsk(m, c, "project"));
-        const firstOptions = globalEligible || projectEligible
-          ? ["Allow once", "Allow for session", ALWAYS_ALLOW, "Deny"]
-          : ["Allow once", "Allow for session", "Deny"];
-        let scope: ApprovalScope = "deny";
-        while (true) {
-          scope = await askApproval(
-            { hasUI: ctx.hasUI, select: (t, o) => ctx.ui.select(t, o) },
-            title,
-            firstOptions,
-          );
-          if (scope !== "forever-global" && scope !== "forever-project") break;
-
-          const persistCommands = policyAsks;
-          const broadLabel = [...new Set(persistCommands.map((command) => command.name))].join(", ");
-          const broadPatterns = persistCommands.flatMap((command) => command.broad);
-          const choices = persistCommands.length === 1
-            ? [
-                ...(projectEligible ? [{ label: `${persistCommands[0].narrow[1]} — this project`, project: true, patterns: persistCommands[0].narrow }] : []),
-                ...(globalEligible ? [{ label: `${persistCommands[0].narrow[1]} — all projects`, project: false, patterns: persistCommands[0].narrow }] : []),
-                ...(projectEligible ? [{ label: `${persistCommands[0].broad[1]} — this project`, project: true, patterns: persistCommands[0].broad }] : []),
-                ...(globalEligible ? [{ label: `${persistCommands[0].broad[1]} — all projects`, project: false, patterns: persistCommands[0].broad }] : []),
-              ]
-            : [
-                ...(projectEligible ? [{ label: `${broadLabel} — this project`, project: true, patterns: broadPatterns }] : []),
-                ...(globalEligible ? [{ label: `${broadLabel} — all projects`, project: false, patterns: broadPatterns }] : []),
-              ];
-          if (!ctx.hasUI) return { block: true, reason: gate.reason };
-          const selectedChoice = await ctx.ui.select("Always allow which bash scope?", choices.map((choice) => choice.label));
-          if (!selectedChoice) continue;
-          const selected = choices.find((choice) => choice.label === selectedChoice);
-          if (!selected) continue;
-          try {
-            for (const pattern of [...new Set(selected.patterns)]) {
-              if (selected.project) persistProjectRule(ctx.cwd, modeName, "bash", pattern, "allow");
-              else persistModeRule(getAgentDir(), modeName, "bash", pattern, "allow");
-              approvals.remember(modeName, "bash", pattern);
-            }
-            config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
-          } catch (e) {
-            ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
-            return { block: true, reason: gate.reason };
+        const persistCommands = policyAsks;
+        const broadLabel = [...new Set(persistCommands.map((candidate) => candidate.name))].join(", ");
+        const broadPatterns = persistCommands.flatMap((candidate) => candidate.broad);
+        const persistentChoices: Array<{ label: string; project: boolean; patterns: string[] }> = [];
+        const addPersistentChoices = (commandLabel: string, patterns: string[]) => {
+          if (projectEligible) {
+            persistentChoices.push({ label: `Always allow for project: ${commandLabel}`, project: true, patterns });
           }
-          break;
+          if (globalEligible) persistentChoices.push({ label: `Always allow: ${commandLabel}`, project: false, patterns });
+        };
+        if (persistCommands.length === 1) {
+          addPersistentChoices(persistCommands[0].narrow[1], persistCommands[0].narrow);
+          if (persistCommands[0].broad[1] !== persistCommands[0].narrow[1]) {
+            addPersistentChoices(persistCommands[0].broad[1], persistCommands[0].broad);
+          }
+        } else if (persistCommands.length > 1) {
+          addPersistentChoices(broadLabel, broadPatterns);
         }
-        if (scope === "session") {
+
+        if (!ctx.hasUI) return { block: true, reason: gate.reason };
+        const choice = await ctx.ui.select(title, [
+          ALLOW_ONCE,
+          ALLOW_SESSION,
+          ...persistentChoices.map((candidate) => candidate.label),
+          DENY,
+        ]);
+        if (choice === ALLOW_SESSION) {
           for (const c of keyed ? approvalTargets : [{ command, narrow: [command], broad: [command] }]) {
             const patterns = keyed ? c.narrow : [command];
             for (const pattern of patterns) approvals.remember(modeName, "bash", pattern);
           }
+        } else {
+          const selected = persistentChoices.find((candidate) => candidate.label === choice);
+          if (selected) {
+            try {
+              for (const pattern of [...new Set(selected.patterns)]) {
+                if (selected.project) persistProjectRule(ctx.cwd, modeName, "bash", pattern, "allow");
+                else persistModeRule(getAgentDir(), modeName, "bash", pattern, "allow");
+                approvals.remember(modeName, "bash", pattern);
+              }
+              config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
+            } catch (e) {
+              ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
+              return { block: true, reason: gate.reason };
+            }
+          } else if (choice !== ALLOW_ONCE) {
+            return { block: true, reason: gate.reason };
+          }
         }
-        if (scope === "deny") return { block: true, reason: gate.reason };
         if (gate.onApproveUnsandboxed) approvedUnsandboxed.add(event.toolCallId);
       }
       return undefined;

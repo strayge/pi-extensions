@@ -202,9 +202,11 @@ The broad choice stores `git` and `git *`. Unparsed commands retain exact-comman
 session semantics and cannot be persisted. Clear grants with
 `/perm clear-approvals`.
 
-**Always allow...** can save narrow or broad bash patterns globally or to a
-trusted project. Dismissing a prompt, or failing to write a selected persistent
-rule, denies the command.
+Persistent bash choices are shown directly in the main prompt. **Always allow:
+PATTERN** saves globally; **Always allow for project: PATTERN** saves to a trusted
+project. Narrow and broad scopes appear as different patterns in those labels.
+Dismissing a prompt, or failing to write a selected persistent rule, denies the
+command.
 
 Use `/perm init -p` to scaffold a project file, or
 `/perm allow [-p|-g] [surface] <pattern>` to write an allow rule. Flags follow
