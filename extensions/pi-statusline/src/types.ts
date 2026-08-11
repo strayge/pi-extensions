@@ -40,10 +40,12 @@ export type ItemType = (typeof ITEM_TYPES)[number];
 /**
  * The colors an item may ask for.
  *
- * A deliberately narrow slice of pi's palette: the semantic names that mean
- * something on a footer. `satisfies` ties the list to the real palette, so a
- * name that pi does not define cannot be added here — `theme.fg` throws on an
- * unknown color, and a throw inside the footer takes the session down.
+ * A narrow slice of pi's palette: the semantic names that mean something on a
+ * footer, plus `mdLink` as a sixth distinguishable hue — producers that color
+ * by category run out of options otherwise, and every theme defines it.
+ * `satisfies` ties the list to the real palette, so a name that pi does not
+ * define cannot be added here — `theme.fg` throws on an unknown color, and a
+ * throw inside the footer takes the session down.
  */
 export const ITEM_COLORS = [
   "dim",
@@ -53,6 +55,7 @@ export const ITEM_COLORS = [
   "success",
   "warning",
   "error",
+  "mdLink",
 ] as const satisfies readonly ThemeColor[];
 
 export type ItemColor = (typeof ITEM_COLORS)[number];

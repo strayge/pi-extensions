@@ -238,9 +238,9 @@ Every item accepts `icon`, `prefix`, `suffix`, `color`, `bold`, `hidden` and
 warning rather than silently doing nothing.
 
 `color` takes a theme color name (`dim`, `muted`, `text`, `accent`, `success`,
-`warning`, `error`) or `auto`, the default — which means `dim`, matching stock
-pi, except for `context`, which tints itself past 70% and 90%. Any other name is
-dropped with a warning.
+`warning`, `error`, `mdLink`) or `auto`, the default — which means `dim`,
+matching stock pi, except for `context`, which tints itself past 70% and 90%.
+Any other name is dropped with a warning.
 
 ### Lines, separators, and the splitter
 

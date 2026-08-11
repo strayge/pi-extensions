@@ -462,6 +462,23 @@ test("defaultPlacement puts a slot on the requested line and side", () => {
   assert.equal(lines.length, 2);
 });
 
+test("a placed slot keeps its color, which the catch-all cannot", () => {
+  const slot = { id: "perm", text: "Build", color: "accent" as const };
+  const colored = (options: object) =>
+    renderStatusline(WIDTH, defaultConfig(), markupTheme(), fakeEnv(options)).join("\n");
+
+  // Down in the catch-all every entry shares one item's color, so a producer
+  // that colors by category renders flat — the reason to ask for a placement.
+  assert.equal(colored({ slots: [slot] }).includes("<accent>Build</accent>"), false);
+
+  assert.equal(
+    colored({ slots: [{ ...slot, defaultPlacement: { side: "left" } }] }).includes(
+      "<accent>Build</accent>",
+    ),
+    true,
+  );
+});
+
 test("defaultPlacement clamps a line index past the end of the layout", () => {
   const config = layout([[{ type: "cwd" }]]);
   const lines = render(config, {
