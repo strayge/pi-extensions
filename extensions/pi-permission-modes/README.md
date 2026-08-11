@@ -177,14 +177,23 @@ Two independent layers compose:
    `skill`). `deny` blocks, `ask` prompts, `allow` passes.
    For **bash**, the command line is parsed with **tree-sitter** (a real AST)
    and every command it contains — including ones nested in `$(...)`, backticks,
-   subshells, and `sh|bash|… -c '…'` scripts (re-parsed recursively) — is judged
-   separately: matched against the `bash` patterns **and** the `path` gate
-   (against the joined command and each individual token, so
+   subshells, and `sh|bash|zsh|fish|… -c '…'` scripts (re-parsed recursively) —
+   is judged separately: matched against the `bash` patterns **and** the `path`
+   gate (against the joined command and each individual token, so
    `"path": { "*.env": "deny" }` blocks `cat .env` wherever the target appears),
    with out-of-project paths and privilege escalation (even through wrappers
    like `env`/`nice`/`xargs`) detected structurally. If the tree-sitter grammar
    can't load, a whole-string token-scan heuristic stands in, which is more
    easily fooled.
+
+   **fish.** No fish grammar exists on npm, so `fish -c` scripts are read with
+   the bash grammar. That covers the common case — `fish -i -c 'cd sub && pytest
+   -k t'` is judged as `cd` and `pytest`, not as one opaque `fish` argument —
+   and fish's `and`/`or`/`not` modifiers are unwrapped so they cannot hide a
+   command head. Block constructs (`for … end`, `switch … end`, `function …
+   end`) have no bash reading and parse incompletely. Those are detected rather
+   than trusted: the command is marked **unparsed** and always prompts, so a
+   hidden `sudo` cannot ride through an `allow` rule.
 2. **OS sandbox** (`@anthropic-ai/sandbox-runtime`): the real enforcement for
    bash. When a mode's `sandbox.enabled` is true, in-project bash runs wrapped by
    `sandbox-exec` (macOS) / `bubblewrap` (Linux), confining **writes** to the

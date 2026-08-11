@@ -7,6 +7,7 @@ import {
   extractCommands,
   isPrivilegeEscalation,
   outsideReasonFromCommands,
+  splitFishConnectives,
   type SyntaxNodeLike,
 } from "./bash-parse.ts";
 
@@ -96,20 +97,22 @@ test("isPrivilegeEscalation: no false positives on mere mentions", () => {
   assert.ok(!isPrivilegeEscalation(bc("env"))); // wrapper with nothing wrapped
 });
 
+const ok = (commands: BashCommand[]) => ({ commands, hasError: false });
+
 test("expandShellCommands: bash -c scripts are re-parsed, recursively and depth-limited", () => {
   const parses: string[] = [];
-  const parse = (s: string): BashCommand[] => {
+  const parse = (s: string) => {
     parses.push(s);
-    if (s === "sudo rm -rf /") return [bc("sudo", "rm", "-rf", "/")];
-    if (s === "bash -c 'sudo x'") return [bc("bash", "-c", "sudo x")];
-    if (s === "sudo x") return [bc("sudo", "x")];
-    return [];
+    if (s === "sudo rm -rf /") return ok([bc("sudo", "rm", "-rf", "/")]);
+    if (s === "bash -c 'sudo x'") return ok([bc("bash", "-c", "sudo x")]);
+    if (s === "sudo x") return ok([bc("sudo", "x")]);
+    return ok([]);
   };
 
   // Simple: the inner command joins the list, marked nested.
   const simple = expandShellCommands(parse, [bc("bash", "-c", "sudo rm -rf /")]);
   assert.deepEqual(
-    simple.map((c) => [c.name, c.isNested]),
+    simple.commands.map((c) => [c.name, c.isNested]),
     [
       ["bash", false],
       ["sudo", true],
@@ -117,25 +120,84 @@ test("expandShellCommands: bash -c scripts are re-parsed, recursively and depth-
   );
 
   // Combined flags (`sh -lc`) and absolute shell paths count too.
-  assert.equal(expandShellCommands(parse, [bc("sh", "-lc", "sudo rm -rf /")]).length, 2);
-  assert.equal(expandShellCommands(parse, [bc("/bin/bash", "-c", "sudo rm -rf /")]).length, 2);
+  assert.equal(expandShellCommands(parse, [bc("sh", "-lc", "sudo rm -rf /")]).commands.length, 2);
+  assert.equal(expandShellCommands(parse, [bc("/bin/bash", "-c", "sudo rm -rf /")]).commands.length, 2);
 
   // No -c → a script file we can't inspect; nothing is expanded.
-  assert.equal(expandShellCommands(parse, [bc("bash", "script.sh")]).length, 1);
+  assert.equal(expandShellCommands(parse, [bc("bash", "script.sh")]).commands.length, 1);
   // Non-shell commands are never expanded.
-  assert.equal(expandShellCommands(parse, [bc("git", "-c", "user.name=x", "log")]).length, 1);
+  assert.equal(expandShellCommands(parse, [bc("git", "-c", "user.name=x", "log")]).commands.length, 1);
 
   // Nested shells expand recursively: bash -c "bash -c 'sudo x'".
   const nested = expandShellCommands(parse, [bc("bash", "-c", "bash -c 'sudo x'")]);
   assert.deepEqual(
-    nested.map((c) => c.name),
+    nested.commands.map((c) => c.name),
     ["bash", "bash", "sudo"],
   );
 
   // Depth limit: self-referential scripts stop expanding instead of looping.
-  const loop = (s: string): BashCommand[] => (s === "loop" ? [bc("bash", "-c", "loop")] : []);
+  const loop = (s: string) => (s === "loop" ? ok([bc("bash", "-c", "loop")]) : ok([]));
   const bounded = expandShellCommands(loop, [bc("bash", "-c", "loop")]);
-  assert.ok(bounded.length <= 4);
+  assert.ok(bounded.commands.length <= 4);
+});
+
+test("expandShellCommands: fish -c scripts expand like any other shell", () => {
+  const parse = (s: string) =>
+    s === "cd sub && pytest -k t" ? ok([bc("cd", "sub"), bc("pytest", "-k", "t")]) : ok([]);
+  const out = expandShellCommands(parse, [bc("fish", "-i", "-c", "cd sub && pytest -k t")]);
+  assert.deepEqual(
+    out.commands.map((c) => [c.name, c.isNested]),
+    [
+      ["fish", false],
+      ["cd", true],
+      ["pytest", true],
+    ],
+  );
+  assert.equal(out.hasError, false);
+});
+
+test("expandShellCommands: fish connectives are unwrapped so the real head is judged", () => {
+  // The bash grammar reads `and sudo id` as a command named "and".
+  const parse = (s: string) => (s === "echo hi; and sudo id" ? ok([bc("echo", "hi"), bc("and", "sudo", "id")]) : ok([]));
+  const out = expandShellCommands(parse, [bc("fish", "-c", "echo hi; and sudo id")]);
+  assert.deepEqual(
+    out.commands.map((c) => c.name),
+    ["fish", "echo", "sudo"],
+  );
+  // ...and only for fish: a POSIX shell has no such modifier, so `and` stands.
+  const posix = expandShellCommands(parse, [bc("bash", "-c", "echo hi; and sudo id")]);
+  assert.deepEqual(
+    posix.commands.map((c) => c.name),
+    ["bash", "echo", "and"],
+  );
+});
+
+test("splitFishConnectives: unwraps and/or/not, bounded, leaves other commands alone", () => {
+  assert.deepEqual(splitFishConnectives([bc("or", "sudo", "id")]), [
+    { name: "sudo", args: ["id"], isNested: false },
+  ]);
+  assert.deepEqual(splitFishConnectives([bc("not", "and", "sudo", "id")]), [
+    { name: "sudo", args: ["id"], isNested: false },
+  ]);
+  // Nothing to modify → left alone, so a real command named `and` still matches.
+  assert.deepEqual(splitFishConnectives([bc("and")]), [bc("and")]);
+  assert.deepEqual(splitFishConnectives([bc("git", "status")]), [bc("git", "status")]);
+});
+
+test("expandShellCommands: an unparsable inner script is reported, not silently dropped", () => {
+  // What the bash grammar does with fish's `for … end`: no commands, an error.
+  const parse = () => ({ commands: [] as BashCommand[], hasError: true });
+  const out = expandShellCommands(parse, [bc("fish", "-c", "for f in *.py; sudo id; end")]);
+  assert.equal(out.hasError, true, "the caller must be able to fail closed");
+  assert.deepEqual(
+    out.commands.map((c) => c.name),
+    ["fish"],
+  );
+
+  const throws = () => {
+    throw new Error("boom");
+  };
+  assert.equal(expandShellCommands(throws, [bc("fish", "-c", "x")]).hasError, true);
 });
 
 test("outsideReasonFromCommands: wrapped privilege escalation is reported", () => {
@@ -166,4 +228,53 @@ test("analyzeBash: real grammar sees through wrappers and shell -c (skips if WAS
   // A benign mention is not privilege escalation in the AST path.
   const benign = await analyzeBash("grep sudo README.md", "/home/u/projX");
   assert.equal(benign.outsideReason, undefined);
+});
+
+test("analyzeBash: fish -c inner commands are extracted (skips if WASM absent)", async () => {
+  const a = await analyzeBash("fish -i -c 'cd subdir && pytest -k testname'", "/home/u/projX");
+  if (a.usedFallback) return; // tree-sitter WASM unavailable in this env
+  assert.deepEqual(
+    a.commands.map((c) => c.name),
+    ["fish", "cd", "pytest"],
+    "the wrapped commands are visible to policy, not buried in an argument",
+  );
+  assert.equal(a.unparsed, false, "bash-compatible fish parses cleanly");
+  assert.equal(a.outsideReason, undefined);
+});
+
+test("analyzeBash: fish syntax the bash grammar cannot read is flagged (skips if WASM absent)", async () => {
+  // `switch` is the reason a zero-command check is not enough: it still yields
+  // its head, so only the error nodes reveal that `sudo` went missing.
+  for (const script of ["for f in *.py; sudo id; end", "switch $x; case a; sudo id; end"]) {
+    const a = await analyzeBash(`fish -i -c '${script}'`, "/home/u/projX");
+    if (a.usedFallback) return;
+    assert.equal(a.unparsed, true, `unparsed must be set for: ${script}`);
+    assert.ok(!a.commands.some((c) => c.name === "sudo"), "the hidden command is indeed not extracted");
+  }
+});
+
+test("analyzeBash: fish connectives expose the escalated command (skips if WASM absent)", async () => {
+  const a = await analyzeBash("fish -i -c 'echo hi; and sudo id'", "/home/u/projX");
+  if (a.usedFallback) return;
+  assert.ok(
+    a.commands.some((c) => c.name === "sudo"),
+    "`and sudo id` must not hide sudo inside the args of a command named `and`",
+  );
+  assert.equal(a.outsideReason, "privilege escalation");
+});
+
+test("analyzeBash: ordinary bash keeps parsing cleanly (skips if WASM absent)", async () => {
+  // Guards against the unparsed flag turning into constant prompting.
+  for (const command of [
+    "cat <<'EOF'\nhi\nEOF",
+    "diff <(ls a) <(ls b)",
+    "for f in *.py; do echo $f; done",
+    "arr=(1 2 3); echo ${arr[@]}",
+    "find . -name '*.ts' -exec grep -l x {} \\;",
+    "pytest -k 'not slow' --maxfail=1",
+  ]) {
+    const a = await analyzeBash(command, "/home/u/projX");
+    if (a.usedFallback) return;
+    assert.equal(a.unparsed, false, `valid bash must not be flagged: ${command}`);
+  }
 });

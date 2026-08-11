@@ -128,13 +128,45 @@ export function isPrivilegeEscalation(c: BashCommand): boolean {
   return false;
 }
 
-/** Shells whose `-c <script>` argument is itself a bash program. */
-const SHELL_COMMANDS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
+/** Shells whose `-c <script>` argument is itself a shell program. */
+const SHELL_COMMANDS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
 
-/** The `-c` script of a shell command (`bash -c '…'`, `sh -lc '…'`), or
- * undefined when the command isn't a shell or has no `-c` script. */
-function shellCScript(c: BashCommand): string | undefined {
-  if (!SHELL_COMMANDS.has(path.basename(c.name))) return undefined;
+/** Shells the bash grammar only approximates; POSIX-ish ones it reads directly. */
+const NON_POSIX_SHELLS = new Set(["fish"]);
+
+const FISH_CONNECTIVES = new Set(["and", "or", "not", "!"]);
+
+/** One parsed script, plus whether the grammar hit error nodes. */
+export interface ParsedScript {
+  commands: BashCommand[];
+  hasError: boolean;
+}
+
+/**
+ * Replace fish's `and`/`or`/`not` modifiers with the command they modify. The
+ * bash grammar has no notion of them, so it reads `and sudo id` as a command
+ * named `and` taking `sudo id` as arguments — hiding the real head from both
+ * privilege detection and policy patterns. Bounded, so `not not not …` cannot
+ * loop; a modifier with nothing after it is left alone.
+ */
+export function splitFishConnectives(commands: BashCommand[]): BashCommand[] {
+  const out: BashCommand[] = [];
+  for (const c of commands) {
+    let cur = c;
+    for (let hops = 0; hops < 4 && FISH_CONNECTIVES.has(path.basename(cur.name)) && cur.args.length > 0; hops++) {
+      cur = { name: cur.args[0], args: cur.args.slice(1), isNested: cur.isNested };
+    }
+    out.push(cur);
+  }
+  return out;
+}
+
+/** The `-c` script of a shell command (`bash -c '…'`, `sh -lc '…'`, `fish -i -c '…'`)
+ * together with the shell that runs it, or undefined when the command isn't a
+ * shell or has no `-c` script. */
+function shellCScript(c: BashCommand): { script: string; shell: string } | undefined {
+  const shell = path.basename(c.name);
+  if (!SHELL_COMMANDS.has(shell)) return undefined;
   let sawC = false;
   for (const a of c.args) {
     if (a.startsWith("-")) {
@@ -143,7 +175,7 @@ function shellCScript(c: BashCommand): string | undefined {
     }
     // First non-flag arg: the script when -c was given, else a script file
     // path (which we can't inspect — the path itself is still policy-matched).
-    return sawC ? a : undefined;
+    return sawC ? { script: a, shell } : undefined;
   }
   return undefined;
 }
@@ -156,26 +188,35 @@ function shellCScript(c: BashCommand): string | undefined {
  * in tests); a script that fails to parse expands to nothing.
  */
 export function expandShellCommands(
-  parse: (script: string) => BashCommand[],
+  parse: (script: string) => ParsedScript,
   commands: BashCommand[],
   depth = 0,
-): BashCommand[] {
-  if (depth >= 3) return commands;
+): ParsedScript {
+  if (depth >= 3) return { commands, hasError: false };
   const out: BashCommand[] = [];
+  let hasError = false;
   for (const c of commands) {
     out.push(c);
-    const script = shellCScript(c);
-    if (!script) continue;
+    const found = shellCScript(c);
+    if (!found) continue;
     let inner: BashCommand[] = [];
     try {
-      inner = parse(script).map((i) => ({ ...i, isNested: true }));
+      const parsed = parse(found.script);
+      // Propagated, not swallowed: an unreadable script would otherwise leave
+      // only the innocuous-looking outer `fish -c` for policy to judge.
+      hasError ||= parsed.hasError;
+      inner = parsed.commands.map((i) => ({ ...i, isNested: true }));
+      if (NON_POSIX_SHELLS.has(found.shell)) inner = splitFishConnectives(inner);
     } catch {
       // unparsable inner script → nothing to expand; the shell command itself
       // was already emitted and stays subject to policy
+      hasError = true;
     }
-    out.push(...expandShellCommands(parse, inner, depth + 1));
+    const expanded = expandShellCommands(parse, inner, depth + 1);
+    hasError ||= expanded.hasError;
+    out.push(...expanded.commands);
   }
-  return out;
+  return { commands: out, hasError };
 }
 
 /**
@@ -201,7 +242,14 @@ export function outsideReasonFromCommands(commands: BashCommand[], root: string)
 
 /** A parser that turns a command string into commands (real or, in tests, fake). */
 export interface BashParser {
-  parse(command: string): BashCommand[];
+  parse(command: string): ParsedScript;
+}
+
+/** `hasError` is a property on current tree-sitter, a method on older ones. */
+function nodeHasError(node: unknown): boolean {
+  const n = node as { hasError?: boolean | (() => boolean) };
+  if (typeof n?.hasError === "function") return n.hasError() === true;
+  return n?.hasError === true;
 }
 
 let parserPromise: Promise<BashParser | undefined> | undefined;
@@ -219,7 +267,11 @@ async function initParser(): Promise<BashParser | undefined> {
     return {
       parse: (command: string) => {
         const tree = parser.parse(command);
-        return tree ? extractCommands(tree.rootNode as unknown as SyntaxNodeLike) : [];
+        if (!tree) return { commands: [], hasError: true };
+        return {
+          commands: extractCommands(tree.rootNode as unknown as SyntaxNodeLike),
+          hasError: nodeHasError(tree.rootNode),
+        };
       },
     };
   } catch {
@@ -240,6 +292,12 @@ export interface BashAnalysis {
   outsideReason: string | undefined;
   /** True when tree-sitter was unavailable and the regex heuristic was used. */
   usedFallback: boolean;
+  /**
+   * True when the grammar hit error nodes, so `commands` may omit what the
+   * shell would actually run: fish's `for … end` parses to nothing at all,
+   * `switch … end` to its head alone. Callers must fail closed on this.
+   */
+  unparsed: boolean;
 }
 
 /** Analyze a bash command via tree-sitter, falling back to the regex heuristic. */
@@ -249,11 +307,22 @@ export async function analyzeBash(command: string, root: string): Promise<BashAn
     try {
       // Expand shell -c scripts so `bash -c 'sudo …'` exposes its inner
       // commands to privilege/escape detection and policy matching alike.
-      const commands = expandShellCommands((s) => parser.parse(s), parser.parse(command));
-      return { commands, outsideReason: outsideReasonFromCommands(commands, root), usedFallback: false };
+      const top = parser.parse(command);
+      const expanded = expandShellCommands((s) => parser.parse(s), top.commands);
+      return {
+        commands: expanded.commands,
+        outsideReason: outsideReasonFromCommands(expanded.commands, root),
+        usedFallback: false,
+        unparsed: top.hasError || expanded.hasError,
+      };
     } catch {
       // parse failure → fall through to the heuristic
     }
   }
-  return { commands: [], outsideReason: bashConfirmReason(command, root), usedFallback: true };
+  return {
+    commands: [],
+    outsideReason: bashConfirmReason(command, root),
+    usedFallback: true,
+    unparsed: false,
+  };
 }

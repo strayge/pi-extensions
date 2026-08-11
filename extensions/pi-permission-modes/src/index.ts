@@ -620,17 +620,22 @@ export default async function (pi: ExtensionAPI) {
       } else {
         action = decide(m, "bash", command);
       }
+      // Confirm rather than trust an `allow` derived from an incomplete command
+      // list — but stay sandboxed: this is uncertainty, not an escape.
+      if (analysis.unparsed) action = mostRestrictive(action, "ask") ?? "ask";
       const gate = bashGate(action, analysis.outsideReason, m.sandbox.enabled, sandbox.ready);
       if (gate.kind === "block") return { block: true, reason: gate.reason };
       if (gate.kind === "prompt") {
         // Session approvals are keyed on the extracted command names, and ALL
         // names in a chain must be granted for it to pass silently — "allow git
         // this session" must not cover `git status && curl ... | sh`. Granting
-        // remembers every name in the chain. Without a parse (heuristic
-        // fallback), the key is the exact command string.
+        // remembers every name in the chain. Without a trustworthy parse — the
+        // heuristic fallback, or one that lost commands — the extracted names
+        // do not describe what runs, so the key is the exact command string.
         const names = [...new Set(analysis.commands.map((c) => c.name).filter(Boolean))];
-        const keys = names.length > 0 ? names : [command];
-        if (!(await promptAllow(ctx, "bash", keys, gate.title))) return { block: true, reason: gate.reason };
+        const keys = analysis.unparsed || names.length === 0 ? [command] : names;
+        const title = analysis.unparsed ? `${gate.title} (script could not be fully parsed)` : gate.title;
+        if (!(await promptAllow(ctx, "bash", keys, title))) return { block: true, reason: gate.reason };
         if (gate.onApproveUnsandboxed) approvedUnsandboxed.add(event.toolCallId);
       }
       return undefined;
