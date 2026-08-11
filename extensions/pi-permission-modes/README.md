@@ -86,6 +86,27 @@ warning when the reason is known (`--no-sandbox` is not one);
 be retuned, and you can add your own, in `permission-mode.json` (see
 [Configuration](#configuration)).
 
+#### Statusline slots
+
+Both chips are also published as statusline slots, so an extension implementing
+the slot protocol can place each one exactly where you want instead of taking
+the pair as one blob:
+
+| Slot id | Shows |
+|---------|-------|
+| `perm` | the mode label, in the mode's own color, with `(!) <reason>` folded in when the sandbox is unavailable |
+| `perm-network` | the network chip, published only when there is one — cleared otherwise |
+
+`perm` deliberately matches the `ctx.ui.setStatus` key, so a statusline renders
+the slot instead of repeating the same text in its catch-all row, and a stock pi
+footer still sees the combined chip. Placing `perm-network` while leaving `perm`
+unplaced is the one layout that shows the network twice — place both, or
+neither.
+
+Both ask for the last line by default, so they land where the catch-all sits in
+a stock layout, colored per mode, with no config from you. Name either slot
+explicitly to put it elsewhere.
+
 | Mode | Behavior |
 |------|----------|
 | **Default** | Confirm every `bash`/`edit`/`write`; reads are free. Approved **in-project** `bash` runs **sandboxed** (writes confined to the project). |

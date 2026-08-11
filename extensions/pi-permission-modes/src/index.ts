@@ -34,7 +34,7 @@
  *   paths.ts        out-of-project / protected-path predicates
  *   heuristics.ts   bash escape/privilege scan (tree-sitter fallback)
  *   sandbox.ts      SandboxController (runtime lifecycle, per-mode profile)
- *   status.ts       footer indicator
+ *   status.ts       footer indicator   statusline-slot.ts  its placeable slots
  *   show-plan.ts    show_plan tool   plan-render.ts  its renderer
  *
  * Install (see README.md):
@@ -74,7 +74,8 @@ import {
   type Surface,
 } from "./schema.ts";
 import { createShowPlanTool } from "./show-plan.ts";
-import { updateStatus } from "./status.ts";
+import { statusSlots, updateStatus } from "./status.ts";
+import { publishStatuslineItem } from "./statusline-slot.ts";
 
 /** Built-in file tools whose `input.path` is gated against the matching surface. */
 const FILE_TOOL_SURFACE: Record<string, Surface> = {
@@ -129,9 +130,29 @@ export default async function (pi: ExtensionAPI) {
   // sandbox-runtime proxy consults it (via net.decide) for every host outside
   // the allowlist, so changes apply instantly — no sandbox re-init.
   const net = new NetworkSession();
+  // Statusline slots, so the two chips can be placed independently. The mode
+  // slot reuses the `perm` status key, which is what makes a statusline render
+  // the slot instead of also listing the key. Both ask for a placement rather
+  // than accepting the catch-all, where one item's color covers every entry and
+  // all four modes would look alike.
+  const publishModeSlot = publishStatuslineItem(pi, {
+    id: "perm",
+    defaultPlacement: { side: "left", order: 10 },
+  });
+  const publishNetworkSlot = publishStatuslineItem(pi, {
+    id: "perm-network",
+    defaultPlacement: { side: "left", order: 20 },
+  });
   // Latest UI-capable context, for prompts that fire OUTSIDE an event handler
   // (the network ask callback runs mid-bash, driven by the proxy).
   let uiCtx: ExtensionContext | undefined;
+
+  /** Paint the footer chip and republish both slots from the same state. */
+  const refreshStatus = (ctx: ExtensionContext, mode: ModeDef = currentMode()): void => {
+    const slots = statusSlots(updateStatus(ctx, mode, sandbox, net.open));
+    publishModeSlot(slots.mode.text, slots.mode.color);
+    publishNetworkSlot(slots.network?.text, slots.network?.color);
+  };
 
   /** Prompt the user about a blocked host (the connection waits meanwhile). */
   const askNetHost = async (host: string, port: number | undefined): Promise<NetAskResult> => {
@@ -223,7 +244,7 @@ export default async function (pi: ExtensionAPI) {
     const m = currentMode();
     await sandbox.applyProfile(m.sandbox); // re-init runtime if the profile changed
     applyToolVisibility();
-    updateStatus(ctx, m, sandbox, net.open);
+    refreshStatus(ctx, m);
     ctx.ui.notify(`Permission mode: ${m.label}`, "info");
     if (persist) pi.appendEntry<PermState>("perm-mode", { mode: modeName });
   };
@@ -308,7 +329,7 @@ export default async function (pi: ExtensionAPI) {
       return ctx.ui.notify("permission-mode: network is not filtered in this mode/state — nothing to toggle", "info");
     }
     net.open = !net.open;
-    updateStatus(ctx, currentMode(), sandbox, net.open);
+    refreshStatus(ctx);
     ctx.ui.notify(
       net.open
         ? "Network: OPEN for this session — domain filtering disabled (alt+n or /net restrict to re-enable)"
@@ -339,7 +360,7 @@ export default async function (pi: ExtensionAPI) {
       }
       if (sub === "reset") {
         net.clear();
-        updateStatus(ctx, m, sandbox, net.open);
+        refreshStatus(ctx, m);
         return ctx.ui.notify("permission-mode: cleared session network grants/denies; filtering restored", "info");
       }
       if (sub === "allow") {

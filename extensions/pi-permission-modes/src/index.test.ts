@@ -41,6 +41,14 @@ type Handler = (event: unknown, ctx: unknown) => Promise<unknown> | unknown;
 class FakePi {
   flags = new Map<string, unknown>();
   handlers = new Map<string, Handler[]>();
+  /** Statusline slot traffic, newest last — see the slot-publishing test. */
+  emitted: Array<{ channel: string; data: Record<string, unknown> }> = [];
+  events = {
+    emit: (channel: string, data: Record<string, unknown>) => {
+      this.emitted.push({ channel, data });
+    },
+    on: (_channel: string, _handler: (data: unknown) => void) => () => {},
+  };
   commands = new Map<string, (args: string, ctx: unknown) => Promise<unknown>>();
   shortcuts = new Map<string, (ctx: unknown) => Promise<unknown>>();
   tools = new Map<string, { name: string }>();
@@ -416,6 +424,29 @@ test("headless child with an explicitly forwarded mode keeps its system prompt",
     const res = (await h.pi.emit("before_agent_start", { systemPrompt: "BASE" }, h.ctx)) as { systemPrompt: string };
     assert.match(res.systemPrompt, /Plan Mode is active/); // explicit → injected
     assert.equal(process.env.PI_PERMISSION_MODE, "plan"); // and re-exported onward
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("statusline: mode and network publish as separate slots", { skip }, async () => {
+  const h = await setup();
+  const latest = (id: string) => h.pi.emitted.filter((e) => e.data.id === id).at(-1);
+  try {
+    assert.equal(latest("perm")?.channel, "statusline:publish");
+    assert.equal(latest("perm")?.data.text, "Default");
+    assert.ok(latest("perm")?.data.defaultPlacement, "asks for a placement, not the catch-all");
+    assert.equal(latest("perm")?.data.color, "muted");
+
+    // --no-sandbox: nothing filters, so the network slot is published too.
+    assert.equal(latest("perm-network")?.channel, "statusline:publish");
+    assert.equal(latest("perm-network")?.data.text, "Network: open");
+
+    // YOLO reports no network state, so its slot is cleared rather than left
+    // showing the previous mode's value.
+    await h.perm("yolo");
+    assert.equal(latest("perm")?.data.text, "YOLO");
+    assert.equal(latest("perm-network")?.channel, "statusline:clear");
   } finally {
     h.cleanup();
   }
