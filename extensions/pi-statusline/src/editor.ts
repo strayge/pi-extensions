@@ -507,13 +507,19 @@ export class LayoutEditor {
     return example ? `ex.: ${example}` : undefined;
   }
 
-  /** Live extension entries, as id -> current text, sorted for a stable list. */
+  /** Placeable extension entries, as id -> current text, sorted for a stable
+   *  list. Includes ids with no value right now, which still belong in the
+   *  catalog — see `SlotRegistry.seen`. */
   private knownSlots(): Array<[string, string]> {
     const found = new Map<string, string>();
     const footerData = this.deps.getFooterData();
     if (footerData) {
       for (const [id, text] of footerData.getExtensionStatuses()) found.set(id, sanitize(text));
     }
+    // Placeholders only where nothing is known yet: a status above or a
+    // published value below wins. Reused by the filter, hence the Set.
+    const known = new Set(this.deps.slots.known());
+    for (const id of known) if (!found.has(id)) found.set(id, "");
     for (const slot of this.deps.slots.all()) found.set(slot.id, slot.text);
     // A producer that registered but has not published yet still belongs in the
     // catalog: `render` is what a placed item would draw from anyway.
@@ -527,7 +533,10 @@ export class LayoutEditor {
     }
 
     return [...found]
-      .filter(([id, text]) => text.length > 0 || this.deps.slots.registration(id) !== undefined)
+      .filter(
+        ([id, text]) =>
+          text.length > 0 || this.deps.slots.registration(id) !== undefined || known.has(id),
+      )
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([id, text]) => [
         id,

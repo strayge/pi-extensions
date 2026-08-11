@@ -13,7 +13,14 @@ import {
 } from "../src/editor.ts";
 import { createRuntime } from "../src/runtime.ts";
 import { ITEM_TYPES, type StatuslineConfig } from "../src/types.ts";
-import { createRegistry, type FakeOptions, fakeEnv, identityTheme, publish } from "./helpers.ts";
+import {
+  clearSlot,
+  createRegistry,
+  type FakeOptions,
+  fakeEnv,
+  identityTheme,
+  publish,
+} from "./helpers.ts";
 
 const UP = "\x1b[A";
 const DOWN = "\x1b[B";
@@ -832,6 +839,16 @@ test("a slot with no registration still offers the shared settings", () => {
   const screen = editor.render(80).join("\n");
   assert.match(screen, /id: usage/);
   assert.match(screen, /priority: \(50\)/);
+});
+
+test("the catalog keeps a slot that published once and then went quiet", () => {
+  const registry = createRegistry();
+  publish(registry, { id: "perm-network", text: "Network: open" });
+  clearSlot(registry, "perm-network");
+
+  const { editor, press } = harness(defaultConfig(), true, { registry });
+  press("a", ...new Array(ITEM_TYPES.length).fill(DOWN));
+  assert.match(editor.render(80).join("\n"), /slot:perm-network\s+\(no value yet\)/);
 });
 
 test("the catalog lists a producer that registered but has not published", () => {

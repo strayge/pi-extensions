@@ -357,6 +357,11 @@ actually change: a reload that read the same file back rewrites nothing.
 A slot in the `extensions` catch-all has nowhere to carry options, so it renders
 with the extension's own defaults.
 
+The layout editor offers every slot published at least once this session, so one
+that only appears under some condition — a warning, a lifted restriction — can
+still be placed while it is quiet. It shows as `(no value yet)` until it speaks
+again.
+
 Placement rules, in order:
 
 1. A `{ "type": "slot", "id": "usage" }` item in your config wins outright.

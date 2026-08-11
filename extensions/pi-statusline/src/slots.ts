@@ -61,6 +61,12 @@ export const OPTIONS_CHANNEL = "statusline:options";
 export class SlotRegistry {
   private items = new Map<string, SlotItem>();
   private registrations = new Map<string, SlotRegistration>();
+  /**
+   * Every id published this session, kept past a clear. A slot reporting a
+   * condition is quiet most of the time, and forgetting it the moment it goes
+   * quiet would leave it placeable only while it happens to be showing.
+   */
+  private seen = new Set<string>();
   /** One message per id: a broken producer is asked to render on every frame. */
   private failures = new Map<string, string>();
   private pi: ExtensionAPI;
@@ -77,6 +83,7 @@ export class SlotRegistry {
       const item = parseSlotItem(data);
       if (!item) return;
       const previous = this.items.get(item.id);
+      this.seen.add(item.id);
       if (previous && slotItemsEqual(previous, item)) return;
       this.items.set(item.id, item);
       this.onChange();
@@ -117,6 +124,11 @@ export class SlotRegistry {
 
   all(): SlotItem[] {
     return [...this.items.values()];
+  }
+
+  /** Ids the layout editor may offer, including ones currently cleared. */
+  known(): string[] {
+    return [...new Set([...this.seen, ...this.registrations.keys()])];
   }
 
   registration(id: string): SlotRegistration | undefined {
