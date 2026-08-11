@@ -478,6 +478,7 @@ test("yolo: never prompts, never blocks, protected paths bypassed", { skip }, as
     await h.perm("yolo");
     assert.match(h.ctx.status, /^YOLO$/);
     assert.equal(await h.call("bash", { command: "sudo rm -rf /" }), undefined);
+    assert.equal(await h.call("bash", { command: "printf one\nprintf two" }), undefined);
     assert.equal(await h.call("edit", { path: ".env" }), undefined);
     assert.equal(await h.call("write", { path: ".git/config" }), undefined);
     assert.equal(h.ctx.prompts.length, 0);

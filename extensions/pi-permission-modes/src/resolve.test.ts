@@ -13,6 +13,11 @@ test("matchPattern: * spans path separators, ? is one char", () => {
   assert.ok(!matchPattern("file?.txt", "file12.txt"));
 });
 
+test("matchPattern: wildcards span newlines in multiline bash commands", () => {
+  assert.ok(matchPattern("*", "printf one\nprintf two"));
+  assert.ok(matchPattern("printf ?", "printf \n"));
+});
+
 test("matchPattern: regex metacharacters in the pattern are literal", () => {
   assert.ok(matchPattern("a.b+c", "a.b+c"));
   assert.ok(!matchPattern("a.b+c", "aXbbbc")); // '.' and '+' must be literal
