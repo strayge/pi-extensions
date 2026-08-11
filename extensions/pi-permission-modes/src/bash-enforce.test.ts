@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { type BashGate, bashExecPlan, bashGate, bashSubject } from "./bash-enforce.ts";
+import { type BashGate, bashExecPlan, bashGate, bashPromptTitle, bashSubject } from "./bash-enforce.ts";
 
 const OUTSIDE = "path outside project: /etc/passwd";
 
@@ -10,6 +10,14 @@ test("bashSubject: names the commands, collapsing a long list to a count", () =>
   assert.equal(bashSubject(["cd", "git", "head"]), "cd, git, head commands");
   assert.equal(bashSubject(["a", "b", "c", "d", "e"]), "a, b, c, d, e commands");
   assert.equal(bashSubject(["a", "b", "c", "d", "e", "f", "g"]), "a, b, c, d, e and 2 more commands");
+});
+
+test("bashPromptTitle: lists full commands comma-separated above the choices", () => {
+  assert.equal(
+    bashPromptTitle("Allow git, npm commands?", ["git status", "npm run check", "bash -c echo one\necho two"]),
+    "Allow git, npm commands?\n\nCommands to allow: git status, npm run check, bash -c echo one echo two",
+  );
+  assert.equal(bashPromptTitle("Allow bash?", []), "Allow bash?");
 });
 
 test("bashGate: the subject titles every prompt variant", () => {

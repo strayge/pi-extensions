@@ -47,9 +47,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { CONFIG_DIR_NAME, createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { ALWAYS_ALLOW, askApproval, askWithSession, SessionApprovals } from "./approvals.ts";
+import { ALWAYS_ALLOW, type ApprovalScope, askApproval, askWithSession, SessionApprovals } from "./approvals.ts";
 import { sandboxAwarenessPrompt } from "./awareness.ts";
-import { bashExecPlan, bashGate, bashSubject } from "./bash-enforce.ts";
+import { bashExecPlan, bashGate, bashPromptTitle, bashSubject } from "./bash-enforce.ts";
 import { analyzeBash } from "./bash-parse.ts";
 import {
   isUnsafeDomain,
@@ -722,8 +722,10 @@ export default async function (pi: ExtensionAPI) {
       if (analysis.unparsed) action = mostRestrictive(action, "ask") ?? "ask";
       const extracted = analysis.commands.map((c) => ({ ...bashRulePatterns(c.name, c.args), name: c.name, args: c.args }));
       const keyed = !analysis.unparsed && extracted.length > 0;
+      const policyAsks = keyed ? extracted.filter((c) => decideBashCommand(m, c.name, c.args) === "ask") : [];
+      const approvalTargets = policyAsks.length > 0 ? policyAsks : extracted;
       const pending = keyed
-        ? extracted.filter((c) => !approvals.has(modeName, "bash", c.command))
+        ? approvalTargets.filter((c) => !approvals.has(modeName, "bash", c.command))
         : [];
       if (((keyed && pending.length === 0) || (analysis.unparsed && approvals.has(modeName, "bash", command))) && action === "ask") {
         action = "allow";
@@ -738,8 +740,9 @@ export default async function (pi: ExtensionAPI) {
       );
       if (gate.kind === "block") return { block: true, reason: gate.reason };
       if (gate.kind === "prompt") {
-        const title = analysis.unparsed ? `${gate.title} (script could not be fully parsed)` : gate.title;
-        const policyAsks = extracted.filter((c) => decideBashCommand(m, c.name, c.args) === "ask");
+        const baseTitle = analysis.unparsed ? `${gate.title} (script could not be fully parsed)` : gate.title;
+        const commandsToAllow = keyed ? pending.map((c) => c.command) : [command];
+        const title = bashPromptTitle(baseTitle, commandsToAllow);
         const persistenceBase =
           !analysis.unparsed &&
           !analysis.outsideReason &&
@@ -751,18 +754,15 @@ export default async function (pi: ExtensionAPI) {
         const firstOptions = globalEligible || projectEligible
           ? ["Allow once", "Allow for session", ALWAYS_ALLOW, "Deny"]
           : ["Allow once", "Allow for session", "Deny"];
-        const scope = await askApproval(
-          { hasUI: ctx.hasUI, select: (t, o) => ctx.ui.select(t, o) },
-          title,
-          firstOptions,
-        );
-        if (scope === "session") {
-          for (const c of keyed ? extracted : [{ command, narrow: [command], broad: [command] }]) {
-            const patterns = keyed ? c.narrow : [command];
-            for (const pattern of patterns) approvals.remember(modeName, "bash", pattern);
-          }
-        }
-        if (scope === "forever-global" || scope === "forever-project") {
+        let scope: ApprovalScope = "deny";
+        while (true) {
+          scope = await askApproval(
+            { hasUI: ctx.hasUI, select: (t, o) => ctx.ui.select(t, o) },
+            title,
+            firstOptions,
+          );
+          if (scope !== "forever-global" && scope !== "forever-project") break;
+
           const persistCommands = policyAsks;
           const broadLabel = [...new Set(persistCommands.map((command) => command.name))].join(", ");
           const broadPatterns = persistCommands.flatMap((command) => command.broad);
@@ -779,9 +779,9 @@ export default async function (pi: ExtensionAPI) {
               ];
           if (!ctx.hasUI) return { block: true, reason: gate.reason };
           const selectedChoice = await ctx.ui.select("Always allow which bash scope?", choices.map((choice) => choice.label));
-          if (!selectedChoice) return { block: true, reason: gate.reason };
+          if (!selectedChoice) continue;
           const selected = choices.find((choice) => choice.label === selectedChoice);
-          if (!selected) return { block: true, reason: gate.reason };
+          if (!selected) continue;
           try {
             for (const pattern of [...new Set(selected.patterns)]) {
               if (selected.project) persistProjectRule(ctx.cwd, modeName, "bash", pattern, "allow");
@@ -792,6 +792,13 @@ export default async function (pi: ExtensionAPI) {
           } catch (e) {
             ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
             return { block: true, reason: gate.reason };
+          }
+          break;
+        }
+        if (scope === "session") {
+          for (const c of keyed ? approvalTargets : [{ command, narrow: [command], broad: [command] }]) {
+            const patterns = keyed ? c.narrow : [command];
+            for (const pattern of patterns) approvals.remember(modeName, "bash", pattern);
           }
         }
         if (scope === "deny") return { block: true, reason: gate.reason };

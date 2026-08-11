@@ -37,6 +37,17 @@ export function bashSubject(names: string[]): string {
   return `${names.slice(0, SUBJECT_LIST_MAX).join(", ")} and ${names.length - SUBJECT_LIST_MAX} more commands`;
 }
 
+/**
+ * Show the exact parsed scopes covered by the confirmation above its choices.
+ * The short subject alone hides subcommands and arguments, which makes it hard
+ * to tell what "Allow for session" or persistent approval would authorize.
+ */
+export function bashPromptTitle(title: string, commands: string[]): string {
+  if (commands.length === 0) return title;
+  const inline = commands.map((command) => command.replace(/\s*\n\s*/g, " "));
+  return `${title}\n\nCommands to allow: ${inline.join(", ")}`;
+}
+
 export interface BashGate {
   kind: BashGateKind;
   /** Prompt title (when kind === "prompt"). */

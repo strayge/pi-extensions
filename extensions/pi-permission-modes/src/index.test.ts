@@ -323,14 +323,15 @@ test("bash: Always allow opens explicit narrow choices and persists both narrow 
   }
 });
 
-test("bash: dismissing the second persistence prompt denies", { skip }, async () => {
+test("bash: dismissing the persistence submenu returns to the main prompt", { skip }, async () => {
   const h = await setup();
   try {
     await useUnsandboxedAskMode(h);
-    h.ctx.answers.push("Always allow…", undefined);
-    const result = await h.call("bash", { command: "git fetch origin" });
-    assert.equal(result?.block, true);
-    assert.equal(h.ctx.prompts.length, 2);
+    h.ctx.answers.push("Always allow…", undefined, "Allow once");
+    assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
+    assert.equal(h.ctx.prompts.length, 3);
+    assert.equal(h.ctx.prompts[2].title, h.ctx.prompts[0].title);
+    assert.deepEqual(h.ctx.prompts[2].options, h.ctx.prompts[0].options);
   } finally {
     h.cleanup();
   }
@@ -426,18 +427,46 @@ test("/perm init -p scaffolds the project schema and project grants notify once"
   }
 });
 
-test("bash: a re-prompt names only the commands still missing a grant", { skip }, async () => {
+test("bash: prompt details omit commands already allowed by policy", { skip }, async () => {
+  const h = await setup();
+  try {
+    const dir = path.join(h.agentDir, "permission-mode");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path.join(dir, "permission-mode.json"),
+      JSON.stringify({ modes: { default: { permission: { bash: { "*": "ask", "echo *": "allow" } } } } }),
+    );
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    h.ctx.answers.push("Allow once");
+    assert.equal(await h.call("bash", { command: "ls -la && echo okay && git status" }), undefined);
+    assert.equal(
+      h.ctx.prompts[0]?.title,
+      "Allow ls, git commands? (sandbox unavailable)\n\nCommands to allow: ls -la, git status",
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: prompts show every full command still missing a grant", { skip }, async () => {
   const h = await setup();
   try {
     h.ctx.answers.push("Allow for session");
     assert.equal(await h.call("bash", { command: 'ls -la && echo "---" && ls src' }), undefined);
     // The suffix comes from the harness running without a sandbox.
-    assert.equal(h.ctx.prompts[0]?.title, "Allow ls, echo commands? (sandbox unavailable)");
+    assert.equal(
+      h.ctx.prompts[0]?.title,
+      "Allow ls, echo commands? (sandbox unavailable)\n\nCommands to allow: ls -la, echo ---, ls src",
+    );
 
-    // echo is already granted, so only the names that reopened the prompt appear.
+    // echo is already granted, so only the full commands that reopened the prompt appear.
     h.ctx.answers.push("Allow for session");
     assert.equal(await h.call("bash", { command: 'cd src && git remote -v && echo "---" && git status | head -20' }), undefined);
-    assert.equal(h.ctx.prompts[1]?.title, "Allow cd, git, head commands? (sandbox unavailable)");
+    assert.equal(
+      h.ctx.prompts[1]?.title,
+      "Allow cd, git, head commands? (sandbox unavailable)\n\nCommands to allow: cd src, git remote -v, git status, head -20",
+    );
   } finally {
     h.cleanup();
   }
