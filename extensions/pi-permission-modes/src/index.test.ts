@@ -210,8 +210,8 @@ async function setup(
 test("default mode: reads free, writes prompt, protected paths hard-block", { skip }, async () => {
   const h = await setup();
   try {
-    // Footer: mode label + shortcut hints + network state (open here: --no-sandbox).
-    assert.match(h.ctx.status, /^Default \(alt\+m\)  Network: open$/);
+    // --no-sandbox: nothing filters, and a sandboxing mode says so.
+    assert.match(h.ctx.status, /^Default  Network: open$/);
 
     // Reads pass silently.
     assert.equal(await h.call("read", { path: "src/app.ts" }), undefined);
@@ -288,7 +288,7 @@ test("yolo: never prompts, never blocks, protected paths bypassed", { skip }, as
   const h = await setup();
   try {
     await h.perm("yolo");
-    assert.match(h.ctx.status, /^YOLO /);
+    assert.match(h.ctx.status, /^YOLO$/);
     assert.equal(await h.call("bash", { command: "sudo rm -rf /" }), undefined);
     assert.equal(await h.call("edit", { path: ".env" }), undefined);
     assert.equal(await h.call("write", { path: ".git/config" }), undefined);
@@ -424,7 +424,7 @@ test("headless child with an explicitly forwarded mode keeps its system prompt",
 test("startup: --perm flag wins; a persisted session entry restores the mode", { skip }, async () => {
   const flagged = await setup({ permFlag: "yolo" });
   try {
-    assert.match(flagged.ctx.status, /^YOLO /);
+    assert.match(flagged.ctx.status, /^YOLO$/);
   } finally {
     flagged.cleanup();
   }
@@ -437,13 +437,13 @@ test("startup: --perm flag wins; a persisted session entry restores the mode", {
   }
 });
 
-test("alt+m cycles modes and persists the choice as a session entry", { skip }, async () => {
+test("shift+tab cycles modes and persists the choice as a session entry", { skip }, async () => {
   const h = await setup();
   try {
-    await h.pi.shortcuts.get("alt+m")!(h.ctx);
+    await h.pi.shortcuts.get("shift+tab")!(h.ctx);
     assert.match(h.ctx.status, /^Plan Mode /); // default → plan (cycleOrder)
     assert.deepEqual(h.pi.entries.at(-1), { customType: "perm-mode", data: { mode: "plan" } });
-    await h.pi.shortcuts.get("alt+m")!(h.ctx);
+    await h.pi.shortcuts.get("shift+tab")!(h.ctx);
     assert.match(h.ctx.status, /^Build /);
   } finally {
     h.cleanup();

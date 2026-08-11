@@ -61,7 +61,7 @@ for OS-level enforcement.
 ### Verify
 
 1. Start pi in any project — the footer shows a mode indicator, e.g. `Default`.
-2. Switch to Build (`alt+m` until `Build`, or `/perm build`):
+2. Switch to Build (`shift+tab` until `Build`, or `/perm build`):
    - sandbox active → `Build (sandboxed in project dir)`;
    - otherwise → `Build (!) sandbox-runtime missing ...` plus a fix-it notification.
 3. `/sandbox` prints the active sandbox configuration (or why it's unavailable).
@@ -70,16 +70,19 @@ for OS-level enforcement.
 
 ## Modes
 
-Cycle with **`alt+m`** or set directly with **`/perm <mode>`**. The current mode
+Cycle with **`shift+tab`** or set directly with **`/perm <mode>`**. The current mode
 is persisted per session (survives `/reload`, resume, and branch navigation) and
 shown in the footer.
 
 Default, Plan Mode, and Build all run in-project `bash` inside the OS sandbox.
-The footer always shows the mode, the network state, and their shortcuts —
-e.g. `Build (sandboxed in project dir, alt+m)  Network: filtered (alt+n)` —
-with the network chip green while the domain allowlist filters and orange when
-open (see [Network](#network)). Only YOLO is unsandboxed. Labels are plain text
-(no icons); `alt+m` cycles in the order below. The table describes the **shipped defaults** — every mode is data and can
+The footer shows the mode, and a network chip only when the network is *not* in
+the state the mode asked for — so a bare `Build` means the allowlist is
+filtering, and `Build  Network: open` (green) means it was lifted for the
+session (see [Network](#network)). A mode whose sandbox is unavailable reports
+`Network: open` too — the missing filtering is unintended there — plus a `(!)`
+warning when the reason is known (`--no-sandbox` is not one);
+`/sandbox` prints the full state. Only YOLO is unsandboxed. Labels are plain text
+(no icons); `shift+tab` cycles in the order below. The table describes the **shipped defaults** — every mode is data and can
 be retuned, and you can add your own, in `permission-mode.json` (see
 [Configuration](#configuration)).
 
@@ -131,8 +134,8 @@ allowlist** (package registries + GitHub by default). This is no longer a silent
 wall — a request to a host outside the allowlist **pauses while you're asked**
 (*Allow for session / Allow forever / Deny*), then proceeds or fails:
 
-- **`alt+n`** toggles filtering for the session: `Network: filtered` (green) ⇄
-  `Network: open` (orange) in the footer, which always shows the shortcut.
+- **`alt+n`** toggles filtering for the session; the footer marks it (see
+  [Modes](#modes)).
 - **`/net`** — `status` (allowlist, session grants/denies), `allow <domain…>`
   (grant for the session), `open` / `restrict` (same as `alt+n`), `reset`
   (forget session grants/denies).

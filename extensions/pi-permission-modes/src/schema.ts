@@ -131,7 +131,7 @@ export interface ModeDef {
 export interface PermissionModeConfig {
   $schema?: string;
   defaultMode: string;
-  /** alt+m cycle order; also the display order. */
+  /** shift+tab cycle order; also the display order. */
   cycleOrder: string[];
   modes: Record<string, ModeDef>;
 }
@@ -167,7 +167,7 @@ export function planModeSystemPrompt(today: string): string {
     "   displays it.",
     "4. After show_plan, do NOT summarize, recap, or describe the plan, and add no other",
     "   commentary. Your entire reply must be a single short line: ask the user to review",
-    "   the plan and press `alt+m` (or run `/perm build`) to switch to Build mode and apply it.",
+    "   the plan and press `shift+tab` (or run `/perm build`) to switch to Build mode and apply it.",
     "",
     "For quick questions that aren't planning tasks, just answer normally.",
   ].join("\n");

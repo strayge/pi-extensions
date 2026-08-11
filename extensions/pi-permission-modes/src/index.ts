@@ -1,7 +1,7 @@
 /**
  * Permission Mode extension
  *
- * Switchable, data-driven permission modes (cycle with alt+m or /perm). A MODE
+ * Switchable, data-driven permission modes (cycle with shift+tab or /perm). A MODE
  * is a JSON bundle of a sandbox profile + an allow/ask/deny permission policy +
  * UI metadata, defined in `schema.ts` (built-in defaults) and overridable in
  * `permission-mode.json`. The four shipped modes:
@@ -112,7 +112,7 @@ export default async function (pi: ExtensionAPI) {
   // True when the current mode was auto-picked as the headless-child safety
   // fallback (no --perm flag, session entry, or forwarded env). The mode's
   // POLICY fully applies, but its systemPrompt is not injected — a planning
-  // prompt steering a headless worker to write plan files and ask about alt+m
+  // prompt steering a headless worker to write plan files and ask about shift+tab
   // would misdirect it — and the fallback isn't exported to child processes
   // as if it were an explicit choice (children re-derive their own fallback).
   let fallbackMode = false;
@@ -270,7 +270,7 @@ export default async function (pi: ExtensionAPI) {
     return { name: resolved ?? modeName, fallback: false };
   };
 
-  pi.registerShortcut("alt+m", {
+  pi.registerShortcut("shift+tab", {
     description: `Cycle permission mode (${config.cycleOrder.join(" -> ")})`,
     handler: async (ctx) => cycle(ctx),
   });
