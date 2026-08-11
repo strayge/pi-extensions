@@ -51,8 +51,6 @@ test("isProtectedPath: segment-aware match of the expanded protected set", () =>
   assert.equal(isProtectedPath(".vscode/settings.json"), true);
   assert.equal(isProtectedPath("sub/.idea/workspace.xml"), true);
   assert.equal(isProtectedPath("home/.bashrc"), true);
-  assert.equal(isProtectedPath(".claude/commands/foo.md"), true);
-  assert.equal(isProtectedPath(".claude/agents/bar.md"), true);
 });
 
 test("isProtectedPath: does not flag look-alikes (no loose substring)", () => {
@@ -60,6 +58,8 @@ test("isProtectedPath: does not flag look-alikes (no loose substring)", () => {
   assert.equal(isProtectedPath("src/.environment.ts"), false); // not .env / .env.*
   assert.equal(isProtectedPath("my.gitignore"), false);
   assert.equal(isProtectedPath("docs/environment.md"), false);
+  assert.equal(isProtectedPath(".claude/commands/foo.md"), false);
+  assert.equal(isProtectedPath(".claude/agents/bar.md"), false);
 });
 
 test("gitFileBlocksSandbox distinguishes 0-byte stub vs real gitfile", () => {
@@ -150,7 +150,7 @@ test("removeSandboxPlaceholders deletes 0-byte placeholders, leaves real files/d
     mkdirSync(proj, { recursive: true });
 
     // 0-byte placeholders the sandbox plants (files for dotfiles AND dir-names).
-    for (const name of [".bashrc", ".zshrc", ".gitconfig", ".mcp.json", ".git", ".vscode", ".idea", ".claude"]) {
+    for (const name of [".bashrc", ".zshrc", ".gitconfig", ".mcp.json", ".git", ".vscode", ".idea"]) {
       writeFileSync(path.join(proj, name), "");
     }
     // Legitimate content that must NOT be touched:
@@ -160,8 +160,8 @@ test("removeSandboxPlaceholders deletes 0-byte placeholders, leaves real files/d
     mkdirSync(path.join(realIdea, ".idea"), { recursive: true }); // a real .idea DIR (separate proj)
 
     const removed = removeSandboxPlaceholders(proj);
-    assert.equal(removed, 8); // all 8 zero-byte placeholders gone
-    for (const name of [".bashrc", ".zshrc", ".gitconfig", ".mcp.json", ".git", ".vscode", ".idea", ".claude"]) {
+    assert.equal(removed, 7); // all 7 zero-byte placeholders gone
+    for (const name of [".bashrc", ".zshrc", ".gitconfig", ".mcp.json", ".git", ".vscode", ".idea"]) {
       assert.equal(existsSync(path.join(proj, name)), false, name);
     }
     assert.equal(existsSync(path.join(proj, ".gitmodules")), true); // real file kept
@@ -172,15 +172,8 @@ test("removeSandboxPlaceholders deletes 0-byte placeholders, leaves real files/d
     mkdirSync(none, { recursive: true });
     assert.equal(removeSandboxPlaceholders(none), 0);
 
-    // Nested .claude/{commands,agents} placeholders inside a real .claude dir.
-    const nested = path.join(base, "nested");
-    mkdirSync(path.join(nested, ".claude"), { recursive: true });
-    writeFileSync(path.join(nested, ".claude", "commands"), "");
-    assert.equal(removeSandboxPlaceholders(nested), 1);
-    assert.equal(existsSync(path.join(nested, ".claude")), true); // real dir kept
-    assert.equal(existsSync(path.join(nested, ".claude", "commands")), false);
-
     assert.ok(SANDBOX_PLACEHOLDER_PATHS.includes(".mcp.json"));
+    assert.equal(SANDBOX_PLACEHOLDER_PATHS.some((entry) => entry.startsWith(".claude")), false);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

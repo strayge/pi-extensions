@@ -131,8 +131,8 @@ and runs **unsandboxed** once you approve it; and `edit`/`write` to
 > **Sandbox placeholder cleanup:** the sandbox runtime write-protects a fixed set
 > of dotfiles/dirs at the project root (`.git`, `.gitconfig`, `.gitmodules`,
 > `.bashrc`/`.zshrc`/… shell rc files, `.npmrc`, `.ripgreprc`, `.mcp.json`,
-> `.vscode`, `.idea`, `.claude/{commands,agents}`). When one of these is **absent**,
-> it blocks the path by mounting `/dev/null` over the first missing component, and
+> `.vscode`, `.idea`). When one of these is **absent**, it blocks the path by
+> mounting `/dev/null` over the first missing component, and
 > — because the project is writable in Default/Build — bubblewrap materializes that
 > mountpoint as a **0-byte, read-only file** that survives teardown (and, for
 > `.git`, would break the next command). The extension keeps such projects **fully
@@ -140,6 +140,12 @@ and runs **unsandboxed** once you approve it; and `edit`/`write` to
 > sandboxed run, so nothing accumulates. Only 0-byte *files* are removed — real
 > directories (`.vscode/`, `.git/`, …) and non-empty files (`.gitmodules`, …) are
 > never touched.
+>
+> The upstream runtime also protects `.claude/{commands,agents}` for Claude Code.
+> This Pi package applies a pinned `patch-package` patch at install time to omit
+> those paths: Pi does not consume them, and mounting absent nested paths can race
+> with the runtime's temporary placeholder files. The extension's file-tool
+> backstop likewise leaves `.claude/` writable.
 >
 > A **real git worktree/submodule** (`.git` is a *non-empty* file pointing at the
 > real gitdir) genuinely can't be sandboxed — bubblewrap can't bind `.git/hooks`
@@ -289,9 +295,9 @@ first-use prompt, or to `"deny"` to block.)
 `edit`/`write` to protected paths are hard-blocked — matched by path segment, not
 loose substring, on both the literal target **and** its symlink-resolved
 canonical path (so a link pointing at `.git/` or a dotfile can't smuggle a write
-past the backstop). The set mirrors the sandbox-runtime mandatory-deny list: `.git/`,
-`node_modules/`, `.vscode/`, `.idea/`, `.env`/`.env.*`, `.claude/{commands,agents}/`,
-and common dotfiles (`.bashrc`, `.zshrc`, `.profile`, `.gitconfig`, `.npmrc`, …).
+past the backstop). The set mirrors the Pi-specific sandbox-runtime mandatory-deny
+list: `.git/`, `node_modules/`, `.vscode/`, `.idea/`, `.env`/`.env.*`, and common
+dotfiles (`.bashrc`, `.zshrc`, `.profile`, `.gitconfig`, `.npmrc`, …).
 This matters most in Build, where file tools aren't OS-sandboxed.
 
 ---

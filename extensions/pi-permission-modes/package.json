@@ -15,6 +15,7 @@
   "files": [
     "src",
     "schemas",
+    "patches",
     "permission-mode.defaults.json",
     "README.md"
   ],
@@ -27,6 +28,7 @@
     ]
   },
   "scripts": {
+    "postinstall": "patch-package",
     "check": "biome check . && tsc --noEmit && npm test",
     "format": "biome check --write .",
     "typecheck": "tsc --noEmit",
@@ -34,6 +36,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.26",
+    "patch-package": "8.0.1",
     "tree-sitter-bash": "^0.25.1",
     "web-tree-sitter": "^0.25.10"
   },

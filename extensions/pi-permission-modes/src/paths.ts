@@ -134,8 +134,8 @@ export function sandboxMountPath(pattern: string, cwd: string = process.cwd(), h
 /**
  * The OS sandbox write-protects a fixed set of dotfiles/dirs at the project root
  * (its mandatory-deny list — `@anthropic-ai/sandbox-runtime`'s `DANGEROUS_FILES`
- * + `DANGEROUS_DIRECTORIES` + the `.claude/{commands,agents}` denies). When such
- * a path is ABSENT, the runtime denies it by mounting `/dev/null` over the first
+ * + `DANGEROUS_DIRECTORIES`). When such a path is ABSENT, the runtime denies it
+ * by mounting `/dev/null` over the first
  * missing component, and because the project is writable in Default/Build,
  * bubblewrap materializes that mountpoint as a **0-byte, read-only file** that
  * survives teardown — littering the project (and, for `.git`, breaking the next
@@ -154,16 +154,13 @@ export const SANDBOX_PLACEHOLDER_PATHS = [
   ".mcp.json",
   ".vscode",
   ".idea",
-  ".claude",
-  ".claude/commands",
-  ".claude/agents",
 ];
 
 /**
  * Delete any 0-byte placeholder files the sandbox left at the project root.
  * Only removes a path that is a **0-byte regular file** — a legitimate version
- * of any of these is a directory (`.git`, `.vscode`, `.idea`, `.claude`) or a
- * non-empty file (`.gitmodules`, `.mcp.json`, shell rc files), so real files and
+ * of any of these is a directory (`.git`, `.vscode`, `.idea`) or a non-empty
+ * file (`.gitmodules`, `.mcp.json`, shell rc files), so real files and
  * dirs are never touched. Called before & after each sandboxed run; best-effort.
  * Returns the number of placeholders removed.
  */
@@ -214,8 +211,8 @@ export function isPlanFile(root: string, p?: string): boolean {
 /**
  * True when a write target is a protected path. Segment-aware (not a loose
  * substring): matches protected directory names anywhere in the path, `.env`
- * and `.env.*` files, known dotfiles, and `.claude/{commands,agents}`.
- * Purely lexical — see `isProtectedWrite` for the symlink-resolving backstop.
+ * and `.env.*` files, and known dotfiles. Purely lexical — see
+ * `isProtectedWrite` for the symlink-resolving backstop.
  */
 export function isProtectedPath(p: string): boolean {
   const segments = p.split(/[/\\]+/).filter(Boolean);
@@ -225,9 +222,6 @@ export function isProtectedPath(p: string): boolean {
   if (segments.some((s) => PROTECTED_DIRS.includes(s))) return true;
   if (base === ".env" || base.startsWith(".env.")) return true;
   if (PROTECTED_FILES.has(base)) return true;
-  for (let i = 0; i + 1 < segments.length; i++) {
-    if (segments[i] === ".claude" && (segments[i + 1] === "commands" || segments[i + 1] === "agents")) return true;
-  }
   return false;
 }
 
