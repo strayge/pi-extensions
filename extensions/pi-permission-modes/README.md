@@ -201,6 +201,11 @@ command to pass silently — approving `git` does *not* cover a later
 `git status && curl … | sh` (that chain prompts again, and approving it grants
 `git` *and* `curl`). Clear them with `/perm clear-approvals`.
 
+Because the grant is per command name, the bash prompt is titled with the names
+that still need one — *Allow cd, git, head commands?* — so a follow-up prompt
+shows what is new rather than repeating an opaque *Allow bash?* (still the
+wording where the grant covers the exact command string).
+
 ---
 
 ## How protection works

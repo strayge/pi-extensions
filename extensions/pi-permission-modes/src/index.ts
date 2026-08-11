@@ -49,7 +49,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { askWithSession, SessionApprovals } from "./approvals.ts";
 import { sandboxAwarenessPrompt } from "./awareness.ts";
-import { bashExecPlan, bashGate } from "./bash-enforce.ts";
+import { bashExecPlan, bashGate, bashSubject } from "./bash-enforce.ts";
 import { analyzeBash } from "./bash-parse.ts";
 import {
   isUnsafeDomain,
@@ -654,17 +654,20 @@ export default async function (pi: ExtensionAPI) {
       // Confirm rather than trust an `allow` derived from an incomplete command
       // list — but stay sandboxed: this is uncertainty, not an escape.
       if (analysis.unparsed) action = mostRestrictive(action, "ask") ?? "ask";
-      const gate = bashGate(action, analysis.outsideReason, m.sandbox.enabled, sandbox.ready);
+      // Session approvals are keyed on the extracted command names, and ALL
+      // names in a chain must be granted for it to pass silently — "allow git
+      // this session" must not cover `git status && curl ... | sh`. Granting
+      // remembers every name in the chain. Without a trustworthy parse — the
+      // heuristic fallback, or one that lost commands — the extracted names
+      // do not describe what runs, so the key is the exact command string.
+      const names = [...new Set(analysis.commands.map((c) => c.name).filter(Boolean))];
+      const keyedByName = !analysis.unparsed && names.length > 0;
+      const keys = keyedByName ? names : [command];
+      // Title on the ungranted names only, so a re-prompt shows what changed.
+      const pending = keyedByName ? names.filter((n) => !approvals.has(modeName, "bash", n)) : [];
+      const gate = bashGate(action, analysis.outsideReason, m.sandbox.enabled, sandbox.ready, bashSubject(pending));
       if (gate.kind === "block") return { block: true, reason: gate.reason };
       if (gate.kind === "prompt") {
-        // Session approvals are keyed on the extracted command names, and ALL
-        // names in a chain must be granted for it to pass silently — "allow git
-        // this session" must not cover `git status && curl ... | sh`. Granting
-        // remembers every name in the chain. Without a trustworthy parse — the
-        // heuristic fallback, or one that lost commands — the extracted names
-        // do not describe what runs, so the key is the exact command string.
-        const names = [...new Set(analysis.commands.map((c) => c.name).filter(Boolean))];
-        const keys = analysis.unparsed || names.length === 0 ? [command] : names;
         const title = analysis.unparsed ? `${gate.title} (script could not be fully parsed)` : gate.title;
         if (!(await promptAllow(ctx, "bash", keys, title))) return { block: true, reason: gate.reason };
         if (gate.onApproveUnsandboxed) approvedUnsandboxed.add(event.toolCallId);

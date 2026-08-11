@@ -1,8 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { type BashGate, bashExecPlan, bashGate } from "./bash-enforce.ts";
+import { type BashGate, bashExecPlan, bashGate, bashSubject } from "./bash-enforce.ts";
 
 const OUTSIDE = "path outside project: /etc/passwd";
+
+test("bashSubject: names the commands, collapsing a long list to a count", () => {
+  assert.equal(bashSubject([]), "bash");
+  assert.equal(bashSubject(["git"]), "git command");
+  assert.equal(bashSubject(["cd", "git", "head"]), "cd, git, head commands");
+  assert.equal(bashSubject(["a", "b", "c", "d", "e"]), "a, b, c, d, e commands");
+  assert.equal(bashSubject(["a", "b", "c", "d", "e", "f", "g"]), "a, b, c, d, e and 2 more commands");
+});
+
+test("bashGate: the subject titles every prompt variant", () => {
+  const subject = bashSubject(["cd", "git"]);
+  assert.equal(bashGate("ask", undefined, true, true, subject).title, "Allow cd, git commands?");
+  assert.match(bashGate("ask", undefined, false, true, subject).title, /^Allow cd, git commands\? \(sandbox disabled/);
+  assert.equal(bashGate("allow", OUTSIDE, true, true, subject).title, `Allow cd, git commands? (${OUTSIDE})`);
+  assert.equal(bashGate("allow", undefined, true, false, subject).title, "Allow cd, git commands? (sandbox unavailable)");
+  assert.equal(bashGate("ask", undefined, true, true).title, "Allow bash?"); // caller had no usable names
+});
 
 test("bashGate: sandbox disabled still honors allow/ask policy", () => {
   for (const ready of [true, false]) {

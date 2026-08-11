@@ -18,6 +18,25 @@ import type { Action } from "./schema.ts";
 
 export type BashGateKind = "allow" | "prompt" | "block";
 
+/** Cap on names spelled out in a title, so a long chain stays readable. */
+const SUBJECT_LIST_MAX = 5;
+
+/**
+ * Name what a prompt is actually asking to grant.
+ *
+ * A bare "Allow bash?" repeated for every chain reads like the extension forgot
+ * the previous answer, when in fact session grants are keyed per command name
+ * and a new name in the chain is what re-opened the prompt. Naming those
+ * commands makes the scope of "Allow for session" visible. An empty list means
+ * the names don't describe what runs, so the opaque wording stands.
+ */
+export function bashSubject(names: string[]): string {
+  if (names.length === 0) return "bash";
+  if (names.length === 1) return `${names[0]} command`;
+  if (names.length <= SUBJECT_LIST_MAX) return `${names.join(", ")} commands`;
+  return `${names.slice(0, SUBJECT_LIST_MAX).join(", ")} and ${names.length - SUBJECT_LIST_MAX} more commands`;
+}
+
 export interface BashGate {
   kind: BashGateKind;
   /** Prompt title (when kind === "prompt"). */
@@ -37,6 +56,7 @@ export interface BashGate {
  *                       undefined when the heuristic finds nothing concerning
  * @param sandboxEnabled the active mode's `sandbox.enabled`
  * @param sandboxReady   whether the OS sandbox is initialized and usable
+ * @param subject        what the title asks about, from `bashSubject`
  *
  * Parity with the old decideBash:
  *   - sandbox disabled, action=allow     → allow (runs unsandboxed via execPlan)
@@ -52,6 +72,7 @@ export function bashGate(
   outsideReason: string | undefined,
   sandboxEnabled: boolean,
   sandboxReady: boolean,
+  subject = "bash",
 ): BashGate {
   const gate = (kind: BashGateKind, title: string, reason: string, onApproveUnsandboxed: boolean): BashGate => ({
     kind,
@@ -68,20 +89,20 @@ export function bashGate(
   // a custom unsandboxed mode with `ask` continues to require confirmation.
   if (!sandboxEnabled) {
     if (action === "ask") {
-      return gate("prompt", "Allow bash? (sandbox disabled; command will run unsandboxed)", "bash blocked", true);
+      return gate("prompt", `Allow ${subject}? (sandbox disabled; command will run unsandboxed)`, "bash blocked", true);
     }
     return gate("allow", "", "", false);
   }
 
   // Out-of-project / privilege escalation: prompt, run unsandboxed once approved
   // (the sandbox would block a genuine escape anyway).
-  if (outsideReason) return gate("prompt", `Allow bash? (${outsideReason})`, "bash blocked", true);
+  if (outsideReason) return gate("prompt", `Allow ${subject}? (${outsideReason})`, "bash blocked", true);
 
   // In-project but the sandbox is unavailable: never run silently unprotected.
-  if (!sandboxReady) return gate("prompt", "Allow bash? (sandbox unavailable)", "bash blocked", true);
+  if (!sandboxReady) return gate("prompt", `Allow ${subject}? (sandbox unavailable)`, "bash blocked", true);
 
   // In-project, sandbox ready: the policy action drives it.
-  if (action === "ask") return gate("prompt", "Allow bash?", "bash blocked", false);
+  if (action === "ask") return gate("prompt", `Allow ${subject}?`, "bash blocked", false);
   return gate("allow", "", "", false);
 }
 

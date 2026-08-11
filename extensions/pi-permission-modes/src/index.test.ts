@@ -278,6 +278,23 @@ test("bash: session grant covers the same command, not a longer chain", { skip }
   }
 });
 
+test("bash: a re-prompt names only the commands still missing a grant", { skip }, async () => {
+  const h = await setup();
+  try {
+    h.ctx.answers.push("Allow for session");
+    assert.equal(await h.call("bash", { command: 'ls -la && echo "---" && ls src' }), undefined);
+    // The suffix comes from the harness running without a sandbox.
+    assert.equal(h.ctx.prompts[0]?.title, "Allow ls, echo commands? (sandbox unavailable)");
+
+    // echo is already granted, so only the names that reopened the prompt appear.
+    h.ctx.answers.push("Allow for session");
+    assert.equal(await h.call("bash", { command: 'cd src && git remote -v && echo "---" && git status | head -20' }), undefined);
+    assert.equal(h.ctx.prompts[1]?.title, "Allow cd, git, head commands? (sandbox unavailable)");
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("plan mode: Markdown-only writes, plan prompt injected, show_plan stays visible", { skip }, async () => {
   const h = await setup();
   try {
