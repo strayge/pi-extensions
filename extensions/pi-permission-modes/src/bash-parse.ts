@@ -54,7 +54,14 @@ const ARG_TYPES = new Set([
   "expansion",
 ]);
 
-const stripQuotes = (s: string): string => s.replace(/^['"]+|['"]+$/g, "");
+function stripQuotes(s: string): string {
+  if (s.length < 2) return s;
+  const first = s[0];
+  const last = s[s.length - 1];
+  if ((first === "'" || first === '"') && last === first) return s.slice(1, -1);
+  if (s.startsWith("$'") && last === "'") return s.slice(2, -1);
+  return s;
+}
 
 function parseCommand(node: SyntaxNodeLike, isNested: boolean): BashCommand {
   let name = "";

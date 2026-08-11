@@ -48,9 +48,15 @@ test("extractCommands: commands in a subshell are nested", () => {
   );
 });
 
-test("extractCommands: quotes are stripped from args", () => {
-  const c = node("command", "echo 'hi'", [cmdName("echo"), node("string", "'hi'")]);
-  assert.deepEqual(extractCommands(program(c))[0].args, ["hi"]);
+test("extractCommands: only the enclosing quote pair is stripped from args", () => {
+  const simple = node("command", "echo 'hi'", [cmdName("echo"), node("string", "'hi'")]);
+  assert.deepEqual(extractCommands(program(simple))[0].args, ["hi"]);
+
+  const nested = node("command", `fish -c "echo x='a b'"`, [
+    cmdName("fish"),
+    node("string", `"echo x='a b'"`),
+  ]);
+  assert.deepEqual(extractCommands(program(nested))[0].args, ["echo x='a b'"]);
 });
 
 test("outsideReasonFromCommands: privilege escalation by command name", () => {
@@ -240,6 +246,16 @@ test("analyzeBash: fish -c inner commands are extracted (skips if WASM absent)",
   );
   assert.equal(a.unparsed, false, "bash-compatible fish parses cleanly");
   assert.equal(a.outsideReason, undefined);
+
+  const nestedQuotes = await analyzeBash(
+    `fish -i -c "npm test -- --test-name-pattern='patched sandbox runtime'"`,
+    "/home/u/projX",
+  );
+  assert.equal(nestedQuotes.unparsed, false, "inner quotes at the end of a double-quoted script must be preserved");
+  assert.deepEqual(
+    nestedQuotes.commands.map((c) => c.name),
+    ["fish", "npm"],
+  );
 });
 
 test("analyzeBash: fish syntax the bash grammar cannot read is flagged (skips if WASM absent)", async () => {

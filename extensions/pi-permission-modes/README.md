@@ -246,8 +246,10 @@ Two independent layers compose:
    and fish's `and`/`or`/`not` modifiers are unwrapped so they cannot hide a
    command head. Block constructs (`for … end`, `switch … end`, `function …
    end`) have no bash reading and parse incompletely. Those are detected rather
-   than trusted: the command is marked **unparsed** and always prompts, so a
-   hidden `sudo` cannot ride through an `allow` rule.
+   than trusted: in sandboxed modes the command is marked **unparsed** and
+   prompts rather than letting a hidden `sudo` ride through an `allow` rule.
+   Explicitly unsandboxed modes keep their policy authoritative, so YOLO still
+   never prompts.
 2. **OS sandbox** (`@anthropic-ai/sandbox-runtime`): the real enforcement for
    bash. When a mode's `sandbox.enabled` is true, in-project bash runs wrapped by
    `sandbox-exec` (macOS) / `bubblewrap` (Linux), confining **writes** to the

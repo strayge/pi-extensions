@@ -529,6 +529,11 @@ test("yolo: never prompts, never blocks, protected paths bypassed", { skip }, as
     assert.match(h.ctx.status, /^YOLO$/);
     assert.equal(await h.call("bash", { command: "sudo rm -rf /" }), undefined);
     assert.equal(await h.call("bash", { command: "printf one\nprintf two" }), undefined);
+    assert.equal(
+      await h.call("bash", { command: "fish -i -c 'for f in *.ts; echo $f; end'" }),
+      undefined,
+      "an incomplete parse must not override YOLO's explicit allow policy",
+    );
     assert.equal(await h.call("edit", { path: ".env" }), undefined);
     assert.equal(await h.call("write", { path: ".git/config" }), undefined);
     assert.equal(h.ctx.prompts.length, 0);

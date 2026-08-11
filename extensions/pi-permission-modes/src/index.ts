@@ -718,8 +718,9 @@ export default async function (pi: ExtensionAPI) {
         action = decide(m, "bash", command);
       }
       // Confirm rather than trust an `allow` derived from an incomplete command
-      // list — but stay sandboxed: this is uncertainty, not an escape.
-      if (analysis.unparsed) action = mostRestrictive(action, "ask") ?? "ask";
+      // list when containment is expected. An explicitly unsandboxed mode keeps
+      // its policy authoritative: in particular, YOLO must never prompt.
+      if (analysis.unparsed && m.sandbox.enabled) action = mostRestrictive(action, "ask") ?? "ask";
       const extracted = analysis.commands.map((c) => ({ ...bashRulePatterns(c.name, c.args), name: c.name, args: c.args }));
       const keyed = !analysis.unparsed && extracted.length > 0;
       const policyAsks = keyed ? extracted.filter((c) => decideBashCommand(m, c.name, c.args) === "ask") : [];
