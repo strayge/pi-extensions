@@ -11,7 +11,9 @@ import {
   loadStockDefaults,
   persistModeDomains,
   persistModeRule,
+  persistProjectRule,
   profileToConfig,
+  projectGrantCount,
   readOnlyOverride,
   stockDefaultsFile,
 } from "./config-load.ts";
@@ -153,6 +155,31 @@ test("project: tighten-only — can tighten, never loosen", () => {
   s.cleanup();
 });
 
+test("trusted project permission entries append after global rules", () => {
+  const s = sandbox({
+    global: { modes: { default: { permission: { bash: { "*": "ask", "git *": "deny" } } } } },
+    project: { modes: { default: { permission: { bash: { "git fetch": "allow", "git fetch *": "allow" } } } } },
+  });
+  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
+  const bash = c.modes.default.permission.bash;
+  assert.ok(bash && typeof bash !== "string");
+  assert.deepEqual(Object.keys(bash), ["*", "git *", "git fetch", "git fetch *"]);
+  assert.equal(decide(c.modes.default, "bash", "git fetch origin"), "allow");
+  assert.equal(decide(c.modes.default, "bash", "git push origin"), "deny");
+  s.cleanup();
+});
+
+test("trusted project ask can override a global allow", () => {
+  const s = sandbox({
+    global: { modes: { default: { permission: { bash: { "*": "ask", "git *": "allow" } } } } },
+    project: { modes: { default: { permission: { bash: { "git push *": "ask" } } } } },
+  });
+  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
+  assert.equal(decide(c.modes.default, "bash", "git fetch origin"), "allow");
+  assert.equal(decide(c.modes.default, "bash", "git push origin"), "ask");
+  s.cleanup();
+});
+
 test("project: repeating inherited sandbox.enabled is a silent no-op", () => {
   const s = sandbox({
     project: {
@@ -277,6 +304,23 @@ test("persistModeRule: creates the global file with the learned rule, round-trip
   s.cleanup();
 });
 
+test("persistProjectRule omits a fallback, moves duplicates last, and preserves malformed files", () => {
+  const s = sandbox();
+  const file = persistProjectRule(s.cwd, "default", "bash", "git fetch", "allow");
+  let written = JSON.parse(readFileSync(file, "utf-8"));
+  assert.deepEqual(written.modes.default.permission.bash, { "git fetch": "allow" });
+
+  writeFileSync(file, JSON.stringify({ modes: { default: { permission: { bash: { "git fetch": "deny", "*": "ask" } } } } }));
+  persistProjectRule(s.cwd, "default", "bash", "git fetch", "allow");
+  written = JSON.parse(readFileSync(file, "utf-8"));
+  assert.deepEqual(Object.keys(written.modes.default.permission.bash), ["*", "git fetch"]);
+
+  writeFileSync(file, "{ malformed");
+  assert.throws(() => persistProjectRule(s.cwd, "default", "bash", "git push", "allow"), /malformed config/);
+  assert.equal(readFileSync(file, "utf-8"), "{ malformed");
+  s.cleanup();
+});
+
 test("persistModeDomains: appends to the FULL stock+global allowlist, round-trips", () => {
   const s = sandbox();
   const stockDomains = loadStockDefaults().modes.default.sandbox.network?.allowedDomains ?? [];
@@ -316,6 +360,50 @@ test("project: askOnBlockedHost can be forced off (silent deny), never back on",
   const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
   assert.equal(c.modes.default.sandbox.askOnBlockedHost, false); // project cannot re-enable asking
   assert.equal(c.modes.build.sandbox.askOnBlockedHost, false); // project may force silent-deny
+  s.cleanup();
+});
+
+test("projectGrantCount counts only valid grants for known modes and surfaces", () => {
+  const s = sandbox({
+    project: {
+      modes: {
+        default: { permission: { bash: { "git": "allow", "git fetch": "invalid" }, write: "allow", bogus: "allow" } },
+        unknown: { permission: { bash: "allow" } },
+      },
+    },
+  });
+  assert.equal(projectGrantCount(s.cwd), 2);
+  s.cleanup();
+});
+
+test("trusted project sandbox additions warn once and preserve tighten-only fields", () => {
+  const s = sandbox({
+    project: {
+      modes: {
+        default: {
+          sandbox: {
+            allowWrite: ["/tmp/project-extra"],
+            denyRead: ["~/.secret"],
+            denyWrite: ["~/.locked"],
+            writable: false,
+            askOnBlockedHost: false,
+            network: { allowedDomains: ["api.example.com", "*.com"], deniedDomains: ["bad.example.com"] },
+          },
+        },
+      },
+    },
+  });
+  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
+  const sb = c.modes.default.sandbox;
+  assert.ok(sb.allowWrite?.includes("/tmp/project-extra"));
+  assert.ok(sb.denyRead?.includes("~/.secret"));
+  assert.ok(sb.denyWrite?.includes("~/.locked"));
+  assert.equal(sb.writable, false);
+  assert.equal(sb.askOnBlockedHost, false);
+  assert.ok(sb.network?.allowedDomains?.includes("api.example.com"));
+  assert.ok(sb.network?.deniedDomains?.includes("bad.example.com"));
+  assert.equal(s.errors.filter((e) => e.includes('"*.com"')).length, 1);
+  assert.equal(sb.enabled, true);
   s.cleanup();
 });
 

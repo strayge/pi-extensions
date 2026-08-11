@@ -7,7 +7,7 @@
  * $HOME, installs into ~/.npm, fetches from non-allowlisted domains — then
  * wastes turns probing variants of a command the kernel will never allow.
  * This section is generated from the ACTIVE mode's merged profile (so global
- * overrides and project tighten-only overlays are reflected truthfully) and
+ * overrides and project layers are reflected truthfully) and
  * states where writes work, which reads are denied, which domains are
  * reachable, and how the prompt flow handles everything else.
  *

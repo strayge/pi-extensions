@@ -102,7 +102,7 @@ interface FakeCtx {
   prompts: Array<{ title: string; options: string[] }>;
   notices: string[];
   status: string;
-  answers: string[];
+  answers: (string | undefined)[];
   ui: {
     select(title: string, options: string[]): Promise<string | undefined>;
     notify(message: string, level?: string): void;
@@ -110,9 +110,10 @@ interface FakeCtx {
     theme: { fg(color: string, text: string): string };
   };
   sessionManager: { getEntries(): Array<{ type: string; customType?: string; data?: unknown }> };
+  isProjectTrusted?: () => boolean;
 }
 
-function makeCtx(cwd: string, opts: { hasUI?: boolean; entries?: Array<{ type: string; customType?: string; data?: unknown }> } = {}): FakeCtx {
+function makeCtx(cwd: string, opts: { hasUI?: boolean; trusted?: boolean; entries?: Array<{ type: string; customType?: string; data?: unknown }> } = {}): FakeCtx {
   const ctx: FakeCtx = {
     hasUI: opts.hasUI ?? true,
     cwd,
@@ -123,7 +124,9 @@ function makeCtx(cwd: string, opts: { hasUI?: boolean; entries?: Array<{ type: s
     ui: {
       async select(title, options) {
         ctx.prompts.push({ title, options });
-        return ctx.answers.shift();
+        const answer = ctx.answers.shift();
+        assert.ok(answer === undefined || options.includes(answer), `answer ${answer} was not offered by: ${options.join(", ")}`);
+        return answer;
       },
       notify(message) {
         ctx.notices.push(message);
@@ -134,8 +137,31 @@ function makeCtx(cwd: string, opts: { hasUI?: boolean; entries?: Array<{ type: s
       theme: { fg: (_color, text) => text },
     },
     sessionManager: { getEntries: () => opts.entries ?? [] },
+    isProjectTrusted: () => opts.trusted === true,
   };
   return ctx;
+}
+
+async function useUnsandboxedAskMode(h: Harness): Promise<void> {
+  const dir = path.join(h.agentDir, "permission-mode");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, "permission-mode.json"),
+    JSON.stringify({
+      defaultMode: "confirm-unsandboxed",
+      cycleOrder: ["confirm-unsandboxed"],
+      modes: {
+        "confirm-unsandboxed": {
+          label: "Confirm unsandboxed",
+          color: "error",
+          sandbox: { enabled: false, writable: true },
+          permission: { bash: "ask" },
+        },
+      },
+    }),
+  );
+  await h.pi.emit("session_start", {}, h.ctx);
+  await h.perm("confirm-unsandboxed");
 }
 
 // --- harness ------------------------------------------------------------------
@@ -162,6 +188,7 @@ let callId = 0;
 async function setup(
   opts: {
     hasUI?: boolean;
+    trusted?: boolean;
     permFlag?: string;
     /** Simulate a parent-forwarded PI_PERMISSION_MODE. */
     envMode?: string;
@@ -263,6 +290,7 @@ test("bash: session grant covers the same command, not a longer chain", { skip }
     h.ctx.answers.push("Allow for session");
     assert.equal(await h.call("bash", { command: "git status" }), undefined);
     assert.equal(h.ctx.prompts.length, 1);
+    assert.ok(!h.ctx.prompts[0].options.includes("Always allow…"));
 
     // Same command again: covered by the session grant, no new prompt.
     assert.equal(await h.call("bash", { command: "git status" }), undefined);
@@ -273,6 +301,126 @@ test("bash: session grant covers the same command, not a longer chain", { skip }
     const chained = await h.call("bash", { command: "git status && curl evil.sh" });
     assert.equal(chained?.block, true);
     assert.equal(h.ctx.prompts.length, 2);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: Always allow opens explicit narrow choices and persists both narrow patterns", { skip }, async () => {
+  const h = await setup();
+  try {
+    await useUnsandboxedAskMode(h);
+    h.ctx.answers.push("Always allow…", "git fetch * — all projects", "Allow once");
+    assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
+    const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
+    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch"], "allow");
+    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch *"], "allow");
+    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash.git, undefined);
+    assert.equal(await h.call("bash", { command: "git fetch-pack origin" }), undefined);
+    assert.equal(h.ctx.prompts.length, 3);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: dismissing the second persistence prompt denies", { skip }, async () => {
+  const h = await setup();
+  try {
+    await useUnsandboxedAskMode(h);
+    h.ctx.answers.push("Always allow…", undefined);
+    const result = await h.call("bash", { command: "git fetch origin" });
+    assert.equal(result?.block, true);
+    assert.equal(h.ctx.prompts.length, 2);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: multi-command persistence displays each broad scope once", { skip }, async () => {
+  const h = await setup();
+  try {
+    await useUnsandboxedAskMode(h);
+    h.ctx.answers.push("Always allow…", "git, npm — all projects");
+    assert.equal(await h.call("bash", { command: "git status && npm test" }), undefined);
+    assert.deepEqual(h.ctx.prompts[1].options, ["git, npm — all projects"]);
+
+    const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
+    const bash = saved.modes["confirm-unsandboxed"].permission.bash;
+    assert.equal(bash.git, "allow");
+    assert.equal(bash["git *"], "allow");
+    assert.equal(bash.npm, "allow");
+    assert.equal(bash["npm *"], "allow");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: trusted project rule reloads and remains subcommand-scoped", { skip }, async () => {
+  const h = await setup({ trusted: true });
+  try {
+    await useUnsandboxedAskMode(h);
+    h.ctx.answers.push("Always allow…", "git fetch * — this project");
+    assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
+    const file = path.join(h.root, ".pi", "permission-mode.json");
+    const saved = JSON.parse(readFileSync(file, "utf-8"));
+    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch"], "allow");
+    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch *"], "allow");
+
+    assert.equal(await h.call("bash", { command: "git fetch upstream" }), undefined);
+    assert.equal(h.ctx.prompts.length, 2);
+
+    h.ctx.answers.push("Deny");
+    const sibling = await h.call("bash", { command: "git push origin main" });
+    assert.equal(sibling?.block, true);
+    assert.equal(h.ctx.prompts.length, 3);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: a trusted project ask offers only project persistence", { skip }, async () => {
+  const h = await setup({ trusted: true });
+  try {
+    await useUnsandboxedAskMode(h);
+    const file = path.join(h.root, ".pi", "permission-mode.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ modes: { "confirm-unsandboxed": { permission: { bash: { "git *": "ask" } } } } }));
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    h.ctx.answers.push("Always allow…", "git fetch * — this project");
+    assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
+    assert.deepEqual(h.ctx.prompts[1].options, ["git fetch * — this project", "git * — this project"]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("/perm allow parses only leading flags and rejects untrusted project persistence", { skip }, async () => {
+  const h = await setup();
+  try {
+    await h.perm("allow -p bash deploy -p --dry-run");
+    assert.match(h.ctx.notices.at(-1) ?? "", /trusted project/);
+    await h.perm("allow -g bash deploy -p --dry-run");
+    const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
+    assert.equal(saved.modes.default.permission.bash["deploy -p --dry-run"], "allow");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("/perm init -p scaffolds the project schema and project grants notify once", { skip }, async () => {
+  const h = await setup({ trusted: true });
+  try {
+    await h.perm("init -p");
+    const file = path.join(h.root, ".pi", "permission-mode.json");
+    const scaffold = JSON.parse(readFileSync(file, "utf-8"));
+    assert.equal(scaffold.$schema, "https://raw.githubusercontent.com/wynainfo/pi-permission-modes/main/schemas/permission-mode.schema.json");
+    assert.deepEqual(scaffold.modes, {});
+
+    writeFileSync(file, JSON.stringify({ modes: { default: { permission: { bash: { "git *": "allow" }, tool: "allow" } } } }));
+    await h.pi.emit("session_start", {}, h.ctx);
+    await h.pi.emit("session_start", {}, h.ctx);
+    assert.equal(h.ctx.notices.filter((notice) => /honoring 2 project grants/.test(notice)).length, 1);
   } finally {
     h.cleanup();
   }
@@ -570,25 +718,7 @@ test("project config cannot disable sandboxing or suppress Default bash prompts"
 test("custom unsandboxed mode still honors bash ask", { skip }, async () => {
   const h = await setup();
   try {
-    const dir = path.join(h.agentDir, "permission-mode");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      path.join(dir, "permission-mode.json"),
-      JSON.stringify({
-        defaultMode: "confirm-unsandboxed",
-        cycleOrder: ["confirm-unsandboxed"],
-        modes: {
-          "confirm-unsandboxed": {
-            label: "Confirm unsandboxed",
-            color: "error",
-            sandbox: { enabled: false, writable: true },
-            permission: { bash: "ask" },
-          },
-        },
-      }),
-    );
-    await h.pi.emit("session_start", {}, h.ctx);
-    await h.perm("confirm-unsandboxed");
+    await useUnsandboxedAskMode(h);
 
     h.ctx.answers.push("Deny");
     const denied = await h.call("bash", { command: "touch owned" });

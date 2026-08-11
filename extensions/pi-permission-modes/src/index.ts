@@ -44,10 +44,10 @@
 
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { askWithSession, SessionApprovals } from "./approvals.ts";
+import { ALWAYS_ALLOW, askApproval, askWithSession, SessionApprovals } from "./approvals.ts";
 import { sandboxAwarenessPrompt } from "./awareness.ts";
 import { bashExecPlan, bashGate, bashSubject } from "./bash-enforce.ts";
 import { analyzeBash } from "./bash-parse.ts";
@@ -57,13 +57,15 @@ import {
   loadStockDefaults,
   persistModeDomains,
   persistModeRule,
+  persistProjectRule,
+  projectGrantCount,
   profileToConfig,
   stockDefaultsFile,
 } from "./config-load.ts";
 import type { PermState } from "./modes.ts";
 import { type NetAskResult, NetworkSession, isHostAllowed, normalizeDomain } from "./network.ts";
 import { isOutside, isProtectedWrite } from "./paths.ts";
-import { decide, decideBashCommand, mostRestrictive } from "./resolve.ts";
+import { decide, decideBashCommand, mostRestrictive, resolveSurface } from "./resolve.ts";
 import { SandboxController } from "./sandbox.ts";
 import {
   type Action,
@@ -72,6 +74,7 @@ import {
   type PermissionModeConfig,
   planModeSystemPrompt,
   type Surface,
+  SURFACES,
 } from "./schema.ts";
 import { createShowPlanTool } from "./show-plan.ts";
 import { statusSlots, updateStatus } from "./status.ts";
@@ -104,10 +107,39 @@ const BUILTIN_HANDLED = new Set([
 /** Our own tools that must never be hidden (show_plan is needed in Plan mode). */
 const NEVER_HIDE = new Set(["show_plan"]);
 
+function bashRulePatterns(name: string, args: string[]): { narrow: string[]; broad: string[]; command: string } {
+  const command = [name, ...args].join(" ").trim();
+  const broad = [name, `${name} *`];
+  const sub = args[0];
+  if (!sub || sub.startsWith("-")) return { narrow: broad, broad, command };
+  return { narrow: [`${name} ${sub}`, `${name} ${sub} *`], broad, command };
+}
+
+function isPersistableBashAsk(
+  mode: ModeDef,
+  command: { name: string; args: string[]; command: string },
+  scope: "global" | "project",
+): boolean {
+  if (resolveSurface(mode.permission.bash, command.command) !== "ask") return false;
+  const targets = [command.command, command.name, ...command.args];
+  const otherActions = targets.map((target) => resolveSurface(mode.permission.path, target));
+  if (mode.projectOverlay) {
+    otherActions.push(resolveSurface(mode.projectOverlay.bash, command.command));
+    otherActions.push(...targets.map((target) => resolveSurface(mode.projectOverlay?.path, target)));
+  }
+  if (scope === "global" && mode.trustedProjectPermission) {
+    otherActions.push(resolveSurface(mode.trustedProjectPermission.bash, command.command));
+  }
+  return otherActions.every((action) => action === undefined || action === "allow");
+}
+
+const isTrustedProject = (ctx: ExtensionContext): boolean =>
+  typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted();
+
 export default async function (pi: ExtensionAPI) {
   // The engine starts on the shipped stock defaults (permission-mode.defaults.json);
   // session_start reloads the merged config (stock + global full-authority +
-  // project tighten-only) from permission-mode.json.
+  // project trust-aware) from permission-mode.json.
   let config: PermissionModeConfig = loadStockDefaults();
   let modeName = config.defaultMode;
   // True when the current mode was auto-picked as the headless-child safety
@@ -130,6 +162,7 @@ export default async function (pi: ExtensionAPI) {
   // sandbox-runtime proxy consults it (via net.decide) for every host outside
   // the allowlist, so changes apply instantly — no sandbox re-init.
   const net = new NetworkSession();
+  let notifiedProjectGrants = false;
   // Statusline slots, so the two chips can be placed independently. The mode
   // slot reuses the `perm` status key, which is what makes a statusline render
   // the slot instead of also listing the key. Both ask for a placement rather
@@ -168,7 +201,7 @@ export default async function (pi: ExtensionAPI) {
     if (choice === "Allow forever") {
       try {
         const file = persistModeDomains(getAgentDir(), modeName, [host]);
-        config = loadModeConfig(ctx.cwd, getAgentDir(), (m) => ctx.ui.notify(m, "warning"));
+        config = loadModeConfig(ctx.cwd, getAgentDir(), (m) => ctx.ui.notify(m, "warning"), isTrustedProject(ctx));
         ctx.ui.notify(`permission-mode: always allow ${host} in ${currentMode().label} — saved to ${file}`, "info");
       } catch (e) {
         ctx.ui.notify(`permission-mode: could not save domain: ${e}`, "error");
@@ -204,7 +237,7 @@ export default async function (pi: ExtensionAPI) {
   const learnForever = (ctx: ExtensionContext, surface: Surface, key: string) => () => {
     try {
       const file = persistModeRule(getAgentDir(), modeName, surface, key, "allow");
-      config = loadModeConfig(ctx.cwd, getAgentDir(), (m) => ctx.ui.notify(m, "warning"));
+      config = loadModeConfig(ctx.cwd, getAgentDir(), (m) => ctx.ui.notify(m, "warning"), isTrustedProject(ctx));
       ctx.ui.notify(`permission-mode: always allow ${surface} "${key}" in ${currentMode().label} — saved to ${file}`, "info");
     } catch (e) {
       ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
@@ -306,25 +339,63 @@ export default async function (pi: ExtensionAPI) {
     handler: async (ctx) => cycle(ctx),
   });
   pi.registerCommand("perm", {
-    description: `Set or cycle permission mode: /perm [${config.cycleOrder.join("|")}|init|clear-approvals]`,
+    description: `Set or cycle permission mode: /perm [${config.cycleOrder.join("|")}|init [-p]|allow [-p|-g] [surface] <pattern>|clear-approvals]`,
     handler: async (args, ctx) => {
-      const arg = args.trim().toLowerCase();
+      const raw = args.trim();
+      const arg = raw.toLowerCase();
       if (arg === "clear-approvals") {
         approvals.clearAll();
         return ctx.ui.notify("permission-mode: cleared session approvals", "info");
       }
-      if (arg === "init") {
+      if (arg === "init" || arg === "init -p") {
         // Scaffold an editable copy of the stock defaults at the global path.
-        const dest = path.join(getAgentDir(), "permission-mode", "permission-mode.json");
+        const project = arg === "init -p";
+        const dest = project
+          ? path.join(ctx.cwd, CONFIG_DIR_NAME, "permission-mode.json")
+          : path.join(getAgentDir(), "permission-mode", "permission-mode.json");
         if (existsSync(dest)) {
           return ctx.ui.notify(`permission-mode: ${dest} already exists — edit it directly`, "warning");
         }
         try {
           mkdirSync(path.dirname(dest), { recursive: true });
-          writeFileSync(dest, readFileSync(stockDefaultsFile(), "utf-8"));
+          writeFileSync(
+            dest,
+            project
+              ? `${JSON.stringify({ $schema: "https://raw.githubusercontent.com/wynainfo/pi-permission-modes/main/schemas/permission-mode.schema.json", modes: {} }, null, 2)}\n`
+              : readFileSync(stockDefaultsFile(), "utf-8"),
+          );
           return ctx.ui.notify(`permission-mode: wrote ${dest} — edit it to customize your modes`, "info");
         } catch (e) {
           return ctx.ui.notify(`permission-mode: could not write ${dest}: ${e}`, "error");
+        }
+      }
+      if (arg.startsWith("allow ") || arg === "allow") {
+        const match = /^allow(?:\s+(-p|-g))*(?:\s+([\s\S]*))?$/i.exec(raw);
+        if (!match) return ctx.ui.notify("permission-mode: usage: /perm allow [-p|-g] [surface] <pattern>", "warning");
+        let project = false;
+        let global = false;
+        const flags = raw.match(/^allow(?:\s+(-p|-g))*/i)?.[0] ?? "allow";
+        for (const flag of flags.match(/-p|-g/gi) ?? []) {
+          if (flag.toLowerCase() === "-p") project = true;
+          if (flag.toLowerCase() === "-g") global = true;
+        }
+        const rest = (match[2] ?? "").trim().split(/\s+/).filter(Boolean);
+        const surface = rest.length > 1 && SURFACES.includes(rest[0] as Surface) ? (rest.shift() as Surface) : "bash";
+        const pattern = rest.join(" ").trim();
+        if (!pattern || (project && global)) {
+          return ctx.ui.notify("permission-mode: usage: /perm allow [-p|-g] [surface] <pattern>", "warning");
+        }
+        if (project && !isTrustedProject(ctx)) {
+          return ctx.ui.notify("permission-mode: project allows require a trusted project", "warning");
+        }
+        try {
+          const file = project
+            ? persistProjectRule(ctx.cwd, modeName, surface, pattern, "allow")
+            : persistModeRule(getAgentDir(), modeName, surface, pattern, "allow");
+          config = loadModeConfig(ctx.cwd, getAgentDir(), (m) => ctx.ui.notify(m, "warning"), isTrustedProject(ctx));
+          return ctx.ui.notify(`permission-mode: allowed ${surface} "${pattern}" — saved to ${file}`, "info");
+        } catch (e) {
+          return ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
         }
       }
       if (config.modes[arg]) await setMode(arg, ctx);
@@ -505,7 +576,7 @@ export default async function (pi: ExtensionAPI) {
       if (choice === "Allow forever") {
         try {
           const file = persistModeDomains(getAgentDir(), modeName, need);
-          config = loadModeConfig(pctx.cwd, getAgentDir(), (msg) => pctx.ui.notify(msg, "warning"));
+          config = loadModeConfig(pctx.cwd, getAgentDir(), (msg) => pctx.ui.notify(msg, "warning"), isTrustedProject(pctx));
           saved = ` (saved permanently for ${currentMode().label})`;
           pctx.ui.notify(`permission-mode: always allow ${need.join(", ")} in ${currentMode().label} — saved to ${file}`, "info");
         } catch (e) {
@@ -518,9 +589,19 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     uiCtx = ctx;
-    config = loadModeConfig(ctx.cwd, getAgentDir(), (m) =>
-      ctx.hasUI ? ctx.ui.notify(m, "warning") : console.error(m),
+    config = loadModeConfig(
+      ctx.cwd,
+      getAgentDir(),
+      (m) => (ctx.hasUI ? ctx.ui.notify(m, "warning") : console.error(m)),
+      isTrustedProject(ctx),
     );
+    if (!notifiedProjectGrants && isTrustedProject(ctx)) {
+      const grants = projectGrantCount(ctx.cwd, getAgentDir());
+      if (grants > 0) {
+        notifiedProjectGrants = true;
+        if (ctx.hasUI) ctx.ui.notify(`permission-mode: honoring ${grants} project grants from ${CONFIG_DIR_NAME}/permission-mode.json`, "info");
+      }
+    }
     if (!config.modes[modeName]) modeName = config.defaultMode;
     // Resolve the start mode BEFORE init so the sandbox initializes with the
     // right profile, then setMode reconciles status (applyProfile is a no-op).
@@ -530,7 +611,7 @@ export default async function (pi: ExtensionAPI) {
       cwd: ctx.cwd,
       noSandbox: pi.getFlag("no-sandbox") === true,
       hasUI: ctx.hasUI,
-      notify: (m) => ctx.ui.notify(m, "warning"),
+      notify: (m) => (ctx.hasUI ? ctx.ui.notify(m, "warning") : console.warn(m)),
       profile: currentMode().sandbox,
       // Live network gate: the proxy consults session state for every host
       // outside the allowlist; unknown hosts prompt via askNetHost.
@@ -623,21 +704,6 @@ export default async function (pi: ExtensionAPI) {
     // Bash.
     if (toolName === "bash") {
       const command = String(input.command ?? "");
-      // Fast path: non-sandboxing modes skip AST escape analysis, but still
-      // honor their explicit bash policy. YOLO remains silent because its
-      // policy is `allow`; an unsandboxed `ask` mode must still prompt.
-      if (!m.sandbox.enabled) {
-        const gate = bashGate(decide(m, "bash", command), undefined, false, sandbox.ready);
-        if (gate.kind === "block") return { block: true, reason: gate.reason };
-        if (gate.kind === "prompt") {
-          // Without an AST parse, scope a session grant to the exact command.
-          if (!(await promptAllow(ctx, "bash", command, gate.title))) {
-            return { block: true, reason: gate.reason };
-          }
-          if (gate.onApproveUnsandboxed) approvedUnsandboxed.add(event.toolCallId);
-        }
-        return undefined;
-      }
       // Real AST when available: judge each (possibly nested) command against the
       // bash surface AND the cross-cutting path gate (joined string + each token,
       // see decideBashCommand), most-restrictive across the chain; detect
@@ -654,22 +720,81 @@ export default async function (pi: ExtensionAPI) {
       // Confirm rather than trust an `allow` derived from an incomplete command
       // list — but stay sandboxed: this is uncertainty, not an escape.
       if (analysis.unparsed) action = mostRestrictive(action, "ask") ?? "ask";
-      // Session approvals are keyed on the extracted command names, and ALL
-      // names in a chain must be granted for it to pass silently — "allow git
-      // this session" must not cover `git status && curl ... | sh`. Granting
-      // remembers every name in the chain. Without a trustworthy parse — the
-      // heuristic fallback, or one that lost commands — the extracted names
-      // do not describe what runs, so the key is the exact command string.
-      const names = [...new Set(analysis.commands.map((c) => c.name).filter(Boolean))];
-      const keyedByName = !analysis.unparsed && names.length > 0;
-      const keys = keyedByName ? names : [command];
-      // Title on the ungranted names only, so a re-prompt shows what changed.
-      const pending = keyedByName ? names.filter((n) => !approvals.has(modeName, "bash", n)) : [];
-      const gate = bashGate(action, analysis.outsideReason, m.sandbox.enabled, sandbox.ready, bashSubject(pending));
+      const extracted = analysis.commands.map((c) => ({ ...bashRulePatterns(c.name, c.args), name: c.name, args: c.args }));
+      const keyed = !analysis.unparsed && extracted.length > 0;
+      const pending = keyed
+        ? extracted.filter((c) => !approvals.has(modeName, "bash", c.command))
+        : [];
+      if (((keyed && pending.length === 0) || (analysis.unparsed && approvals.has(modeName, "bash", command))) && action === "ask") {
+        action = "allow";
+      }
+      if (action !== "deny" && analysis.commands.length === 1 && !analysis.outsideReason && approvals.has(modeName, "bash", command)) return undefined;
+      const gate = bashGate(
+        action,
+        analysis.outsideReason,
+        m.sandbox.enabled,
+        sandbox.ready,
+        bashSubject([...new Set(pending.map((c) => c.name))]),
+      );
       if (gate.kind === "block") return { block: true, reason: gate.reason };
       if (gate.kind === "prompt") {
         const title = analysis.unparsed ? `${gate.title} (script could not be fully parsed)` : gate.title;
-        if (!(await promptAllow(ctx, "bash", keys, title))) return { block: true, reason: gate.reason };
+        const policyAsks = extracted.filter((c) => decideBashCommand(m, c.name, c.args) === "ask");
+        const persistenceBase =
+          !analysis.unparsed &&
+          !analysis.outsideReason &&
+          (sandbox.ready || !m.sandbox.enabled) &&
+          policyAsks.length > 0;
+        const globalEligible = persistenceBase && policyAsks.every((c) => isPersistableBashAsk(m, c, "global"));
+        const projectEligible =
+          persistenceBase && isTrustedProject(ctx) && policyAsks.every((c) => isPersistableBashAsk(m, c, "project"));
+        const firstOptions = globalEligible || projectEligible
+          ? ["Allow once", "Allow for session", ALWAYS_ALLOW, "Deny"]
+          : ["Allow once", "Allow for session", "Deny"];
+        const scope = await askApproval(
+          { hasUI: ctx.hasUI, select: (t, o) => ctx.ui.select(t, o) },
+          title,
+          firstOptions,
+        );
+        if (scope === "session") {
+          for (const c of keyed ? extracted : [{ command, narrow: [command], broad: [command] }]) {
+            const patterns = keyed ? c.narrow : [command];
+            for (const pattern of patterns) approvals.remember(modeName, "bash", pattern);
+          }
+        }
+        if (scope === "forever-global" || scope === "forever-project") {
+          const persistCommands = policyAsks;
+          const broadLabel = [...new Set(persistCommands.map((command) => command.name))].join(", ");
+          const broadPatterns = persistCommands.flatMap((command) => command.broad);
+          const choices = persistCommands.length === 1
+            ? [
+                ...(projectEligible ? [{ label: `${persistCommands[0].narrow[1]} — this project`, project: true, patterns: persistCommands[0].narrow }] : []),
+                ...(globalEligible ? [{ label: `${persistCommands[0].narrow[1]} — all projects`, project: false, patterns: persistCommands[0].narrow }] : []),
+                ...(projectEligible ? [{ label: `${persistCommands[0].broad[1]} — this project`, project: true, patterns: persistCommands[0].broad }] : []),
+                ...(globalEligible ? [{ label: `${persistCommands[0].broad[1]} — all projects`, project: false, patterns: persistCommands[0].broad }] : []),
+              ]
+            : [
+                ...(projectEligible ? [{ label: `${broadLabel} — this project`, project: true, patterns: broadPatterns }] : []),
+                ...(globalEligible ? [{ label: `${broadLabel} — all projects`, project: false, patterns: broadPatterns }] : []),
+              ];
+          if (!ctx.hasUI) return { block: true, reason: gate.reason };
+          const selectedChoice = await ctx.ui.select("Always allow which bash scope?", choices.map((choice) => choice.label));
+          if (!selectedChoice) return { block: true, reason: gate.reason };
+          const selected = choices.find((choice) => choice.label === selectedChoice);
+          if (!selected) return { block: true, reason: gate.reason };
+          try {
+            for (const pattern of [...new Set(selected.patterns)]) {
+              if (selected.project) persistProjectRule(ctx.cwd, modeName, "bash", pattern, "allow");
+              else persistModeRule(getAgentDir(), modeName, "bash", pattern, "allow");
+              approvals.remember(modeName, "bash", pattern);
+            }
+            config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
+          } catch (e) {
+            ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
+            return { block: true, reason: gate.reason };
+          }
+        }
+        if (scope === "deny") return { block: true, reason: gate.reason };
         if (gate.onApproveUnsandboxed) approvedUnsandboxed.add(event.toolCallId);
       }
       return undefined;

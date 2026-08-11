@@ -12,12 +12,15 @@
  */
 
 import type { Surface } from "./schema.ts";
+import { matchPattern } from "./resolve.ts";
 
 export class SessionApprovals {
   private store = new Map<string, Map<Surface, Set<string>>>();
 
   has(mode: string, surface: Surface, target: string): boolean {
-    return this.store.get(mode)?.get(surface)?.has(target) ?? false;
+    const values = this.store.get(mode)?.get(surface);
+    if (!values) return false;
+    return surface === "bash" ? [...values].some((pattern) => matchPattern(pattern, target)) : values.has(target);
   }
 
   remember(mode: string, surface: Surface, target: string): void {
@@ -49,10 +52,25 @@ export interface ApprovalUI {
   select(title: string, options: string[]): Promise<string | undefined>;
 }
 
-const ALLOW_ONCE = "Allow once";
-const ALLOW_SESSION = "Allow for session";
-const ALLOW_FOREVER = "Allow forever";
-const DENY = "Deny";
+export const ALLOW_ONCE = "Allow once";
+export const ALLOW_SESSION = "Allow for session";
+export const ALLOW_FOREVER = "Allow forever";
+export const ALWAYS_ALLOW = "Always allow…";
+export const DENY = "Deny";
+export type ApprovalScope = "once" | "session" | "forever-global" | "forever-project" | "deny";
+
+export async function askApproval(
+  ui: ApprovalUI,
+  title: string,
+  options: string[] = [ALLOW_ONCE, ALLOW_SESSION, ALLOW_FOREVER, DENY],
+): Promise<ApprovalScope> {
+  if (!ui.hasUI) return "deny";
+  const choice = await ui.select(title, options);
+  if (choice === ALLOW_ONCE) return "once";
+  if (choice === ALLOW_SESSION) return "session";
+  if (choice === ALLOW_FOREVER || choice === ALWAYS_ALLOW) return "forever-global";
+  return "deny";
+}
 
 /**
  * Prompt for approval, honoring prior "Allow for session" grants. Returns true
@@ -84,15 +102,15 @@ export async function askWithSession(
   if (targets.length > 0 && targets.every((t) => approvals.has(mode, surface, t))) return true;
 
   const options = onForever ? [ALLOW_ONCE, ALLOW_SESSION, ALLOW_FOREVER, DENY] : [ALLOW_ONCE, ALLOW_SESSION, DENY];
-  const choice = await ui.select(title, options);
-  if (choice === ALLOW_FOREVER) {
+  const choice = await askApproval(ui, title, options);
+  if (choice === "forever-global") {
     for (const t of targets) approvals.remember(mode, surface, t); // cover the rest of this session immediately
     await onForever?.();
     return true;
   }
-  if (choice === ALLOW_SESSION) {
+  if (choice === "session") {
     for (const t of targets) approvals.remember(mode, surface, t);
     return true;
   }
-  return choice === ALLOW_ONCE;
+  return choice === "once";
 }

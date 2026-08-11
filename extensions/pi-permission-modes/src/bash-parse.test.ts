@@ -269,7 +269,7 @@ test("analyzeBash: ordinary bash keeps parsing cleanly (skips if WASM absent)", 
     "cat <<'EOF'\nhi\nEOF",
     "diff <(ls a) <(ls b)",
     "for f in *.py; do echo $f; done",
-    "arr=(1 2 3); echo ${arr[@]}",
+    `arr=(1 2 3); echo \${arr[@]}`,
     "find . -name '*.ts' -exec grep -l x {} \\;",
     "pytest -k 'not slow' --maxfail=1",
   ]) {

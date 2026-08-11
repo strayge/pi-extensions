@@ -119,12 +119,17 @@ export interface ModeDef {
    */
   bypassProtectedPaths?: boolean;
   /**
-   * Internal (NOT part of the JSON schema): a project config's tighten-only
+   * Internal (NOT part of the JSON schema): an untrusted project config's
    * permission overlay, set by the loader. The resolver folds it in as an extra
    * most-restrictive layer, so it can only tighten the base policy, never loosen
    * it — regardless of the patterns it contains.
    */
   projectOverlay?: Partial<Record<Surface, SurfaceValue>>;
+  /**
+   * Retains trusted rules so persistence does not offer a global rule that a
+   * later project `ask` would override.
+   */
+  trustedProjectPermission?: Partial<Record<Surface, SurfaceValue>>;
 }
 
 /** Top-level config: the mode registry plus cycle/default metadata. */

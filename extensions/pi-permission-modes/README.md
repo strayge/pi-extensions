@@ -194,17 +194,22 @@ forever") and apply instantly — no sandbox restart.
 ### Session approvals
 
 When a mode `ask`s, the prompt offers **Allow once / Allow for session / Deny**.
-"Allow for session" remembers that action (per mode) so it isn't re-asked for the
-rest of the session. For **bash**, the grant is keyed on the command names
-extracted from the chain, and **every** name must already be granted for a
-command to pass silently — approving `git` does *not* cover a later
-`git status && curl … | sh` (that chain prompts again, and approving it grants
-`git` *and* `curl`). Clear them with `/perm clear-approvals`.
+File, tool, skill, and web-search approvals are exact targets, so literal `*`
+and `?` in filenames are not treated as globs. Bash session grants are patterns
+matched against the full extracted command. Narrow `git fetch` stores both
+`git fetch` and `git fetch *`, covering `git fetch origin` but not `git fetch-pack`.
+The broad choice stores `git` and `git *`. Unparsed commands retain exact-command
+session semantics and cannot be persisted. Clear grants with
+`/perm clear-approvals`.
 
-Because the grant is per command name, the bash prompt is titled with the names
-that still need one — *Allow cd, git, head commands?* — so a follow-up prompt
-shows what is new rather than repeating an opaque *Allow bash?* (still the
-wording where the grant covers the exact command string).
+**Always allow...** can save narrow or broad bash patterns globally or to a
+trusted project. Dismissing a prompt, or failing to write a selected persistent
+rule, denies the command.
+
+Use `/perm init -p` to scaffold a project file, or
+`/perm allow [-p|-g] [surface] <pattern>` to write an allow rule. Flags follow
+`allow`; only leading flags are parsed, so the remaining pattern text preserves
+spaces and may contain `-p` or `-g`. `-p` requires a trusted project.
 
 ---
 
@@ -299,12 +304,19 @@ Modes are data, layered in this order:
 2. `~/.pi/agent/permission-mode/permission-mode.json` (**global, full authority**):
    redefine built-in modes, add your own, and set `defaultMode` / `cycleOrder`.
    (Stable location, independent of where `pi install` placed the extension.)
-3. `<project>/.pi/permission-mode.json` (**project, tighten-only**): may only make
-   an existing mode *stricter*. Its permission policy is applied as a
-   most-restrictive overlay (so it can only `ask`/`deny` more, never loosen — no
-   matter what patterns it uses), and its sandbox is intersected/unioned the
-   stricter way. A project config **cannot** add modes, change defaults, or widen
-   anything. Opening an untrusted repo can never weaken your protection.
+3. `<project>/.pi/permission-mode.json`: trusted projects append permission maps
+   after global maps and union `allowWrite` and `allowedDomains`. Duplicate
+   permission keys move to the end. Untrusted projects use a most-restrictive
+   permission overlay and tighten every sandbox field. In either case,
+   `denyRead`, `denyWrite`, denied domains, `writable`, and `askOnBlockedHost`
+   remain tighten-only; projects cannot change defaults, cycle order,
+   `sandbox.enabled`, or add modes. Unsafe domain patterns are ignored. Project
+   writers do not add an implicit `"*"`, because it could override global rules.
+
+The `.pi/permission-mode.json` file alone is not a pi trust-triggering resource.
+In a cloned repository with no other `.pi` resource, its grants may therefore
+apply without a trust prompt. Session start reports the accepted project grant
+count so this limitation is visible.
 
 ### Shape
 

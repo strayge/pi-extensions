@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { type ApprovalUI, askWithSession, SessionApprovals } from "./approvals.ts";
+import { ALWAYS_ALLOW, type ApprovalUI, askApproval, askWithSession, SessionApprovals } from "./approvals.ts";
 
 test("SessionApprovals: remembers per (mode, surface, target)", () => {
   const a = new SessionApprovals();
@@ -65,7 +65,7 @@ test("askWithSession: 'Deny' (or dismiss) denies", async () => {
 test("askWithSession: a target list requires EVERY entry to be granted", async () => {
   const u = ui(true, "Allow for session");
   const a = new SessionApprovals();
-  // Granting a chain remembers each of its command names.
+  // Granting a chain remembers every supplied target.
   assert.equal(await askWithSession(u, a, "default", "bash", ["git", "curl"], "?"), true);
   assert.equal(u.calls, 1);
   assert.equal(a.has("default", "bash", "git"), true);
@@ -113,4 +113,29 @@ test("askWithSession: 'Allow forever' option only appears with onForever, and pe
   assert.deepEqual(seen, ["Allow once", "Allow for session", "Allow forever", "Deny"]);
   assert.equal(persisted, 1);
   assert.equal(a.has("default", "tool", "foo"), true); // also covers the session
+});
+
+test("askApproval: the literal Always allow menu choice is persistent approval", async () => {
+  const u = ui(true, ALWAYS_ALLOW);
+  assert.equal(await askApproval(u, "bash?", ["Allow once", "Allow for session", ALWAYS_ALLOW, "Deny"]), "forever-global");
+});
+
+test("SessionApprovals: bash globs match full commands without covering fetch-pack", () => {
+  const a = new SessionApprovals();
+  a.remember("default", "bash", "git fetch");
+  a.remember("default", "bash", "git fetch *");
+  assert.equal(a.has("default", "bash", "git fetch origin"), true);
+  assert.equal(a.has("default", "bash", "git fetch-pack origin"), false);
+  a.remember("default", "bash", "literal?*");
+  assert.equal(a.has("default", "bash", "literalXYZ"), true);
+});
+
+test("SessionApprovals: non-bash wildcard characters remain literal", () => {
+  const a = new SessionApprovals();
+  a.remember("default", "write", "reports/draft?.txt");
+  a.remember("default", "tool", "build*");
+  assert.equal(a.has("default", "write", "reports/draft?.txt"), true);
+  assert.equal(a.has("default", "write", "reports/draft1.txt"), false);
+  assert.equal(a.has("default", "tool", "build*"), true);
+  assert.equal(a.has("default", "tool", "builder"), false);
 });

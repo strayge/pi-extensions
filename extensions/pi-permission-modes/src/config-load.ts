@@ -6,11 +6,9 @@
  *      over a minimal in-code fallback (FALLBACK_CONFIG).
  *   2. <agentDir>/permission-mode/permission-mode.json (global) — FULL authority:
  *      may add modes, redefine built-ins, and change defaultMode / cycleOrder.
- *   3. <cwd>/.pi/permission-mode.json (project) — TIGHTEN-ONLY: may only make an
- *      existing mode stricter. Its permission policy is attached as a separate
- *      most-restrictive overlay (so it can never loosen, regardless of patterns);
- *      its sandbox is intersected/unioned the stricter way. Project configs
- *      cannot add modes or change defaults.
+ *   3. <cwd>/.pi/permission-mode.json (project) — trusted projects may append
+ *      permission rules and additive sandbox entries; untrusted projects are a
+ *      most-restrictive overlay. Project configs cannot add modes or change defaults.
  *
  * Pure except for the filesystem reads in `loadModeConfig`; no `pi`/`ctx`
  * dependency so the merge/tighten semantics are unit-testable.
@@ -23,6 +21,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { sandboxMountPath } from "./paths.ts";
 import {
   type Action,
@@ -237,7 +236,7 @@ function mergeGlobal(base: PermissionModeConfig, over: Partial<PermissionModeCon
 }
 
 // ---------------------------------------------------------------------------
-// Project (tighten-only) merge
+// Project merge
 // ---------------------------------------------------------------------------
 
 function tightenSandbox(base: SandboxProfile, over: Partial<SandboxProfile>, onError: OnError): SandboxProfile {
@@ -273,7 +272,22 @@ function tightenSandbox(base: SandboxProfile, over: Partial<SandboxProfile>, onE
   return result;
 }
 
-function applyProject(config: PermissionModeConfig, project: Partial<PermissionModeConfig>, onError: OnError): void {
+function appendPatterns(base: SurfaceValue | undefined, over: SurfaceValue): SurfaceValue {
+  const left: Record<string, Action> = typeof base === "string" ? { "*": base } : { ...(base ?? {}) };
+  const right: Record<string, Action> = typeof over === "string" ? { "*": over } : over;
+  for (const [key, action] of Object.entries(right)) {
+    delete left[key];
+    left[key] = action;
+  }
+  return left;
+}
+
+function applyProject(
+  config: PermissionModeConfig,
+  project: Partial<PermissionModeConfig>,
+  onError: OnError,
+  projectTrusted: boolean,
+): void {
   if (project.defaultMode || project.cycleOrder) {
     onError("permission-mode: project config cannot change defaultMode/cycleOrder; ignoring");
   }
@@ -284,10 +298,39 @@ function applyProject(config: PermissionModeConfig, project: Partial<PermissionM
       continue;
     }
     const pm = raw as Partial<ModeDef>;
-    if (pm.sandbox) base.sandbox = tightenSandbox(base.sandbox, pm.sandbox, onError);
+    if (pm.sandbox) {
+      if (projectTrusted) {
+        const over = pm.sandbox;
+        const tightenOnly: Partial<SandboxProfile> = {
+          ...over,
+          allowWrite: undefined,
+          network: over.network ? { ...over.network, allowedDomains: undefined } : undefined,
+        };
+        const next = tightenSandbox(base.sandbox, tightenOnly, onError);
+        next.allowWrite = union(base.sandbox.allowWrite, over.allowWrite);
+        if (over.network?.allowedDomains !== undefined) {
+          const safe = over.network.allowedDomains.filter((d) => {
+            if (isUnsafeDomain(d)) {
+              onError(`permission-mode: ignoring overly-broad allowedDomains pattern "${d}" in project config`);
+              return false;
+            }
+            return true;
+          });
+          next.network = { ...next.network, allowedDomains: union(base.sandbox.network?.allowedDomains, safe) };
+        }
+        base.sandbox = next;
+      } else base.sandbox = tightenSandbox(base.sandbox, pm.sandbox, onError);
+    }
     if (pm.permission) {
-      // Attach as a most-restrictive overlay — provably tighten-only.
-      base.projectOverlay = cleanPermission(pm.permission, `project mode "${name}"`, onError) as ModeDef["permission"];
+      const clean = cleanPermission(pm.permission, `project mode "${name}"`, onError) as ModeDef["permission"];
+      if (projectTrusted) {
+        base.trustedProjectPermission = clean;
+        for (const [surface, value] of Object.entries(clean) as [Surface, SurfaceValue][]) {
+          base.permission[surface] = appendPatterns(base.permission[surface], value);
+        }
+      } else {
+        base.projectOverlay = clean;
+      }
     }
     // label/color/systemPrompt/hideTools/bypassProtectedPaths from a project are
     // ignored: they're cosmetic or could loosen, neither of which a project may do.
@@ -338,14 +381,44 @@ export function globalConfigFile(agentDir: string): string {
   return path.join(agentDir, "permission-mode", "permission-mode.json");
 }
 
-export function loadModeConfig(cwd: string, agentDir: string, onError: OnError = noop): PermissionModeConfig {
-  const projectPath = path.join(cwd, ".pi", "permission-mode.json");
+/** Count project permission entries that can grant when the project is trusted. */
+export function projectGrantCount(cwd: string, agentDir?: string): number {
+  const file = path.join(cwd, CONFIG_DIR_NAME, "permission-mode.json");
+  if (!existsSync(file)) return 0;
+  try {
+    const data = JSON.parse(readFileSync(file, "utf-8")) as Partial<PermissionModeConfig>;
+    let base = loadStockDefaults();
+    const global = agentDir ? parseConfigFile(globalConfigFile(agentDir), noop) : undefined;
+    if (global) base = mergeGlobal(base, global, noop);
+    const known = new Set(Object.keys(base.modes));
+    let count = 0;
+    for (const [name, mode] of Object.entries(data.modes ?? {})) {
+      if (!known.has(name)) continue;
+      const permission = cleanPermission((mode as Partial<ModeDef>).permission, `project mode "${name}"`, noop);
+      for (const value of Object.values(permission)) {
+        if (value === "allow") count++;
+        else if (value && typeof value === "object") count += Object.values(value).filter((action) => action === "allow").length;
+      }
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+export function loadModeConfig(
+  cwd: string,
+  agentDir: string,
+  onError: OnError = noop,
+  projectTrusted = false,
+): PermissionModeConfig {
+  const projectPath = path.join(cwd, CONFIG_DIR_NAME, "permission-mode.json");
 
   let config = loadStockDefaults(onError);
   const global = parseConfigFile(globalConfigFile(agentDir), onError);
   if (global) config = mergeGlobal(config, global, onError);
   const project = parseConfigFile(projectPath, onError);
-  if (project) applyProject(config, project, onError);
+  if (project) applyProject(config, project, onError, projectTrusted);
   return config;
 }
 
@@ -369,8 +442,8 @@ export function persistModeDomains(agentDir: string, modeName: string, domains: 
   if (existsSync(file)) {
     try {
       data = JSON.parse(readFileSync(file, "utf-8")) as Record<string, unknown>;
-    } catch {
-      data = {}; // unreadable/corrupt → start fresh rather than lose the grant
+    } catch (e) {
+      throw new Error(`cannot update malformed config ${file}: ${e}`);
     }
   }
   const modes = (data.modes ??= {}) as Record<string, { sandbox?: { network?: Record<string, unknown> } }>;
@@ -394,7 +467,8 @@ export function persistModeDomains(agentDir: string, modeName: string, domains: 
  * pattern-map (seeding `"*": "ask"` so other names keep prompting), sets the
  * rule, and writes pretty JSON. Returns the path written.
  *
- * Global only: project config is tighten-only and cannot grant allows.
+ * Project rules use `persistProjectRule`, which deliberately omits the global
+ * fallback seeded here.
  */
 export function persistModeRule(
   agentDir: string,
@@ -404,12 +478,16 @@ export function persistModeRule(
   action: Action,
 ): string {
   const file = globalConfigFile(agentDir);
+  return writeRuleInto(file, modeName, surface, key, action, true);
+}
+
+function writeRuleInto(file: string, modeName: string, surface: Surface, key: string, action: Action, seed: boolean): string {
   let data: Record<string, unknown> = {};
   if (existsSync(file)) {
     try {
       data = JSON.parse(readFileSync(file, "utf-8")) as Record<string, unknown>;
-    } catch {
-      data = {}; // unreadable/corrupt → start fresh rather than lose the grant
+    } catch (e) {
+      throw new Error(`cannot update malformed config ${file}: ${e}`);
     }
   }
   const modes = (data.modes ??= {}) as Record<string, { permission?: Record<string, SurfaceValue> }>;
@@ -418,11 +496,17 @@ export function persistModeRule(
   const current = permission[surface];
   const map: Record<string, Action> =
     typeof current === "string" ? { "*": current } : { ...(current as Record<string, Action> | undefined) };
-  if (!("*" in map)) map["*"] = "ask"; // keep prompting for other names
+  if (seed && !("*" in map)) map["*"] = "ask"; // keep prompting for other names
+  delete map[key];
   map[key] = action;
   permission[surface] = map;
 
   mkdirSync(path.dirname(file), { recursive: true });
   writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
   return file;
+}
+
+/** Persist an allow rule in the trusted project's permission-mode file. */
+export function persistProjectRule(cwd: string, modeName: string, surface: Surface, key: string, action: Action): string {
+  return writeRuleInto(path.join(cwd, CONFIG_DIR_NAME, "permission-mode.json"), modeName, surface, key, action, false);
 }
