@@ -242,6 +242,21 @@ test("default mode: reads free, writes prompt, protected paths hard-block", { sk
   }
 });
 
+test("session start is silent; only a switch the user made announces the mode", { skip }, async () => {
+  const h = await setup();
+  try {
+    // Silent at startup, including the re-pick a resumed session does.
+    assert.deepEqual(h.ctx.notices, []);
+    await h.pi.emit("session_start", {}, h.ctx);
+    assert.deepEqual(h.ctx.notices, []);
+
+    await h.perm("build");
+    assert.deepEqual(h.ctx.notices, ["Permission mode: Build"]);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("bash: session grant covers the same command, not a longer chain", { skip }, async () => {
   const h = await setup();
   try {

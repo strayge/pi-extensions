@@ -231,7 +231,17 @@ export default async function (pi: ExtensionAPI) {
     pi.setActiveTools(hide.size ? all.filter((n) => !hide.has(n)) : all);
   };
 
-  const setMode = async (name: string, ctx: ExtensionContext, persist = true, viaFallback = false) => {
+  /**
+   * Announcing is for switches the user made themselves: the footer carries the
+   * mode at all times, so a notice would be noise on every launch — the lifecycle
+   * handlers pass `announce: false`.
+   */
+  const setMode = async (
+    name: string,
+    ctx: ExtensionContext,
+    opts: { persist?: boolean; viaFallback?: boolean; announce?: boolean } = {},
+  ) => {
+    const { persist = true, viaFallback = false, announce = true } = opts;
     if (!config.modes[name]) return;
     uiCtx = ctx;
     modeName = name;
@@ -245,7 +255,7 @@ export default async function (pi: ExtensionAPI) {
     await sandbox.applyProfile(m.sandbox); // re-init runtime if the profile changed
     applyToolVisibility();
     refreshStatus(ctx, m);
-    ctx.ui.notify(`Permission mode: ${m.label}`, "info");
+    if (announce) ctx.ui.notify(`Permission mode: ${m.label}`, "info");
     if (persist) pi.appendEntry<PermState>("perm-mode", { mode: modeName });
   };
 
@@ -527,12 +537,12 @@ export default async function (pi: ExtensionAPI) {
       askHost: (host, port) => net.decide(host, port, askNetHost),
       drainBlockedHosts: () => net.drainBlocked(),
     });
-    await setMode(picked.name, ctx, false, picked.fallback);
+    await setMode(picked.name, ctx, { persist: false, viaFallback: picked.fallback, announce: false });
   });
   pi.on("session_tree", async (_event, ctx) => {
     uiCtx = ctx;
     const picked = pickMode(ctx, false);
-    await setMode(picked.name, ctx, false, picked.fallback);
+    await setMode(picked.name, ctx, { persist: false, viaFallback: picked.fallback, announce: false });
   });
   pi.on("session_shutdown", async () => {
     approvals.clearAll(); // session-scoped grants don't outlive the session
