@@ -39,6 +39,11 @@ coverage/
 .env.*
 !.env.example
 
+# pi-permission-modes local overrides (written at runtime, never committed)
+extensions/pi-permission-modes/permission-mode.json
+extensions/pi-permission-modes/sandbox.json
+extensions/pi-permission-modes/.pi/
+
 # Editors
 .idea/
 .vscode/*
