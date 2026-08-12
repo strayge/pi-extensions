@@ -1,7 +1,30 @@
 import { describe, expect, it } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
-import type { WidgetMode } from "../src/types.js";
-import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatSessionTokens } from "../src/ui/agent-widget.js";
+import type { AgentInvocation, WidgetMode } from "../src/types.js";
+import {
+  type AgentActivity,
+  AgentWidget,
+  buildInvocationTags,
+  fgPreservingNestedStyles,
+  formatSessionTokens,
+  formatTurns,
+} from "../src/ui/agent-widget.js";
+
+describe("formatTurns", () => {
+  it("renders current and maximum turns without ambiguous glyphs", () => {
+    expect(formatTurns(16, 48)).toBe("turns: 16/48");
+    expect(formatTurns(16)).toBe("turns: 16");
+  });
+});
+
+describe("buildInvocationTags", () => {
+  it("can omit the max-turn tag when turn progress is shown separately", () => {
+    const invocation: AgentInvocation = { thinking: "xhigh", maxTurns: 48 };
+
+    expect(buildInvocationTags(invocation).tags).toEqual(["thinking: xhigh", "max turns: 48"]);
+    expect(buildInvocationTags(invocation, { includeMaxTurns: false }).tags).toEqual(["thinking: xhigh"]);
+  });
+});
 
 describe("formatSessionTokens", () => {
   const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => s };
