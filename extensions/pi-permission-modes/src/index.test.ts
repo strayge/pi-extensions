@@ -269,6 +269,52 @@ test("default mode: reads free, writes prompt, protected paths hard-block", { sk
   }
 });
 
+test("outside file access offers project and global persistence in trusted projects", { skip }, async () => {
+  const h = await setup({ trusted: true });
+  try {
+    const target = "../shared/input.txt";
+    h.ctx.answers.push(`Always allow for project: ${target}`);
+    assert.equal(await h.call("read", { path: target }), undefined);
+    assert.deepEqual(h.ctx.prompts[0].options, [
+      "Allow once",
+      "Allow for session",
+      `Always allow for project: ${target}`,
+      `Always allow: ${target}`,
+      "Deny",
+    ]);
+
+    const saved = JSON.parse(readFileSync(path.join(h.root, ".pi", "permission-mode.json"), "utf-8"));
+    assert.equal(saved.modes.default.permission.external_directory[target], "allow");
+    assert.equal(await h.call("read", { path: target }), undefined);
+    assert.equal(h.ctx.prompts.length, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("outside file persistence grants every asking policy layer", { skip }, async () => {
+  const h = await setup();
+  try {
+    const target = "../shared/output.txt";
+    h.ctx.answers.push(`Always allow: ${target}`);
+    assert.equal(await h.call("write", { path: target }), undefined);
+    assert.deepEqual(h.ctx.prompts[0].options, [
+      "Allow once",
+      "Allow for session",
+      `Always allow: ${target}`,
+      "Deny",
+    ]);
+
+    const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
+    assert.equal(saved.modes.default.permission.external_directory[target], "allow");
+    assert.equal(saved.modes.default.permission.write[target], "allow");
+    assert.equal(await h.call("write", { path: target }), undefined);
+    assert.equal(h.ctx.prompts.length, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("session start is silent; only a switch the user made announces the mode", { skip }, async () => {
   const h = await setup();
   try {

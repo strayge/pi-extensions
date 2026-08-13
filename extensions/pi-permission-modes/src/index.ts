@@ -133,6 +133,33 @@ function isPersistableBashAsk(
   return otherActions.every((action) => action === undefined || action === "allow");
 }
 
+function filePolicySurfaces(surface: Surface, outside: boolean): Surface[] {
+  const candidates: Surface[] = ["path"];
+  if (outside) candidates.push("external_directory");
+  candidates.push(surface);
+  return candidates;
+}
+
+function fileAskSurfaces(mode: ModeDef, surface: Surface, target: string, outside: boolean): Surface[] {
+  const asks = filePolicySurfaces(surface, outside).filter(
+    (candidate) => resolveSurface(mode.permission[candidate], target) === "ask",
+  );
+  // Sparse custom modes fall back to ask when no layer matches. Persist that
+  // boundary decision on the surface the prompt represents.
+  return asks.length > 0 ? [...new Set(asks)] : [outside ? "external_directory" : surface];
+}
+
+function projectPolicyAllowsGlobalFileRule(mode: ModeDef, surface: Surface, target: string, outside: boolean): boolean {
+  return [mode.projectOverlay, mode.trustedProjectPermission].every(
+    (permission) =>
+      !permission ||
+      filePolicySurfaces(surface, outside).every((candidate) => {
+        const action = resolveSurface(permission[candidate], target);
+        return action === undefined || action === "allow";
+      }),
+  );
+}
+
 const isTrustedProject = (ctx: ExtensionContext): boolean =>
   typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted();
 
@@ -823,7 +850,45 @@ export default async function (pi: ExtensionAPI) {
       if (action === "ask") {
         const title = outside ? `Outside project — allow ${toolName}? (${path})` : `Allow ${toolName}? (${path})`;
         const reason = outside ? "Access outside project blocked" : "blocked";
-        if (!(await promptAllow(ctx, surface, path, title))) return { block: true, reason };
+        if (!outside) {
+          if (!(await promptAllow(ctx, surface, path, title))) return { block: true, reason };
+          return undefined;
+        }
+
+        if (!ctx.hasUI) return { block: true, reason };
+        const persistentChoices: Array<{ label: string; project: boolean }> = [];
+        if (isTrustedProject(ctx)) {
+          persistentChoices.push({ label: `Always allow for project: ${path}`, project: true });
+        }
+        if (projectPolicyAllowsGlobalFileRule(m, surface, path, outside)) {
+          persistentChoices.push({ label: `Always allow: ${path}`, project: false });
+        }
+        const choice = await ctx.ui.select(title, [
+          ALLOW_ONCE,
+          ALLOW_SESSION,
+          ...persistentChoices.map((candidate) => candidate.label),
+          DENY,
+        ]);
+        if (choice === ALLOW_SESSION) {
+          approvals.remember(modeName, surface, path);
+        } else {
+          const selected = persistentChoices.find((candidate) => candidate.label === choice);
+          if (selected) {
+            try {
+              for (const askSurface of fileAskSurfaces(m, surface, path, outside)) {
+                if (selected.project) persistProjectRule(ctx.cwd, modeName, askSurface, path, "allow");
+                else persistModeRule(getAgentDir(), modeName, askSurface, path, "allow");
+              }
+              approvals.remember(modeName, surface, path);
+              config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
+            } catch (e) {
+              ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
+              return { block: true, reason };
+            }
+          } else if (choice !== ALLOW_ONCE) {
+            return { block: true, reason };
+          }
+        }
       }
       return undefined; // allow
     }

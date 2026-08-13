@@ -114,8 +114,11 @@ explicitly to put it elsewhere.
 | **Build** | Reads, writes, and `bash` **inside the project** run with no confirmation; in-project `bash` runs **sandboxed**. |
 | **YOLO** | Never prompts, never sandboxes, no protected-path backstop. Can do anything the current user can. |
 
-In every mode except YOLO: **out-of-project** access prompts; `bash` that
-reaches outside the project or **escalates privileges**
+In every mode except YOLO: **out-of-project** access prompts. File-tool prompts
+can save an exact-path grant with **Always allow for project** (trusted projects)
+or **Always allow** (global); if multiple policy layers asked, the choice grants
+each one so the same access does not prompt again. `bash` that reaches outside
+the project or **escalates privileges**
 (`su`/`sudo`/`doas`/`pkexec`/`runuser`/`setpriv`/`chroot` — detected even
 through wrappers like `env`/`nice`/`xargs` and `bash -c '…'` scripts) prompts,
 and runs **unsandboxed** once you approve it; and `edit`/`write` to
