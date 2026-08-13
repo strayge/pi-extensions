@@ -58,12 +58,14 @@ test("malformed records are discarded but valid records survive", () => {
   const history = parseHistory({
     version: 1,
     models: {
-      good: { favorite: true, lastUsedAt: 4 },
+      good: { favorite: true, lastUsedAt: 4, thinkingLevel: "high" },
       bad: "no",
-      nan: { lastUsedAt: "4" },
+      nan: { lastUsedAt: "4", thinkingLevel: "extreme" },
     },
   });
-  assert.deepEqual(history.models, { good: { favorite: true, lastUsedAt: 4 } });
+  assert.deepEqual(history.models, {
+    good: { favorite: true, lastUsedAt: 4, thinkingLevel: "high" },
+  });
 });
 
 test("mutation reloads and preserves unavailable entries", async () => {
@@ -78,6 +80,23 @@ test("mutation reloads and preserves unavailable entries", async () => {
     "live/id": { lastUsedAt: 3 },
   });
   assert.match(await readFile(file, "utf8"), /"version": 1/);
+});
+
+test("concurrent mutations are serialized without losing records", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-models-"));
+  const file = join(dir, "model-history.json");
+  await Promise.all([
+    mutateHistory((history) => {
+      history.models.first = { thinkingLevel: "low" };
+    }, file),
+    mutateHistory((history) => {
+      history.models.second = { thinkingLevel: "high" };
+    }, file),
+  ]);
+  assert.deepEqual((await loadHistory(file)).models, {
+    first: { thinkingLevel: "low" },
+    second: { thinkingLevel: "high" },
+  });
 });
 
 test("selector truncates every row to narrow terminal widths", () => {

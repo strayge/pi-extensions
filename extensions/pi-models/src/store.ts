@@ -1,10 +1,23 @@
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
+
+export type ThinkingLevel = Parameters<ExtensionAPI["setThinkingLevel"]>[0];
+
+const thinkingLevels = new Set<ThinkingLevel>([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
 
 export interface ModelRecord {
   favorite?: boolean;
   lastUsedAt?: number;
+  thinkingLevel?: ThinkingLevel;
 }
 export interface ModelHistory {
   version: 1;
@@ -24,9 +37,19 @@ export function parseHistory(value: unknown): ModelHistory {
   const models: Record<string, ModelRecord> = {};
   for (const [key, raw] of Object.entries(input.models)) {
     if (!raw || typeof raw !== "object" || !key) continue;
-    const record = raw as { favorite?: unknown; lastUsedAt?: unknown };
+    const record = raw as {
+      favorite?: unknown;
+      lastUsedAt?: unknown;
+      thinkingLevel?: unknown;
+    };
     const clean: ModelRecord = {};
     if (typeof record.favorite === "boolean") clean.favorite = record.favorite;
+    if (
+      typeof record.thinkingLevel === "string" &&
+      thinkingLevels.has(record.thinkingLevel as ThinkingLevel)
+    ) {
+      clean.thinkingLevel = record.thinkingLevel as ThinkingLevel;
+    }
     if (
       typeof record.lastUsedAt === "number" &&
       Number.isFinite(record.lastUsedAt) &&
@@ -34,7 +57,13 @@ export function parseHistory(value: unknown): ModelHistory {
     ) {
       clean.lastUsedAt = record.lastUsedAt;
     }
-    if (clean.favorite !== undefined || clean.lastUsedAt !== undefined) models[key] = clean;
+    if (
+      clean.favorite !== undefined ||
+      clean.lastUsedAt !== undefined ||
+      clean.thinkingLevel !== undefined
+    ) {
+      models[key] = clean;
+    }
   }
   return { version: 1, models };
 }
@@ -47,16 +76,25 @@ export async function loadHistory(file = historyPath()): Promise<ModelHistory> {
   }
 }
 
-export async function mutateHistory(
+let mutationQueue: Promise<void> = Promise.resolve();
+
+export function mutateHistory(
   mutation: (history: ModelHistory) => void,
   file = historyPath(),
 ): Promise<ModelHistory> {
-  const history = await loadHistory(file);
-  mutation(history);
-  await mkdir(dirname(file), { recursive: true });
-  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temp, `${JSON.stringify(history, null, 2)}\n`, { mode: 0o600 });
-  await chmod(temp, 0o600);
-  await rename(temp, file);
-  return history;
+  const operation = mutationQueue.then(async () => {
+    const history = await loadHistory(file);
+    mutation(history);
+    await mkdir(dirname(file), { recursive: true });
+    const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(temp, `${JSON.stringify(history, null, 2)}\n`, { mode: 0o600 });
+    await chmod(temp, 0o600);
+    await rename(temp, file);
+    return history;
+  });
+  mutationQueue = operation.then(
+    () => undefined,
+    () => undefined,
+  );
+  return operation;
 }

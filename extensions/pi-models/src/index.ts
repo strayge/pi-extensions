@@ -2,10 +2,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { prioritizeModelsCommand } from "./autocomplete.ts";
 import { chooseModel } from "./selector.ts";
 import { modelKey } from "./sort.ts";
-import { loadHistory, mutateHistory } from "./store.ts";
+import { loadHistory, mutateHistory, type ThinkingLevel } from "./store.ts";
 
 export default function (pi: ExtensionAPI): void {
+  let activeModel: string | undefined;
+  let activeThinking: ThinkingLevel | undefined;
+
   pi.on("session_start", (_event, ctx) => {
+    activeModel = ctx.model ? modelKey(ctx.model) : undefined;
+    activeThinking = ctx.thinkingLevel;
     if (ctx.mode !== "tui") return;
     ctx.ui.addAutocompleteProvider((current) => ({
       async getSuggestions(lines, cursorLine, cursorCol, options) {
@@ -23,15 +28,50 @@ export default function (pi: ExtensionAPI): void {
     }));
   });
 
-  pi.on("model_select", async (event) => {
+  pi.on("thinking_level_select", async (event, ctx) => {
+    const currentModel = ctx.model ? modelKey(ctx.model) : undefined;
+    // Model switches clamp thinking before model_select. That level belongs to the
+    // new model, while activeThinking still represents the model being left.
+    if (!currentModel || currentModel !== activeModel) return;
+    activeThinking = event.level;
     try {
       await mutateHistory((history) => {
-        const record = history.models[modelKey(event.model)] ?? {};
-        record.lastUsedAt = Date.now();
-        history.models[modelKey(event.model)] = record;
+        history.models[currentModel] = {
+          ...history.models[currentModel],
+          thinkingLevel: event.level,
+        };
       });
     } catch {
       /* Persistence must not take down the event dispatcher. */
+    }
+  });
+
+  pi.on("model_select", async (event) => {
+    const nextModel = modelKey(event.model);
+    let rememberedThinking: ThinkingLevel | undefined;
+    try {
+      const history = await mutateHistory((history) => {
+        if (activeModel && activeThinking) {
+          history.models[activeModel] = {
+            ...history.models[activeModel],
+            thinkingLevel: activeThinking,
+          };
+        }
+        history.models[nextModel] = {
+          ...history.models[nextModel],
+          lastUsedAt: Date.now(),
+        };
+      });
+      rememberedThinking = history.models[nextModel]?.thinkingLevel;
+    } catch {
+      /* Persistence must not take down the event dispatcher. */
+    }
+
+    activeModel = nextModel;
+    activeThinking = pi.getThinkingLevel();
+    if (rememberedThinking) {
+      pi.setThinkingLevel(rememberedThinking);
+      activeThinking = pi.getThinkingLevel();
     }
   });
   pi.registerCommand("models", {

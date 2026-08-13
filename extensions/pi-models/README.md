@@ -1,7 +1,9 @@
 # pi-models
 
 `/models` opens a model picker containing the complete available model catalogue.
-Favorites and model usage history are stored globally in `model-history.json`.
+Favorites, model usage history, and each model's latest thinking level are stored globally in
+`model-history.json`. When switching models, the picker remembers the thinking level of the model
+being left and restores the level previously used with the selected model.
 For partial command input such as `/m` or `/mo`, `/models` is suggested before the built-in `/model`.
 
 Rows display `[provider] Model Name`, falling back to the model ID when no name is available.
