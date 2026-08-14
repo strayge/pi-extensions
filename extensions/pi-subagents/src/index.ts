@@ -970,11 +970,17 @@ Terse command-style prompts produce shallow, generic work.
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
-      const details = result.details as AgentDetails | undefined;
-      if (!details) {
+      const rawResult = () => {
         const text = result.content[0]?.type === "text" ? result.content[0].text : "";
         return new Text(text, 0, 0);
-      }
+      };
+      const candidate = result.details as Partial<AgentDetails> | undefined;
+      // A tool_call veto happens before Agent.execute(), so pi supplies the
+      // blocking extension's text with empty details. Preserve that result;
+      // treating an absent/unknown status as a hard max-turn abort invents a
+      // subagent lifecycle that never happened.
+      if (!candidate?.status) return rawResult();
+      const details = candidate as AgentDetails;
 
       // Helper: build "haiku · thinking: high · turns: 5/30 · 3 tool uses · 33.8k tokens" stats string
       const stats = (d: AgentDetails) => {
@@ -1037,16 +1043,20 @@ Terse command-style prompts produce shallow, generic work.
       }
 
       // ---- Error / Aborted (hard max_turns) ----
-      const s = stats(details);
-      let line = theme.fg("error", "✗") + (s ? " " + s : "");
+      if (details.status === "error" || details.status === "aborted") {
+        const s = stats(details);
+        let line = theme.fg("error", "✗") + (s ? " " + s : "");
 
-      if (details.status === "error") {
-        line += "\n" + theme.fg("error", `  ⎿  Error: ${details.error ?? "unknown"}`);
-      } else {
-        line += "\n" + theme.fg("warning", "  ⎿  Aborted (max turns exceeded)");
+        if (details.status === "error") {
+          line += "\n" + theme.fg("error", `  ⎿  Error: ${details.error ?? "unknown"}`);
+        } else {
+          line += "\n" + theme.fg("warning", "  ⎿  Aborted (max turns exceeded)");
+        }
+
+        return new Text(line, 0, 0);
       }
 
-      return new Text(line, 0, 0);
+      return rawResult();
     },
 
     // ---- Execute ----

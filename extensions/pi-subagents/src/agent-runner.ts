@@ -19,6 +19,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
+import { createChildExtensionUI } from "./child-ui.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
@@ -362,6 +363,8 @@ export interface RunOptions {
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
+  /** Short task description shown in the parent UI. */
+  description?: string;
   model?: Model<any>;
   maxTurns?: number;
   signal?: AbortSignal;
@@ -863,15 +866,20 @@ export async function runAgent(
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
 
   const baseSessionName = agentConfig?.name ?? type;
-  session.setSessionName(
-    options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
-  );
+  const sessionName = options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName;
+  session.setSessionName(sessionName);
+  const taskDescription = options.description?.trim().replace(/\s+/g, " ");
+  const childLabel = taskDescription ? `${config.displayName} — ${taskDescription}` : sessionName;
 
   // Bind extensions so that session_start fires and extensions can initialize
   // (e.g. loading credentials, setting up state). Tool gating already happened
   // at session construction via the `tools:` allowlist above — no separate
   // post-bind filter is needed. All ExtensionBindings fields are optional.
   await session.bindExtensions({
+    ...(ctx.hasUI && {
+      uiContext: createChildExtensionUI(ctx.ui, childLabel, options.signal),
+      mode: ctx.mode,
+    }),
     onError: (err) => {
       options.onToolActivity?.({
         type: "end",

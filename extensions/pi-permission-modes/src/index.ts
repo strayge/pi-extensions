@@ -106,6 +106,16 @@ const BUILTIN_HANDLED = new Set([
 /** Our own tools that must never be hidden (show_plan is needed in Plan mode). */
 const NEVER_HIDE = new Set(["show_plan"]);
 
+const USER_DENIED_COMMAND_REASON =
+  "Command denied by the user; it was not executed. Do not retry this command or an equivalent command. " +
+  "Continue without it or report that permission was denied.";
+
+function userDeniedToolReason(toolName: string): string {
+  return toolName === "Agent"
+    ? "Agent launch denied by the user; no subagent was started."
+    : `Tool "${toolName}" denied by the user; it was not executed.`;
+}
+
 function bashRulePatterns(name: string, args: string[]): { narrow: string[]; broad: string[]; command: string } {
   const command = [name, ...args].join(" ").trim();
   const broad = [name, `${name} *`];
@@ -834,7 +844,7 @@ export default async function (pi: ExtensionAPI) {
               return { block: true, reason: gate.reason };
             }
           } else if (choice !== ALLOW_ONCE) {
-            return { block: true, reason: gate.reason };
+            return { block: true, reason: USER_DENIED_COMMAND_REASON };
           }
         }
         if (gate.onApproveUnsandboxed) approvedUnsandboxed.add(event.toolCallId);
@@ -922,7 +932,12 @@ export default async function (pi: ExtensionAPI) {
         action === "ask" &&
         !(await promptAllow(ctx, "tool", toolName, `Tool "${toolName}" — first use in ${m.label}; allow?`, learnForever(ctx, "tool", toolName)))
       ) {
-        return { block: true, reason: "tool blocked" };
+        return {
+          block: true,
+          reason: ctx.hasUI
+            ? userDeniedToolReason(toolName)
+            : `Tool "${toolName}" requires approval, but no interactive user is available.`,
+        };
       }
     }
 

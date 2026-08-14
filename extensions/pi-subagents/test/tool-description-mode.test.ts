@@ -92,6 +92,23 @@ describe("toolDescriptionMode", () => {
     expect(desc).toContain("very thorough");
   });
 
+  it("renders a pre-execution permission veto instead of inventing an aborted subagent", () => {
+    const tools = setup();
+    const agent = tools.get("Agent");
+    const component = agent.renderResult(
+      {
+        content: [{ type: "text", text: "Agent launch denied by the user; no subagent was started." }],
+        details: {},
+      },
+      { expanded: false, isPartial: false },
+      { fg: (_color: string, text: string) => text },
+    );
+
+    expect(component.render(120).map((line: string) => line.trimEnd())).toEqual([
+      "Agent launch denied by the user; no subagent was started.",
+    ]);
+  });
+
   it("compact mode swaps in the short description with one-line type list", () => {
     const tools = setup({ toolDescriptionMode: "compact" });
     const desc: string = tools.get("Agent").description;
