@@ -126,10 +126,10 @@ and runs **unsandboxed** once you approve it; and `edit`/`write` to
 [below](#how-protection-works)) are hard-blocked.
 
 > **When the sandbox is unavailable** (missing dependency, init failure,
-> `--no-sandbox`, or the project is a **git worktree/submodule** — see below):
-> Default/Plan/Build show `(!) <reason>` in the footer, and in-project `bash` that
-> would have been sandboxed instead **prompts** for confirmation — you are never
-> silently unprotected.
+> `--no-sandbox`, or malformed/unsafe Git metadata): Default/Plan/Build show
+> `(!) <reason>` in the footer, and in-project `bash` that would have been
+> sandboxed instead **prompts** for confirmation — you are never silently
+> unprotected.
 
 > **Sandbox placeholder cleanup:** the sandbox runtime write-protects a fixed set
 > of dotfiles/dirs at the project root (`.git`, `.gitconfig`, `.gitmodules`,
@@ -150,12 +150,20 @@ and runs **unsandboxed** once you approve it; and `edit`/`write` to
 > with the runtime's temporary placeholder files. The extension's file-tool
 > backstop likewise leaves `.claude/` writable.
 >
-> A **real git worktree/submodule** (`.git` is a *non-empty* file pointing at the
-> real gitdir) genuinely can't be sandboxed — bubblewrap can't bind `.git/hooks`
-> under a file, and that file is legitimate so we won't delete it. There the
-> extension disables the sandbox for the project (falling back to prompting)
-> instead of letting every command fail with `bwrap: ... Not a directory`. Use a
-> normal clone for full Build-mode sandboxing.
+> **Git worktrees and submodules:** when `.git` is a non-empty Git file, the
+> extension resolves its per-worktree gitdir and optional shared `commondir`.
+> Writable modes expose the resolved Git metadata directory to the sandbox so
+> normal operations such as `git add`, `git commit`, and `git fetch` can update
+> indexes, objects, and refs. Plan remains read-only. Malformed, missing, symlinked,
+> dangerously broad, or nonstandard gitfile layouts without a verifiable
+> worktree/submodule backlink fail closed and degrade to prompting.
+>
+> This is intentionally a coarse write grant. For a linked worktree the shared
+> common `.git` directory is writable from sandboxed Bash, including hooks,
+> repository config, refs, objects, logs, and administrative data for sibling
+> worktrees. The local `.git` pointer file stays read-only, and normal clones keep
+> the runtime's existing `.git/hooks` and `.git/config` write protection. Direct
+> `edit`/`write` tools keep their protected-path backstop in every non-YOLO mode.
 
 > **Symlinked sandbox paths:** a mount point that *is* a symlink aborts the whole
 > sandbox — and with it every command — because bubblewrap resolves destinations

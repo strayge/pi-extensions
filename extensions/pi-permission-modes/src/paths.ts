@@ -11,7 +11,7 @@
  * only containment guard.
  */
 
-import { realpathSync, rmSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -169,8 +169,8 @@ export function removeSandboxPlaceholders(root: string): number {
   for (const rel of SANDBOX_PLACEHOLDER_PATHS) {
     const p = path.join(root, rel);
     try {
-      const st = statSync(p);
-      if (st.isFile() && st.size === 0) {
+      const st = lstatSync(p);
+      if (st.isFile() && st.size === 0 && st.nlink === 1) {
         rmSync(p, { force: true });
         removed++;
       }
@@ -181,19 +181,154 @@ export function removeSandboxPlaceholders(root: string): number {
   return removed;
 }
 
+export type GitLayout =
+  | { kind: "none" | "directory" | "placeholder" }
+  | { kind: "gitfile"; gitFile: string; gitDir: string; commonDir: string; writePaths: string[] }
+  | { kind: "invalid"; reason: string };
+
+const MAX_GIT_PATH_FILE_BYTES = 16 * 1024;
+
+function readGitPathFile(file: string, prefix?: string): string {
+  const st = lstatSync(file);
+  if (st.isSymbolicLink() || !st.isFile() || st.size === 0 || st.size > MAX_GIT_PATH_FILE_BYTES) {
+    throw new Error("must be a non-empty regular file of reasonable size");
+  }
+  const text = readFileSync(file, "utf8").replace(/\r\n/g, "\n");
+  const withoutFinalNewline = text.endsWith("\n") ? text.slice(0, -1) : text;
+  if (withoutFinalNewline.includes("\n") || withoutFinalNewline.includes("\0")) {
+    throw new Error("must contain exactly one path line");
+  }
+  const value = prefix ? (withoutFinalNewline.startsWith(prefix) ? withoutFinalNewline.slice(prefix.length) : "") : withoutFinalNewline;
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error(prefix ? `must start with ${JSON.stringify(prefix)}` : "must contain a path");
+  return trimmed;
+}
+
+function resolveGitDirectory(raw: string, relativeTo: string, label: string): string {
+  const lexical = path.resolve(relativeTo, raw);
+  if (lstatSync(lexical).isSymbolicLink()) throw new Error(`${label} target is a symbolic link`);
+  const resolved = realpathSync(lexical);
+  if (!statSync(resolved).isDirectory()) throw new Error(`${label} target is not a directory`);
+  const components = resolved.slice(path.parse(resolved).root.length).split(path.sep).filter(Boolean);
+  if (components.length <= 1) throw new Error(`${label} resolves to dangerously broad path ${resolved}`);
+  return resolved;
+}
+
+function containsPath(parent: string, child: string): boolean {
+  const rel = path.relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function isMissingPathError(err: unknown): boolean {
+  return err instanceof Error && "code" in err && err.code === "ENOENT";
+}
+
+function gitConfigCoreValue(file: string, key: string): string | undefined {
+  const st = lstatSync(file);
+  if (st.isSymbolicLink() || !st.isFile() || st.size === 0 || st.size > MAX_GIT_PATH_FILE_BYTES) return undefined;
+  let inCore = false;
+  for (const line of readFileSync(file, "utf8").replace(/\r\n/g, "\n").split("\n")) {
+    const section = /^\s*\[([^\]]+)]\s*$/.exec(line);
+    if (section) {
+      inCore = section[1].trim().toLowerCase() === "core";
+      continue;
+    }
+    if (!inCore) continue;
+    const entry = new RegExp(`^\\s*${key}\\s*=\\s*(.*?)\\s*$`, "i").exec(line);
+    if (!entry) continue;
+    const raw = entry[1];
+    if (raw.startsWith('"')) {
+      if (!raw.endsWith('"')) return undefined;
+      return raw.slice(1, -1).replace(/\\(["\\])/g, "$1");
+    }
+    return raw || undefined;
+  }
+  return undefined;
+}
+
+function requireLinkedCommonDir(commonDir: string, gitDir: string): void {
+  const config = path.join(commonDir, "config");
+  if (!statSync(path.join(commonDir, "HEAD")).isFile() || !statSync(config).isFile()) {
+    throw new Error("commondir is missing repository metadata");
+  }
+  const conventional = path.basename(commonDir) === ".git";
+  const bare = gitConfigCoreValue(config, "bare")?.toLowerCase() === "true";
+  if ((!conventional && !bare) || path.dirname(gitDir) !== path.join(commonDir, "worktrees")) {
+    throw new Error("commondir is not the parent Git metadata for this worktree");
+  }
+  if (!statSync(path.join(commonDir, "objects")).isDirectory()) {
+    throw new Error("commondir is missing its object database");
+  }
+}
+
+function requireGitfileOwner(root: string, gitFile: string, gitDir: string, hasCommonDir: boolean): void {
+  const expectedRoot = realpathSync(root);
+  if (hasCommonDir) {
+    const backlinkRaw = readGitPathFile(path.join(gitDir, "gitdir"));
+    const backlink = realpathSync(path.resolve(gitDir, backlinkRaw));
+    if (backlink !== realpathSync(gitFile) || realpathSync(path.dirname(backlink)) !== expectedRoot) {
+      throw new Error("gitdir backlink does not point to this worktree");
+    }
+    return;
+  }
+
+  const segments = gitDir.split(path.sep).filter(Boolean);
+  const dotGit = segments.lastIndexOf(".git");
+  const directModule = dotGit >= 0 && segments[dotGit + 1] === "modules";
+  const linkedWorktreeModule =
+    dotGit >= 0 && segments[dotGit + 1] === "worktrees" && Boolean(segments[dotGit + 2]) && segments[dotGit + 3] === "modules";
+  if (!directModule && !linkedWorktreeModule) throw new Error("gitdir is not submodule metadata");
+  const worktree = gitConfigCoreValue(path.join(gitDir, "config"), "worktree");
+  if (!worktree || realpathSync(path.resolve(gitDir, worktree)) !== expectedRoot) {
+    throw new Error("gitdir has no worktree ownership backlink");
+  }
+}
+
 /**
- * True when `<root>/.git` is a **real gitfile** (a non-empty file) — i.e. a git
- * worktree or submodule. bubblewrap can't bind `.git/hooks` under a file, and
- * unlike the 0-byte placeholder this file is legitimate and must NOT be deleted,
- * so the sandbox degrades to prompting for these projects. (A 0-byte `.git`
- * placeholder returns false here — it's cleaned up instead, see `removeSandboxPlaceholders`.)
+ * Describe the project's Git metadata without invoking Git before containment is
+ * active. Git files are used by linked worktrees and submodules; their optional
+ * `commondir` redirects shared objects/refs/config to another directory.
  */
-export function gitFileBlocksSandbox(root: string): boolean {
+export function resolveGitLayout(root: string): GitLayout {
+  const gitFile = path.join(root, ".git");
+  let gitFileStat: ReturnType<typeof lstatSync>;
   try {
-    const st = statSync(path.join(root, ".git"));
-    return !st.isDirectory() && !(st.isFile() && st.size === 0);
-  } catch {
-    return false; // no .git → normal non-git project, sandbox is fine
+    gitFileStat = lstatSync(gitFile);
+  } catch (err) {
+    return isMissingPathError(err)
+      ? { kind: "none" }
+      : { kind: "invalid", reason: `cannot inspect .git (${err instanceof Error ? err.message : String(err)})` };
+  }
+  if (gitFileStat.isSymbolicLink()) return { kind: "invalid", reason: ".git is a symbolic link" };
+  if (gitFileStat.isDirectory()) return { kind: "directory" };
+  if (gitFileStat.isFile() && gitFileStat.size === 0) return { kind: "placeholder" };
+  if (!gitFileStat.isFile()) return { kind: "invalid", reason: ".git is not a regular file or directory" };
+  if (gitFileStat.nlink !== 1) return { kind: "invalid", reason: ".git has multiple hard links" };
+
+  try {
+    const gitDirRaw = readGitPathFile(gitFile, "gitdir: ");
+    const gitDir = resolveGitDirectory(gitDirRaw, path.dirname(gitFile), "gitdir");
+    const head = path.join(gitDir, "HEAD");
+    if (!statSync(head).isFile()) throw new Error("gitdir does not contain a regular HEAD file");
+
+    const commonFile = path.join(gitDir, "commondir");
+    let commonFileStat: ReturnType<typeof lstatSync> | undefined;
+    try {
+      commonFileStat = lstatSync(commonFile);
+    } catch (err) {
+      if (!isMissingPathError(err)) throw err;
+    }
+    if (commonFileStat?.isSymbolicLink()) throw new Error("commondir is a symbolic link");
+    const commonDir = commonFileStat
+      ? resolveGitDirectory(readGitPathFile(commonFile), gitDir, "commondir")
+      : gitDir;
+    requireGitfileOwner(root, gitFile, gitDir, commonFileStat !== undefined);
+    if (commonFileStat) requireLinkedCommonDir(commonDir, gitDir);
+
+    const writePaths = containsPath(commonDir, gitDir) ? [commonDir] : [commonDir, gitDir];
+    return { kind: "gitfile", gitFile, gitDir, commonDir, writePaths };
+  } catch (err) {
+    return { kind: "invalid", reason: err instanceof Error ? err.message : String(err) };
   }
 }
 

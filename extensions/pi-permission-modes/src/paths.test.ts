@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
-  gitFileBlocksSandbox,
+  resolveGitLayout,
   isMarkdown,
   isOutside,
   isPlanFile,
@@ -62,32 +62,156 @@ test("isProtectedPath: does not flag look-alikes (no loose substring)", () => {
   assert.equal(isProtectedPath(".claude/agents/bar.md"), false);
 });
 
-test("gitFileBlocksSandbox distinguishes 0-byte stub vs real gitfile", () => {
-  const t = tmpdir();
-  if (!existsSync(t)) mkdirSync(t, { recursive: true });
-  const base = mkdtempSync(path.join(t, "perm-git-"));
+test("resolveGitLayout distinguishes ordinary project layouts", () => {
+  const base = mkdtempSync(path.join(tmpdir(), "perm-git-kind-"));
   try {
-    // No .git → non-git project: sandbox stays on.
     const none = path.join(base, "none");
-    mkdirSync(none, { recursive: true });
-    assert.equal(gitFileBlocksSandbox(none), false);
+    mkdirSync(none);
+    assert.deepEqual(resolveGitLayout(none), { kind: "none" });
 
-    // Real .git directory → normal repo: sandbox on.
     const repo = path.join(base, "repo");
     mkdirSync(path.join(repo, ".git"), { recursive: true });
-    assert.equal(gitFileBlocksSandbox(repo), false);
+    assert.deepEqual(resolveGitLayout(repo), { kind: "directory" });
 
-    // 0-byte .git → sandbox-planted placeholder: not a worktree (cleaned instead).
     const stub = path.join(base, "stub");
-    mkdirSync(stub, { recursive: true });
+    mkdirSync(stub);
     writeFileSync(path.join(stub, ".git"), "");
-    assert.equal(gitFileBlocksSandbox(stub), false);
+    assert.deepEqual(resolveGitLayout(stub), { kind: "placeholder" });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
 
-    // Non-empty .git file → real worktree/submodule: degrade.
-    const wt = path.join(base, "worktree");
-    mkdirSync(wt, { recursive: true });
-    writeFileSync(path.join(wt, ".git"), "gitdir: /elsewhere\n");
-    assert.equal(gitFileBlocksSandbox(wt), true);
+test("resolveGitLayout resolves a linked worktree to its common git directory", () => {
+  const base = realpathSync(mkdtempSync(path.join(tmpdir(), "perm-git-wt-")));
+  try {
+    const commonDir = path.join(base, "main repo", ".git");
+    const gitDir = path.join(commonDir, "worktrees", "feature");
+    const worktree = path.join(base, "feature tree");
+    mkdirSync(gitDir, { recursive: true });
+    mkdirSync(path.join(commonDir, "objects"));
+    mkdirSync(worktree);
+    writeFileSync(path.join(commonDir, "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(path.join(commonDir, "config"), "[core]\n\tbare = false\n");
+    writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/feature\n");
+    writeFileSync(path.join(gitDir, "commondir"), "../..\r\n");
+    writeFileSync(path.join(gitDir, "gitdir"), `${path.join(worktree, ".git")}\n`);
+    writeFileSync(path.join(worktree, ".git"), `gitdir: ${path.relative(worktree, gitDir)}\r\n`);
+
+    assert.deepEqual(resolveGitLayout(worktree), {
+      kind: "gitfile",
+      gitFile: path.join(worktree, ".git"),
+      gitDir,
+      commonDir,
+      writePaths: [commonDir],
+    });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("resolveGitLayout supports linked worktrees from a bare common repository", () => {
+  const base = realpathSync(mkdtempSync(path.join(tmpdir(), "perm-git-bare-")));
+  try {
+    const commonDir = path.join(base, "repository.git");
+    const gitDir = path.join(commonDir, "worktrees", "feature");
+    const worktree = path.join(base, "feature");
+    mkdirSync(path.join(commonDir, "objects"), { recursive: true });
+    mkdirSync(gitDir, { recursive: true });
+    mkdirSync(worktree);
+    writeFileSync(path.join(commonDir, "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(path.join(commonDir, "config"), "[core]\n\tbare = true\n");
+    writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/feature\n");
+    writeFileSync(path.join(gitDir, "commondir"), "../..\n");
+    writeFileSync(path.join(gitDir, "gitdir"), `${path.join(worktree, ".git")}\n`);
+    writeFileSync(path.join(worktree, ".git"), `gitdir: ${gitDir}\n`);
+
+    const layout = resolveGitLayout(worktree);
+    assert.equal(layout.kind, "gitfile");
+    if (layout.kind === "gitfile") assert.deepEqual(layout.writePaths, [commonDir]);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("resolveGitLayout supports submodules and rejects unrelated commondirs", () => {
+  const base = realpathSync(mkdtempSync(path.join(tmpdir(), "perm-git-sub-")));
+  try {
+    const project = path.join(base, "submodule");
+    const gitDir = path.join(base, "super", ".git", "modules", "submodule");
+    mkdirSync(project, { recursive: true });
+    mkdirSync(gitDir, { recursive: true });
+    writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(path.join(gitDir, "config"), `[core]\n\tworktree = ${path.relative(gitDir, project)}\n`);
+    writeFileSync(path.join(project, ".git"), `gitdir: ${gitDir}\n`);
+    const submodule = resolveGitLayout(project);
+    assert.equal(submodule.kind, "gitfile");
+    if (submodule.kind === "gitfile") {
+      assert.equal(submodule.commonDir, gitDir);
+      assert.deepEqual(submodule.writePaths, [gitDir]);
+    }
+
+    const linkedSubmodule = path.join(base, "linked-submodule");
+    const linkedSubmoduleGitDir = path.join(base, "linked", ".git", "worktrees", "feature", "modules", "sub");
+    mkdirSync(linkedSubmodule, { recursive: true });
+    mkdirSync(linkedSubmoduleGitDir, { recursive: true });
+    writeFileSync(path.join(linkedSubmoduleGitDir, "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(
+      path.join(linkedSubmoduleGitDir, "config"),
+      `[core]\n\tworktree = ${path.relative(linkedSubmoduleGitDir, linkedSubmodule)}\n`,
+    );
+    writeFileSync(path.join(linkedSubmodule, ".git"), `gitdir: ${linkedSubmoduleGitDir}\n`);
+    assert.equal(resolveGitLayout(linkedSubmodule).kind, "gitfile");
+
+    const commonDir = path.join(base, "shared", "metadata");
+    mkdirSync(commonDir, { recursive: true });
+    writeFileSync(path.join(gitDir, "commondir"), `${commonDir}\n`);
+    writeFileSync(path.join(gitDir, "gitdir"), `${path.join(project, ".git")}\n`);
+    const disjoint = resolveGitLayout(project);
+    assert.equal(disjoint.kind, "invalid");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("resolveGitLayout rejects malformed or unsafe gitfiles", () => {
+  const base = mkdtempSync(path.join(tmpdir(), "perm-git-bad-"));
+  try {
+    const project = path.join(base, "project");
+    mkdirSync(project);
+    writeFileSync(path.join(project, ".git"), "not a gitfile\n");
+    assert.equal(resolveGitLayout(project).kind, "invalid");
+
+    writeFileSync(path.join(project, ".git"), "gitdir: missing\n");
+    assert.equal(resolveGitLayout(project).kind, "invalid");
+
+    const gitDir = path.join(base, "metadata", "worktrees", "project");
+    mkdirSync(gitDir, { recursive: true });
+    writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(path.join(gitDir, "commondir"), "missing\n");
+    writeFileSync(path.join(project, ".git"), `gitdir: ${gitDir}\n`);
+    assert.equal(resolveGitLayout(project).kind, "invalid");
+
+    rmSync(path.join(gitDir, "commondir"));
+    const otherWorktree = path.join(base, "other-worktree");
+    mkdirSync(otherWorktree);
+    writeFileSync(path.join(gitDir, "config"), `[core]\n\tworktree = ${path.relative(gitDir, otherWorktree)}\n`);
+    assert.equal(resolveGitLayout(project).kind, "invalid");
+
+    const gitDirLink = path.join(base, "metadata-link");
+    symlinkSync(gitDir, gitDirLink);
+    writeFileSync(path.join(project, ".git"), `gitdir: ${gitDirLink}\n`);
+    assert.equal(resolveGitLayout(project).kind, "invalid");
+
+    rmSync(path.join(project, ".git"));
+    symlinkSync(path.join(base, "elsewhere"), path.join(project, ".git"));
+    assert.equal(resolveGitLayout(project).kind, "invalid");
+
+    rmSync(path.join(project, ".git"));
+    const hardlinkSource = path.join(base, "gitfile-copy");
+    writeFileSync(hardlinkSource, `gitdir: ${gitDir}\n`);
+    linkSync(hardlinkSource, path.join(project, ".git"));
+    assert.equal(resolveGitLayout(project).kind, "invalid");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -166,6 +290,22 @@ test("removeSandboxPlaceholders deletes 0-byte placeholders, leaves real files/d
     }
     assert.equal(existsSync(path.join(proj, ".gitmodules")), true); // real file kept
     assert.equal(removeSandboxPlaceholders(realIdea), 0); // a real .idea dir is left alone
+
+    const linked = path.join(base, "linked");
+    const zeroTarget = path.join(base, "zero-target");
+    mkdirSync(linked);
+    writeFileSync(zeroTarget, "");
+    symlinkSync(zeroTarget, path.join(linked, ".git"));
+    assert.equal(removeSandboxPlaceholders(linked), 0);
+    assert.equal(existsSync(path.join(linked, ".git")), true);
+
+    const hardlinked = path.join(base, "hardlinked");
+    const hardlinkTarget = path.join(base, "hardlink-target");
+    mkdirSync(hardlinked);
+    writeFileSync(hardlinkTarget, "");
+    linkSync(hardlinkTarget, path.join(hardlinked, ".git"));
+    assert.equal(removeSandboxPlaceholders(hardlinked), 0);
+    assert.equal(existsSync(path.join(hardlinked, ".git")), true);
 
     // No placeholders → 0.
     const none = path.join(base, "none");

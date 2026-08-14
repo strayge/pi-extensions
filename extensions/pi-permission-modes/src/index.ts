@@ -59,7 +59,6 @@ import {
   persistModeRule,
   persistProjectRule,
   projectGrantCount,
-  profileToConfig,
   stockDefaultsFile,
 } from "./config-load.ts";
 import type { PermState } from "./modes.ts";
@@ -511,7 +510,7 @@ export default async function (pi: ExtensionAPI) {
       }
       if (sandbox.disabled) return ctx.ui.notify("Sandbox disabled via --no-sandbox", "info");
       if (!sandbox.ready) return ctx.ui.notify(`Sandbox unavailable: ${sandbox.warn ?? "unknown"}`, "warning");
-      const c = profileToConfig(m.sandbox);
+      const c = sandbox.effectiveConfig(m.sandbox);
       ctx.ui.notify(
         [
           `Sandbox: ACTIVE for ${m.label} (${m.sandbox.writable ? "project-writable" : "read-only"})`,
@@ -674,7 +673,17 @@ export default async function (pi: ExtensionAPI) {
     applyToolVisibility(); // keep hidden tools hidden as the tool set evolves
     const m = currentMode();
     const parts: string[] = [];
-    const aware = sandboxAwarenessPrompt(m, {
+    const effectiveFilesystem = sandbox.effectiveConfig(m.sandbox).filesystem;
+    const awarenessMode = {
+      ...m,
+      sandbox: {
+        ...m.sandbox,
+        allowWrite: effectiveFilesystem?.allowWrite,
+        denyWrite: effectiveFilesystem?.denyWrite,
+        denyRead: effectiveFilesystem?.denyRead,
+      },
+    };
+    const aware = sandboxAwarenessPrompt(awarenessMode, {
       active: sandbox.ready && !sandbox.disabled,
       reason: sandbox.disabled ? "disabled via --no-sandbox" : sandbox.warn,
       networkOpen: net.open,

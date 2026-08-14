@@ -11,7 +11,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import { type SandboxConfig, canonicalizeSandboxPaths, profileToConfig, readOnlyOverride } from "./config-load.ts";
-import { gitFileBlocksSandbox, removeSandboxPlaceholders } from "./paths.ts";
+import { type GitLayout, removeSandboxPlaceholders, resolveGitLayout } from "./paths.ts";
 import { withProxyReady } from "./proxy-wait.ts";
 import type { SandboxProfile } from "./schema.ts";
 import { isModuleNotFound } from "./util.ts";
@@ -95,11 +95,31 @@ export function createSandboxedBashOps(
           });
         });
       } finally {
-        // Always delete the placeholders bwrap just planted, regardless of how
-        // we leave: normal close, abort/timeout rejection, a throw from
-        // wrapWithSandbox, or a synchronous spawn failure.
-        removeSandboxPlaceholders(cwd);
+        // The runtime tracks every host mountpoint it materializes and requires
+        // per-command cleanup once the child has exited. Keep our narrow legacy
+        // cleanup as a backstop for placeholders left by older runtime behavior.
+        try {
+          SandboxManager.cleanupAfterCommand();
+        } finally {
+          removeSandboxPlaceholders(cwd);
+        }
       }
+    },
+  };
+}
+
+/** Add writable Git metadata for a validated gitfile project. */
+export function addGitWriteAccess(config: SandboxConfig, layout: GitLayout): SandboxConfig {
+  if (layout.kind !== "gitfile") return config;
+  const filesystem = config.filesystem ?? {};
+  return {
+    ...config,
+    filesystem: {
+      ...filesystem,
+      allowWrite: [...new Set([...(filesystem.allowWrite ?? []), ...layout.writePaths])],
+      // The project itself is writable, but its gitfile must keep pointing at
+      // the metadata tree that was validated before the sandbox started.
+      denyWrite: [...new Set([...(filesystem.denyWrite ?? []), layout.gitFile])],
     },
   };
 }
@@ -140,6 +160,7 @@ export class SandboxController {
   private notifyFn: Notify = () => {};
   private askHost: ((host: string, port: number | undefined) => Promise<boolean>) | undefined;
   private drainBlockedHosts: (() => string[]) | undefined;
+  private gitLayout: GitLayout = { kind: "none" };
   ready = false;
   disabled = false;
   warn: string | undefined;
@@ -147,6 +168,12 @@ export class SandboxController {
   /** The active runtime, or null when unavailable. */
   get sandboxManager(): SandboxManagerType | null {
     return this.manager;
+  }
+
+  /** Runtime-facing profile including any validated gitfile write grant. */
+  effectiveConfig(profile: SandboxProfile): SandboxConfig {
+    const config = profileToConfig(profile);
+    return profile.writable ? addGitWriteAccess(config, this.gitLayout) : config;
   }
 
   /**
@@ -181,6 +208,7 @@ export class SandboxController {
     this.notifyFn = notify;
     this.askHost = askHost;
     this.drainBlockedHosts = drainBlockedHosts;
+    this.gitLayout = { kind: "none" };
 
     if (noSandbox) {
       this.disabled = true;
@@ -217,21 +245,19 @@ export class SandboxController {
     // .git), so .git below isn't mistaken for a worktree.
     removeSandboxPlaceholders(cwd);
 
-    // bubblewrap unconditionally binds <cwd>/.git/hooks; if .git is a REAL file
-    // (git worktree/submodule) that bind fails and every sandboxed command
-    // errors — and we must not delete that legitimate file. Degrade to prompting.
-    if (gitFileBlocksSandbox(cwd)) {
+    this.gitLayout = resolveGitLayout(cwd);
+    if (this.gitLayout.kind === "invalid") {
       this.degraded = true;
       this.profile = profile;
-      this.warn = "sandbox off: project .git is a file (worktree/submodule); bwrap can't bind .git/hooks";
+      this.warn = `sandbox off: project .git metadata is invalid (${this.gitLayout.reason})`;
       if (hasUI) {
         notify(
-          "permission-mode: OS sandbox disabled for this project — its `.git` is a file (git worktree/submodule), " +
-            "which bubblewrap can't sandbox. In-project bash will prompt for confirmation instead. " +
-            "Use a normal clone for full sandboxing.",
+          "permission-mode: OS sandbox disabled because the project's `.git` metadata could not be resolved safely. " +
+            "In-project bash will prompt for confirmation instead.\n" +
+            this.gitLayout.reason,
         );
       }
-      return; // leave ready=false → the sandboxed modes degrade to prompting
+      return;
     }
 
     await this.applyProfile(profile);
@@ -250,7 +276,7 @@ export class SandboxController {
     if (!profile.enabled) return; // non-sandboxing mode (e.g. YOLO): keep prior init
 
     const dropped: string[] = [];
-    const cfg = canonicalizeSandboxPaths(profileToConfig(profile), (m) => dropped.push(m));
+    const cfg = canonicalizeSandboxPaths(this.effectiveConfig(profile), (m) => dropped.push(m));
     const key = JSON.stringify({ n: cfg.network, f: cfg.filesystem });
     if (this.ready && key === this.appliedKey) return;
 
