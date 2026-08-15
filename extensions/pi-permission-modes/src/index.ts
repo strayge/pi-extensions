@@ -181,9 +181,17 @@ export default async function (pi: ExtensionAPI) {
   // would misdirect it — and the fallback isn't exported to child processes
   // as if it were an explicit choice (children re-derive their own fallback).
   let fallbackMode = false;
+  // Set once from the first session_start. Only an identified in-process child
+  // that began from a forwarded mode, or an implicit safety fallback, follows
+  // later parent changes; a root selection is a startup snapshot.
+  let followsEnvironment: boolean | undefined;
   const root = process.cwd();
 
   const currentMode = (): ModeDef => config.modes[modeName] ?? config.modes[config.defaultMode];
+
+  /** Recognize pi-subagents' standalone marker, not prose that merely mentions it. */
+  const isActiveAgentChild = (ctx: ExtensionContext): boolean =>
+    /(?:^|\n)<active_agent name="[^\r\n]*"\/>(?=\n|$)/.test(ctx.getSystemPrompt());
 
   const sandbox = new SandboxController();
   // toolCallIds the user explicitly approved to run OUTSIDE the sandbox.
@@ -304,9 +312,9 @@ export default async function (pi: ExtensionAPI) {
   const setMode = async (
     name: string,
     ctx: ExtensionContext,
-    opts: { persist?: boolean; viaFallback?: boolean; announce?: boolean } = {},
+    opts: { persist?: boolean; viaFallback?: boolean; announce?: boolean; forwardEnv?: boolean } = {},
   ) => {
-    const { persist = true, viaFallback = false, announce = true } = opts;
+    const { persist = true, viaFallback = false, announce = true, forwardEnv = true } = opts;
     if (!config.modes[name]) return;
     uiCtx = ctx;
     modeName = name;
@@ -315,13 +323,22 @@ export default async function (pi: ExtensionAPI) {
     // adopts it on session_start unless an explicit --perm flag overrides. The
     // implicit headless fallback is NOT forwarded: a child with no explicit mode
     // derives the same safe fallback itself (and skips the systemPrompt too).
-    if (!viaFallback) process.env.PI_PERMISSION_MODE = modeName;
+    if (forwardEnv && !viaFallback) process.env.PI_PERMISSION_MODE = modeName;
     const m = currentMode();
     await sandbox.applyProfile(m.sandbox); // re-init runtime if the profile changed
     applyToolVisibility();
     refreshStatus(ctx, m);
     if (announce) ctx.ui.notify(`Permission mode: ${m.label}`, "info");
     if (persist) pi.appendEntry<PermState>("perm-mode", { mode: modeName });
+  };
+
+  /** Reapply a parent-selected environment mode at the next policy boundary. */
+  const reconcileModeFromEnvironment = async (ctx: ExtensionContext): Promise<void> => {
+    if (!followsEnvironment) return;
+    const requested = process.env.PI_PERMISSION_MODE;
+    if (!requested || !config.modes[requested]) return;
+    if (requested === modeName && !fallbackMode) return;
+    await setMode(requested, ctx, { persist: false, announce: false, forwardEnv: false });
   };
 
   /** The most restrictive built-in-style mode for a headless child without a
@@ -346,24 +363,31 @@ export default async function (pi: ExtensionAPI) {
    *      flagged as `fallback` (policy applies, systemPrompt is not injected),
    *   5. the current/default mode.
    */
-  const pickMode = (ctx: ExtensionContext, useFlag: boolean): { name: string; fallback: boolean } => {
-    let resolved: string | undefined;
+  type ModeSource = "flag" | "persisted" | "env" | "fallback" | "current";
+  const pickMode = (
+    ctx: ExtensionContext,
+    useFlag: boolean,
+    useEnvironment = true,
+  ): { name: string; fallback: boolean; source: ModeSource } => {
     if (useFlag) {
       const flag = String(pi.getFlag("perm") ?? "").toLowerCase();
-      if (config.modes[flag]) resolved = flag;
+      if (config.modes[flag]) return { name: flag, fallback: false, source: "flag" };
     }
+    let persisted: string | undefined;
     for (const entry of ctx.sessionManager.getEntries()) {
       if (entry.type === "custom" && entry.customType === "perm-mode") {
         const data = entry.data as PermState | undefined;
-        if (data?.mode && config.modes[data.mode]) resolved = data.mode;
+        if (data?.mode && config.modes[data.mode]) persisted = data.mode;
       }
     }
-    if (!resolved) {
+    if (persisted) return { name: persisted, fallback: false, source: "persisted" };
+
+    if (useEnvironment) {
       const env = process.env.PI_PERMISSION_MODE;
-      if (env && config.modes[env]) resolved = env;
+      if (env && config.modes[env]) return { name: env, fallback: false, source: "env" };
     }
-    if (!resolved && !ctx.hasUI) return { name: safeChildMode(), fallback: true }; // headless child, no forwarded mode
-    return { name: resolved ?? modeName, fallback: false };
+    if (!ctx.hasUI) return { name: safeChildMode(), fallback: true, source: "fallback" }; // headless child, no forwarded mode
+    return { name: modeName, fallback: false, source: "current" };
   };
 
   pi.registerShortcut("shift+tab", {
@@ -638,6 +662,9 @@ export default async function (pi: ExtensionAPI) {
     // Resolve the start mode BEFORE init so the sandbox initializes with the
     // right profile, then setMode reconciles status (applyProfile is a no-op).
     const picked = pickMode(ctx, true);
+    if (followsEnvironment === undefined) {
+      followsEnvironment = picked.source === "fallback" || (picked.source === "env" && isActiveAgentChild(ctx));
+    }
     modeName = picked.name;
     await sandbox.init({
       cwd: ctx.cwd,
@@ -650,12 +677,25 @@ export default async function (pi: ExtensionAPI) {
       askHost: (host, port) => net.decide(host, port, askNetHost),
       drainBlockedHosts: () => net.drainBlocked(),
     });
-    await setMode(picked.name, ctx, { persist: false, viaFallback: picked.fallback, announce: false });
+    await setMode(picked.name, ctx, {
+      persist: false,
+      viaFallback: picked.fallback,
+      announce: false,
+      forwardEnv: picked.source !== "env",
+    });
   });
   pi.on("session_tree", async (_event, ctx) => {
     uiCtx = ctx;
-    const picked = pickMode(ctx, false);
-    await setMode(picked.name, ctx, { persist: false, viaFallback: picked.fallback, announce: false });
+    // A root session restores branch-persisted modes but never adopts a value
+    // changed by an in-process child. Environment followers keep tracking the
+    // parent across tree navigation.
+    const picked = pickMode(ctx, false, followsEnvironment === true);
+    await setMode(picked.name, ctx, {
+      persist: false,
+      viaFallback: picked.fallback,
+      announce: false,
+      forwardEnv: picked.source !== "env",
+    });
   });
   pi.on("session_shutdown", async () => {
     approvals.clearAll(); // session-scoped grants don't outlive the session
@@ -675,7 +715,8 @@ export default async function (pi: ExtensionAPI) {
   // implicit headless fallback keeps the FACTUAL awareness section (boundary
   // knowledge helps a worker avoid failing commands) but skips the mode's
   // STEERING systemPrompt, which would misdirect a headless worker.
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    await reconcileModeFromEnvironment(ctx);
     applyToolVisibility(); // keep hidden tools hidden as the tool set evolves
     const m = currentMode();
     const parts: string[] = [];
@@ -707,6 +748,7 @@ export default async function (pi: ExtensionAPI) {
   // Skill gating: skills aren't tools — they're invoked via `/skill:<name>` text,
   // so intercept the input before expansion and resolve the `skill` surface.
   pi.on("input", async (event, ctx) => {
+    await reconcileModeFromEnvironment(ctx);
     const match = /^\/skill:([\w-]+)/.exec(event.text.trim());
     if (!match) return undefined;
     const name = match[1];
@@ -726,6 +768,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event, ctx) => {
     uiCtx = ctx;
+    await reconcileModeFromEnvironment(ctx);
     const { toolName } = event;
     const m = currentMode();
     // `input` is a discriminated union across tools; view it loosely (custom

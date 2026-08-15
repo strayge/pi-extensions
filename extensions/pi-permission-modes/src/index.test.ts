@@ -110,10 +110,19 @@ interface FakeCtx {
     theme: { fg(color: string, text: string): string };
   };
   sessionManager: { getEntries(): Array<{ type: string; customType?: string; data?: unknown }> };
+  getSystemPrompt(): string;
   isProjectTrusted?: () => boolean;
 }
 
-function makeCtx(cwd: string, opts: { hasUI?: boolean; trusted?: boolean; entries?: Array<{ type: string; customType?: string; data?: unknown }> } = {}): FakeCtx {
+type FakeCtxOptions = {
+  hasUI?: boolean;
+  trusted?: boolean;
+  entries?: Array<{ type: string; customType?: string; data?: unknown }>;
+  activeAgent?: string;
+  systemPrompt?: string;
+};
+
+function makeCtx(cwd: string, opts: FakeCtxOptions = {}): FakeCtx {
   const ctx: FakeCtx = {
     hasUI: opts.hasUI ?? true,
     cwd,
@@ -137,6 +146,9 @@ function makeCtx(cwd: string, opts: { hasUI?: boolean; trusted?: boolean; entrie
       theme: { fg: (_color, text) => text },
     },
     sessionManager: { getEntries: () => opts.entries ?? [] },
+    getSystemPrompt: () =>
+      opts.systemPrompt ??
+      (opts.activeAgent ? `<active_agent name="${opts.activeAgent}"/>\n\n# Environment\nWorking directory: ${cwd}` : "ROOT SYSTEM PROMPT"),
     isProjectTrusted: () => opts.trusted === true,
   };
   return ctx;
@@ -193,6 +205,10 @@ async function setup(
     /** Simulate a parent-forwarded PI_PERMISSION_MODE. */
     envMode?: string;
     entries?: Array<{ type: string; customType?: string; data?: unknown }>;
+    activeAgent?: string;
+    systemPrompt?: string;
+    /** Build the extension without emitting session_start yet. */
+    startSession?: boolean;
   } = {},
 ): Promise<Harness> {
   const base = mkdtempSync(path.join(tmpdir(), "perm-idx-"));
@@ -202,6 +218,7 @@ async function setup(
   mkdirSync(agentDir, { recursive: true });
 
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const prevPermissionMode = process.env.PI_PERMISSION_MODE;
   const prevCwd = process.cwd();
   process.env.PI_CODING_AGENT_DIR = agentDir;
   delete process.env.PI_PERMISSION_MODE;
@@ -219,7 +236,7 @@ async function setup(
   }
 
   const ctx = makeCtx(root, opts);
-  await pi.emit("session_start", {}, ctx);
+  if (opts.startSession !== false) await pi.emit("session_start", {}, ctx);
 
   return {
     pi,
@@ -234,7 +251,8 @@ async function setup(
     cleanup: () => {
       if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
-      delete process.env.PI_PERMISSION_MODE;
+      if (prevPermissionMode === undefined) delete process.env.PI_PERMISSION_MODE;
+      else process.env.PI_PERMISSION_MODE = prevPermissionMode;
       rmSync(base, { recursive: true, force: true });
     },
   };
@@ -409,7 +427,77 @@ test("session start is silent; only a switch the user made announces the mode", 
     assert.deepEqual(h.ctx.notices, []);
 
     await h.perm("build");
+    assert.equal(process.env.PI_PERMISSION_MODE, "build");
     assert.deepEqual(h.ctx.notices, ["Permission mode: Build"]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("fresh root reload keeps its startup environment snapshot", { skip }, async () => {
+  const first = await setup();
+  try {
+    assert.equal(process.env.PI_PERMISSION_MODE, "default");
+    assert.deepEqual(first.pi.entries, []);
+
+    const fresh = await setup({ envMode: "default" });
+    try {
+      assert.equal(fresh.ctx.getSystemPrompt(), "ROOT SYSTEM PROMPT");
+      process.env.PI_PERMISSION_MODE = "yolo";
+      await fresh.pi.emit("session_tree", {}, fresh.ctx);
+      assert.equal(process.env.PI_PERMISSION_MODE, "default");
+      const before = (await fresh.pi.emit("before_agent_start", { systemPrompt: "BASE" }, fresh.ctx)) as { systemPrompt: string };
+      assert.match(fresh.ctx.status, /^Default /);
+      assert.match(before.systemPrompt, /Sandbox & permissions \(Default\)/);
+
+      fresh.ctx.answers.push("Deny");
+      assert.equal((await fresh.call("web_search", { query: "root" }))?.block, true);
+      assert.match(fresh.ctx.status, /^Default /);
+    } finally {
+      fresh.cleanup();
+    }
+  } finally {
+    first.cleanup();
+  }
+});
+
+test("incidental active-agent prose does not enable environment following", { skip }, async () => {
+  const h = await setup({
+    envMode: "default",
+    systemPrompt: 'The prompt mentions <active_agent name="general-purpose"/> inline.',
+  });
+  try {
+    process.env.PI_PERMISSION_MODE = "yolo";
+    h.ctx.answers.push("Deny");
+    assert.equal((await h.call("web_search", { query: "prose" }))?.block, true);
+    assert.match(h.ctx.status, /^Default /);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("quoted custom agent names still identify an environment-following child", { skip }, async () => {
+  const h = await setup({ envMode: "default", activeAgent: 'review"strict' });
+  try {
+    process.env.PI_PERMISSION_MODE = "yolo";
+    assert.equal(await h.call("web_search", { query: "quoted name" }), undefined);
+    assert.match(h.ctx.status, /^YOLO$/);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("environment startup does not export a stale child snapshot", { skip }, async () => {
+  const h = await setup({ envMode: "default", activeAgent: "general-purpose", startSession: false });
+  try {
+    const starting = h.pi.emit("session_start", {}, h.ctx);
+    process.env.PI_PERMISSION_MODE = "yolo";
+    await starting;
+    assert.equal(process.env.PI_PERMISSION_MODE, "yolo");
+    assert.match(h.ctx.status, /^Default /);
+
+    assert.equal(await h.call("web_search", { query: "updated" }), undefined);
+    assert.match(h.ctx.status, /^YOLO$/);
   } finally {
     h.cleanup();
   }
@@ -709,6 +797,106 @@ test("web_search: ask in Default, session-wide grant", { skip }, async () => {
   }
 });
 
+test("environment-following child reconciles Default, YOLO, and Default at policy boundaries", { skip }, async () => {
+  const h = await setup({ envMode: "default", activeAgent: "general-purpose" });
+  try {
+    assert.match(h.ctx.status, /^Default /);
+    h.ctx.answers.push("Deny", "Deny");
+    assert.equal((await h.call("bash", { command: "printf initial" }))?.block, true);
+    assert.equal((await h.call("web_search", { query: "initial" }))?.block, true);
+    assert.equal(h.ctx.prompts.length, 2);
+
+    process.env.PI_PERMISSION_MODE = "yolo";
+    assert.equal(await h.call("bash", { command: "printf yolo" }), undefined);
+    assert.equal(await h.call("web_search", { query: "yolo" }), undefined);
+    assert.match(h.ctx.status, /^YOLO$/);
+    assert.deepEqual(h.pi.entries, []);
+    assert.deepEqual(h.ctx.notices, []);
+
+    process.env.PI_PERMISSION_MODE = "not-a-mode";
+    assert.equal(await h.call("web_search", { query: "invalid" }), undefined);
+    assert.match(h.ctx.status, /^YOLO$/);
+    assert.equal(h.ctx.prompts.length, 2);
+
+    process.env.PI_PERMISSION_MODE = "default";
+    const before = (await h.pi.emit("before_agent_start", { systemPrompt: "BASE" }, h.ctx)) as { systemPrompt: string };
+    assert.match(h.ctx.status, /^Default /);
+    assert.match(before.systemPrompt, /Sandbox & permissions \(Default\)/);
+    assert.equal(h.pi.entries.length, 0);
+    assert.deepEqual(h.ctx.notices, []);
+
+    h.ctx.answers.push("Deny", "Deny");
+    assert.equal((await h.call("bash", { command: "printf default" }))?.block, true);
+    assert.equal((await h.call("web_search", { query: "default" }))?.block, true);
+    assert.equal(h.ctx.prompts.length, 4);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("environment reconciliation also runs at the skill input boundary", { skip }, async () => {
+  const h = await setup({ envMode: "default", activeAgent: "general-purpose" });
+  try {
+    process.env.PI_PERMISSION_MODE = "yolo";
+    assert.equal(await h.pi.emit("input", { text: "/skill:deep-research" }, h.ctx), undefined);
+    assert.equal(h.ctx.prompts.length, 0);
+
+    process.env.PI_PERMISSION_MODE = "default";
+    h.ctx.answers.push("Deny");
+    assert.deepEqual(await h.pi.emit("input", { text: "/skill:deep-research" }, h.ctx), { action: "handled" });
+    assert.equal(h.ctx.prompts.length, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("flag and persisted startup modes remain authoritative over later environment changes", { skip }, async () => {
+  const flagged = await setup({ permFlag: "default", envMode: "yolo", entries: [{ type: "custom", customType: "perm-mode", data: { mode: "build" } }] });
+  try {
+    assert.match(flagged.ctx.status, /^Default /);
+    assert.equal(process.env.PI_PERMISSION_MODE, "default");
+    process.env.PI_PERMISSION_MODE = "yolo";
+    const before = (await flagged.pi.emit("before_agent_start", { systemPrompt: "BASE" }, flagged.ctx)) as { systemPrompt: string };
+    assert.match(flagged.ctx.status, /^Default /);
+    assert.match(before.systemPrompt, /Sandbox & permissions \(Default\)/);
+    flagged.ctx.answers.push("Deny");
+    assert.equal((await flagged.call("web_search", { query: "flag" }))?.block, true);
+  } finally {
+    flagged.cleanup();
+  }
+
+  const resumed = await setup({ envMode: "yolo", entries: [{ type: "custom", customType: "perm-mode", data: { mode: "default" } }] });
+  try {
+    assert.match(resumed.ctx.status, /^Default /);
+    assert.equal(process.env.PI_PERMISSION_MODE, "default");
+    process.env.PI_PERMISSION_MODE = "yolo";
+    const before = (await resumed.pi.emit("before_agent_start", { systemPrompt: "BASE" }, resumed.ctx)) as { systemPrompt: string };
+    assert.match(resumed.ctx.status, /^Default /);
+    assert.match(before.systemPrompt, /Sandbox & permissions \(Default\)/);
+    resumed.ctx.answers.push("Deny");
+    assert.equal((await resumed.call("web_search", { query: "persisted" }))?.block, true);
+  } finally {
+    resumed.cleanup();
+  }
+});
+
+test("headless fallback promotes to an explicit environment mode and enables its prompt", { skip }, async () => {
+  const h = await setup({ hasUI: false });
+  try {
+    assert.match(h.ctx.status, /^Plan Mode /);
+    const fallback = (await h.pi.emit("before_agent_start", { systemPrompt: "BASE" }, h.ctx)) as { systemPrompt: string };
+    assert.doesNotMatch(fallback.systemPrompt, /Plan Mode is active/);
+
+    process.env.PI_PERMISSION_MODE = "plan";
+    const promoted = (await h.pi.emit("before_agent_start", { systemPrompt: "BASE" }, h.ctx)) as { systemPrompt: string };
+    assert.match(h.ctx.status, /^Plan Mode /);
+    assert.match(promoted.systemPrompt, /Plan Mode is active/);
+    assert.deepEqual(h.pi.entries, []);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("custom tools: first-use prompt in Default (with Allow forever), silent in Build", { skip }, async () => {
   const h = await setup();
   try {
@@ -823,7 +1011,7 @@ test("headless fallback: restrictive policy WITHOUT the plan prompt, not exporte
 });
 
 test("headless child with an explicitly forwarded mode keeps its system prompt", { skip }, async () => {
-  const h = await setup({ hasUI: false, envMode: "plan" });
+  const h = await setup({ hasUI: false, envMode: "plan", activeAgent: "general-purpose" });
   try {
     assert.match(h.ctx.status, /^Plan Mode /);
     const res = (await h.pi.emit("before_agent_start", { systemPrompt: "BASE" }, h.ctx)) as { systemPrompt: string };
