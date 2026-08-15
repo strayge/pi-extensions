@@ -580,7 +580,7 @@ test("plan mode: Markdown-only writes, plan prompt injected, show_plan stays vis
     assert.match(h.ctx.status, /^Plan Mode /);
 
     // Markdown in-project: silent allow. Code: deny with the friendly reason.
-    assert.equal(await h.call("write", { path: "plan/2026-07-11_x.md" }), undefined);
+    assert.equal(await h.call("write", { path: "plans/2026-07-11_x.md" }), undefined);
     const denied = await h.call("write", { path: "src/app.ts" });
     assert.equal(denied?.block, true);
     assert.match(denied?.reason ?? "", /Markdown/);

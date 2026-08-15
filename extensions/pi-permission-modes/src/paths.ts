@@ -333,13 +333,13 @@ export function resolveGitLayout(root: string): GitLayout {
 }
 
 /**
- * True when `p` is a Markdown file inside the project's `plan/` directory — the
+ * True when `p` is a Markdown file inside the project's `plans/` directory — the
  * files Plan Mode writes and `show_plan` renders. Lexical (no realpath); this is
  * a UI-routing predicate, not a security boundary.
  */
 export function isPlanFile(root: string, p?: string): boolean {
   if (!p || !isMarkdown(p)) return false;
-  const rel = path.relative(path.resolve(root, "plan"), path.resolve(root, p));
+  const rel = path.relative(path.resolve(root, "plans"), path.resolve(root, p));
   return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 

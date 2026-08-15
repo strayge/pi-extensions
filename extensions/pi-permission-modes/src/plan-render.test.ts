@@ -43,11 +43,11 @@ test("renderPlanResult: error renders a single Text line", () => {
 });
 
 test("renderPlanResult: plan renders a header + markdown body", () => {
-  const out = renderPlanResult(tui, theme, { markdown: "# Plan\nbody", path: "plan/x.md" }) as unknown as FakeContainer;
+  const out = renderPlanResult(tui, theme, { markdown: "# Plan\nbody", path: "plans/x.md" }) as unknown as FakeContainer;
   assert.ok(out instanceof FakeContainer);
   assert.equal(out.children.length, 2);
   assert.ok(out.children[0] instanceof FakeText);
-  assert.match((out.children[0] as FakeText).text, /plan · plan\/x\.md/);
+  assert.match((out.children[0] as FakeText).text, /plan · plans\/x\.md/);
   assert.ok(out.children[1] instanceof FakeMarkdown);
   assert.equal((out.children[1] as FakeMarkdown).text, "# Plan\nbody");
 });

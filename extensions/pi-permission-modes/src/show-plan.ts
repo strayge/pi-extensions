@@ -47,15 +47,15 @@ export async function createShowPlanTool(root: string): Promise<ToolDefinition> 
     label: "Show Plan",
     description:
       "Render a plan Markdown file to the user in the terminal for review. In Plan Mode, after writing " +
-      "the plan to plan/<date>_<description>.md, call show_plan with that path. The file is shown as " +
+      "the plan to plans/<date>_<description>.md, call show_plan with that path. The file is shown as " +
       "formatted Markdown inline — do NOT paste the plan text into your reply.",
     parameters: Type.Object({
-      path: Type.String({ description: "Path to the plan Markdown file, e.g. plan/2026-06-07_my-task.md" }),
+      path: Type.String({ description: "Path to the plan Markdown file, e.g. plans/2026-06-07_my-task.md" }),
     }),
     async execute(_id, params, _signal, _onUpdate) {
       const rel = resolvePlanPath((params as { path?: string }).path);
       if (!isPlanFile(root, rel)) {
-        const msg = `show_plan only renders Markdown files under plan/. Got: ${rel || "(empty)"}`;
+        const msg = `show_plan only renders Markdown files under plans/. Got: ${rel || "(empty)"}`;
         return { content: [{ type: "text", text: msg }], details: { error: msg } satisfies PlanDetails };
       }
       const abs = path.resolve(root, rel);

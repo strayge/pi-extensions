@@ -38,7 +38,7 @@ test("default: confirm bash/write/web_search; reads free; out-of-project asks", 
 
 test("plan: read-only sandbox, Markdown-only writes, reads free", () => {
   const p = M.plan;
-  assert.equal(decide(p, "write", "plan/2026-06-08_x.md"), "allow");
+  assert.equal(decide(p, "write", "plans/2026-06-08_x.md"), "allow");
   assert.equal(decide(p, "write", "README.markdown"), "allow");
   assert.equal(decide(p, "write", "src/app.ts"), "deny"); // → "Markdown only" block
   assert.equal(decide(p, "edit", "src/app.ts"), "deny");
