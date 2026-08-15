@@ -14,7 +14,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { normalizeMaxTurns, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { shortModelName } from "./model-resolver.js";
-import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentInvocation, AgentRecord, IsolationMode, ResultDelivery, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
 
@@ -80,6 +80,8 @@ interface SpawnOptions {
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
   isBackground?: boolean;
+  /** How completion is delivered to the main agent. Defaults to steer. */
+  resultDelivery?: ResultDelivery;
   /**
    * Skip the maxConcurrent queue check for this spawn — start immediately even
    * if the configured concurrency limit would otherwise queue it. Used by the
@@ -221,6 +223,7 @@ export class AgentManager {
       // only filter excludes only explicit `false`, so undefined agents — which
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
+      resultDelivery: options.resultDelivery ?? "steer",
       // Callers that build a richer snapshot (the Agent tool, nested delegation)
       // pass one; the scheduler and the RPC layer do not, and their agents would
       // otherwise render as blank rows in the fleet list. Derive it from the

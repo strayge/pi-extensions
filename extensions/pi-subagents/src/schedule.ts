@@ -22,7 +22,7 @@ import type { AgentManager } from "./agent-manager.js";
 import { resolveSpawnType } from "./agent-types.js";
 import { resolveModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
-import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
+import type { IsolationMode, ResultDelivery, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
 /** Event emitted on `pi.events` for cross-extension consumers. */
 export type ScheduleChangeEvent =
@@ -44,6 +44,7 @@ export interface NewJobInput {
   max_turns?: number;
   isolated?: boolean;
   isolation?: IsolationMode;
+  result_delivery?: ResultDelivery;
 }
 
 export class SubagentScheduler {
@@ -107,6 +108,7 @@ export class SubagentScheduler {
       max_turns: input.max_turns,
       isolated: input.isolated,
       isolation: input.isolation,
+      result_delivery: input.result_delivery,
       enabled: true,
       createdAt: new Date().toISOString(),
       runCount: 0,
@@ -256,6 +258,7 @@ export class SubagentScheduler {
         isolated: job.isolated,
         thinkingLevel: job.thinking,
         isolation: job.isolation,
+        resultDelivery: job.result_delivery,
       });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);

@@ -32,7 +32,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type ResultDelivery, type SubagentType, type WidgetMode } from "./types.js";
 import {
   type AgentActivity,
   type AgentDetails,
@@ -327,7 +327,7 @@ export default function (pi: ExtensionAPI) {
       content: notification + footer,
       display: true,
       details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+    }, { deliverAs: record.resultDelivery === "followUp" ? "followUp" : "steer", triggerTurn: true });
   }
 
   function sendIndividualNudge(record: AgentRecord) {
@@ -365,7 +365,7 @@ export default function (pi: ExtensionAPI) {
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
           display: true,
           details,
-        }, { deliverAs: "followUp", triggerTurn: true });
+        }, { deliverAs: first.resultDelivery === "followUp" ? "followUp" : "steer", triggerTurn: true });
       });
       widget.update();
     },
@@ -419,8 +419,9 @@ export default function (pi: ExtensionAPI) {
       startedAt: record.startedAt, completedAt: record.completedAt,
     });
 
-    // Skip notification if result was already consumed via get_subagent_result
-    if (record.resultConsumed) {
+    // Skip model injection when explicitly disabled or already consumed. The
+    // record remains retrievable; "none" is not the same as consumption.
+    if (record.resultDelivery === "none" || record.resultConsumed) {
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
       fleet.onAgentFinished(record.id);
@@ -656,7 +657,7 @@ export default function (pi: ExtensionAPI) {
   // Uses a debounced timer: each new agent resets the 100ms window so that all
   // parallel tool calls (which may be dispatched across multiple microtasks by the
   // framework) are captured in the same batch.
-  let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
+  let currentBatchAgents: { id: string; joinMode: JoinMode; resultDelivery: Exclude<ResultDelivery, "none"> }[] = [];
   let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
   let batchCounter = 0;
 
@@ -667,26 +668,35 @@ export default function (pi: ExtensionAPI) {
     currentBatchAgents = [];
 
     const smartAgents = batchAgents.filter(a => a.joinMode === 'smart' || a.joinMode === 'group');
-    if (smartAgents.length >= 2) {
-      const groupId = `batch-${++batchCounter}`;
-      const ids = smartAgents.map(a => a.id);
-      groupJoin.registerGroup(groupId, ids);
-      // Retroactively process agents that already completed during the debounce window.
-      // Their onComplete fired but was deferred (agent was in currentBatchAgents),
-      // so we feed them into the group now.
-      for (const id of ids) {
-        const record = manager.getRecord(id);
-        if (!record) continue;
-        record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
-          groupJoin.onAgentComplete(record);
+    const byDelivery = new Map<Exclude<ResultDelivery, "none">, typeof smartAgents>();
+    for (const agent of smartAgents) {
+      const agents = byDelivery.get(agent.resultDelivery) ?? [];
+      agents.push(agent);
+      byDelivery.set(agent.resultDelivery, agents);
+    }
+
+    // Delivery is a property of the resulting message, so agents with different
+    // modes must never share a notification batch.
+    for (const agents of byDelivery.values()) {
+      if (agents.length >= 2) {
+        const groupId = `batch-${++batchCounter}`;
+        const ids = agents.map(a => a.id);
+        groupJoin.registerGroup(groupId, ids);
+        // Retroactively process agents that already completed during the debounce window.
+        // Their onComplete fired but was deferred (agent was in currentBatchAgents),
+        // so we feed them into the group now.
+        for (const id of ids) {
+          const record = manager.getRecord(id);
+          if (!record) continue;
+          record.groupId = groupId;
+          if (record.completedAt != null && !record.resultConsumed) {
+            groupJoin.onAgentComplete(record);
+          }
         }
-      }
-    } else {
-      // No group formed — send individual nudges for any agents that completed
-      // during the debounce window and had their notification deferred.
-      for (const { id } of batchAgents) {
-        const record = manager.getRecord(id);
+      } else {
+        // No group formed — send an individual nudge if this agent completed
+        // during the debounce window and had its notification deferred.
+        const record = manager.getRecord(agents[0].id);
         if (record?.completedAt != null && !record.resultConsumed) {
           sendIndividualNudge(record);
         }
@@ -800,7 +810,7 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
-- Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
+- Parallel work: one message, multiple Agent calls, run_in_background: true on each. Results steer you on completion by default — never poll or sleep. Use result_delivery: "followUp" to wait until the current run settles, or "none" for manual retrieval only.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.
 - isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
@@ -824,7 +834,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - When you launch multiple agents for independent work, send them in a single message with multiple tool uses, with run_in_background: true on each, so they run concurrently. If the user specifies that they want agents run "in parallel", you MUST send a single message with multiple tool calls. Foreground calls run sequentially — only one executes at a time.
 - When the agent is done, it returns a single message back to you. The result is not visible to the user — to show the user, send a text message with a concise summary.
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
-- Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
+- Use run_in_background for work you don't need immediately. By default its result steers you on completion — do NOT poll or sleep waiting for it. Use result_delivery: "followUp" to defer it until the current run settles, or "none" when you will retrieve it manually.
 - Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
@@ -936,6 +946,15 @@ Terse command-style prompts produce shallow, generic work.
       run_in_background: Type.Optional(
         Type.Boolean({
           description: "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
+        }),
+      ),
+      result_delivery: Type.Optional(
+        Type.Unsafe<ResultDelivery>({
+          type: "string",
+          enum: ["steer", "followUp", "none"],
+          description:
+            'How a background result reaches the main agent. "steer" (default) injects it before the next model call; ' +
+            '"followUp" waits until the current run settles; "none" requires manual get_subagent_result retrieval.',
         }),
       ),
       resume: Type.Optional(
@@ -1206,6 +1225,7 @@ Terse command-style prompts produce shallow, generic work.
             max_turns: effectiveMaxTurns,
             isolated: isolated,
             isolation: isolation,
+            result_delivery: params.result_delivery as ResultDelivery | undefined,
           });
           const next = scheduler.getNextRun(job.id);
           return textResult(
@@ -1268,6 +1288,7 @@ Terse command-style prompts produce shallow, generic work.
             inheritContext,
             thinkingLevel: thinking,
             isBackground: true,
+            resultDelivery: params.result_delivery as ResultDelivery | undefined,
             isolation,
             invocation: agentInvocation,
             rootSessionId: ctx.sessionManager.getSessionId(),
@@ -1281,17 +1302,17 @@ Terse command-style prompts produce shallow, generic work.
         // event loop yields — onSessionCreated is async so this is safe.
         const joinMode = resolveJoinMode(defaultJoinMode, true);
         const record = manager.getRecord(id);
-        if (record && joinMode) {
-          record.joinMode = joinMode;
+        if (record) {
           record.toolCallId = toolCallId;
           attachTranscript(record, id);
+          if (joinMode) record.joinMode = joinMode;
         }
 
-        if (joinMode == null || joinMode === 'async') {
+        if (!record || record.resultDelivery === "none" || joinMode == null || joinMode === 'async') {
           // Foreground/no join mode or explicit async — not part of any batch
         } else {
           // smart or group — add to current batch
-          currentBatchAgents.push({ id, joinMode });
+          currentBatchAgents.push({ id, joinMode, resultDelivery: record.resultDelivery });
           // Debounce: reset timer on each new agent so parallel tool calls
           // dispatched across multiple event loop ticks are captured together
           if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
@@ -1320,7 +1341,11 @@ Terse command-style prompts produce shallow, generic work.
           `Description: ${params.description}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-          `\nYou will be notified when this agent completes.\n` +
+          (record?.resultDelivery === "none"
+            ? `\nCompletion will not be injected. Use get_subagent_result to retrieve it.\n`
+            : record?.resultDelivery === "followUp"
+              ? `\nYou will be notified after the current agent run settles.\n`
+              : `\nYou will be notified when this agent completes.\n`) +
           `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
           `Do not duplicate this agent's work.`,
           { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },

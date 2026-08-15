@@ -58,7 +58,7 @@ Agent({
 })
 ```
 
-Foreground agents block until complete and return results inline. Background agents return an ID immediately and notify you on completion.
+Foreground agents block until complete and return results inline. Background agents return an ID immediately. By default their result steers the main agent on completion; use `result_delivery: "followUp"` to wait for the current run to settle or `result_delivery: "none"` for manual retrieval only.
 
 ### Scheduling
 
@@ -308,6 +308,7 @@ Launch a sub-agent.
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
 | `run_in_background` | boolean | no | Run without blocking |
+| `result_delivery` | `"steer"` \| `"followUp"` \| `"none"` | no | Background result delivery. Defaults to `"steer"`; `"none"` requires manual retrieval |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"worktree"` | no | Run in an isolated git worktree |
@@ -383,7 +384,7 @@ Foreground agents bypass the queue — they block the parent anyway.
 
 ## Join Strategies
 
-When background agents complete, they notify the main agent. The **join mode** controls how these notifications are delivered. It applies only to background agents.
+When background agents complete, they notify the main agent. `result_delivery` controls when each result is injected: `steer` (default) delivers it before the main agent's next model call, `followUp` waits for the current run to settle, and `none` disables injection so the caller must use `get_subagent_result`. The **join mode** controls how notifications with the same delivery mode are batched. It applies only to background agents.
 
 | Mode | Behavior |
 |------|----------|

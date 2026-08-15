@@ -74,6 +74,9 @@ export interface AgentConfig {
 
 export type JoinMode = 'async' | 'group' | 'smart';
 
+/** How a background result is injected into the main agent's conversation. */
+export type ResultDelivery = "steer" | "followUp" | "none";
+
 /**
  * Display mode for the persistent above-editor agent widget.
  * - `all`: show every agent (foreground + background).
@@ -98,6 +101,8 @@ export interface AgentRecord {
   promise?: Promise<string>;
   groupId?: string;
   joinMode?: JoinMode;
+  /** Defaults to steer so results can influence the main agent before it finishes. */
+  resultDelivery: ResultDelivery;
   /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
   resultConsumed?: boolean;
   /** Steering messages queued before the session was ready. */
@@ -213,6 +218,7 @@ export interface ScheduledSubagent {
   max_turns?: number;
   isolated?: boolean;
   isolation?: IsolationMode;
+  result_delivery?: ResultDelivery;
 
   // state
   enabled: boolean;
