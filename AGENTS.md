@@ -4,6 +4,11 @@ Extensions for the [pi](https://github.com/earendil-works/pi) coding agent.
 Each extension lives in `extensions/pi-<name>/` as its own npm package
 (TypeScript, `src/index.ts` as the pi entry point, biome + `tsc --noEmit`).
 
+## Commit messages
+
+Use a Conventional Commit prefix and extension scope: `<type>(<scope>): <summary>`,
+for example `fix(permission-modes): hide project grants notice in subagents`.
+
 ## vendor/ — local reference material
 
 `vendor/` is git-ignored: it holds read-only reference material, never
