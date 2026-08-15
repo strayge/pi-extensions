@@ -292,6 +292,21 @@ test("outside file access offers project and global persistence in trusted proje
   }
 });
 
+test("outside file session grant suppresses repeat prompts", { skip }, async () => {
+  const h = await setup();
+  try {
+    const target = "../shared/input.txt";
+    h.ctx.answers.push("Allow for session");
+    assert.equal(await h.call("read", { path: target }), undefined);
+    assert.equal(h.ctx.prompts.length, 1);
+
+    assert.equal(await h.call("read", { path: target }), undefined);
+    assert.equal(h.ctx.prompts.length, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("outside file persistence grants every asking policy layer", { skip }, async () => {
   const h = await setup();
   try {
@@ -348,6 +363,20 @@ test("bash: session grant covers the same command, not a longer chain", { skip }
     assert.equal(chained?.block, true);
     assert.match(chained?.reason ?? "", /denied by the user.*not executed.*Do not retry/);
     assert.equal(h.ctx.prompts.length, 2);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: session grant covers repeated outside-project commands", { skip }, async () => {
+  const h = await setup();
+  try {
+    h.ctx.answers.push("Allow for session");
+    assert.equal(await h.call("bash", { command: "cat ../secret.txt" }), undefined);
+    assert.match(h.ctx.prompts[0]?.title ?? "", /path outside project/);
+
+    assert.equal(await h.call("bash", { command: "cat ../secret.txt" }), undefined);
+    assert.equal(h.ctx.prompts.length, 1);
   } finally {
     h.cleanup();
   }
@@ -527,6 +556,10 @@ test("bash: prompts show every full command still missing a grant", { skip }, as
       h.ctx.prompts[0]?.title,
       "Allow ls, echo commands? (sandbox unavailable)\n\nCommands to allow: ls -la, echo ---, ls src",
     );
+
+    // A repeated multi-command call is fully covered even in degraded mode.
+    assert.equal(await h.call("bash", { command: 'ls -la && echo "---" && ls src' }), undefined);
+    assert.equal(h.ctx.prompts.length, 1);
 
     // echo is already granted, so only the full commands that reopened the prompt appear.
     h.ctx.answers.push("Allow for session");

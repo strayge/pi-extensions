@@ -774,10 +774,14 @@ export default async function (pi: ExtensionAPI) {
       const pending = keyed
         ? approvalTargets.filter((c) => !approvals.has(modeName, "bash", c.command))
         : [];
-      if (((keyed && pending.length === 0) || (analysis.unparsed && approvals.has(modeName, "bash", command))) && action === "ask") {
-        action = "allow";
+      const sessionApproved = keyed ? pending.length === 0 : approvals.has(modeName, "bash", command);
+      if (sessionApproved && action === "ask") action = "allow";
+      if (action !== "deny" && sessionApproved) {
+        // Escape approvals must mark each new tool call so the replacement bash
+        // tool runs this invocation outside the sandbox without prompting again.
+        if (analysis.outsideReason) approvedUnsandboxed.add(event.toolCallId);
+        return undefined;
       }
-      if (action !== "deny" && analysis.commands.length === 1 && !analysis.outsideReason && approvals.has(modeName, "bash", command)) return undefined;
       const gate = bashGate(
         action,
         analysis.outsideReason,
@@ -874,6 +878,7 @@ export default async function (pi: ExtensionAPI) {
           return undefined;
         }
 
+        if (approvals.has(modeName, surface, path)) return undefined;
         if (!ctx.hasUI) return { block: true, reason };
         const persistentChoices: Array<{ label: string; project: boolean }> = [];
         if (isTrustedProject(ctx)) {
