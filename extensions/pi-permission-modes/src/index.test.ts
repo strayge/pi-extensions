@@ -682,6 +682,21 @@ test("/perm init -p scaffolds the project schema and project grants notify once"
   }
 });
 
+test("project grants notice is hidden in active agent children", { skip }, async () => {
+  const h = await setup({ trusted: true, activeAgent: "Agent" });
+  try {
+    const file = path.join(h.root, ".pi", "permission-mode.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ modes: { default: { permission: { bash: { "git *": "allow" } } } } }));
+
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    assert.equal(h.ctx.notices.some((notice) => /honoring .* project grants/.test(notice)), false);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("bash: prompt details omit commands already allowed by policy", { skip }, async () => {
   const h = await setup();
   try {

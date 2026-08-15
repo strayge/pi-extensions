@@ -651,7 +651,7 @@ export default async function (pi: ExtensionAPI) {
       (m) => (ctx.hasUI ? ctx.ui.notify(m, "warning") : console.error(m)),
       isTrustedProject(ctx),
     );
-    if (!notifiedProjectGrants && isTrustedProject(ctx)) {
+    if (!notifiedProjectGrants && isTrustedProject(ctx) && !isActiveAgentChild(ctx)) {
       const grants = projectGrantCount(ctx.cwd, getAgentDir());
       if (grants > 0) {
         notifiedProjectGrants = true;
