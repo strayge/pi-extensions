@@ -29,6 +29,7 @@
  *   bash-parse.ts   tree-sitter command extraction + heuristic fallback
  *   config-load.ts  layered permission-mode.json loader
  *   approvals.ts    session-scoped "Allow for session" store
+ *   file-approval.ts outside-project file scope model, prompt UI, and RPC fallback
  *   awareness.ts    sandbox-boundary system-prompt section (injected each turn)
  *   network.ts      live network session state (grants, denies, open toggle)
  *   paths.ts        out-of-project / protected-path predicates
@@ -57,6 +58,8 @@ import {
   loadStockDefaults,
   persistModeDomains,
   persistModeRule,
+  persistOutsideFileGrant,
+  persistProjectOutsideFileGrant,
   persistProjectRule,
   projectGrantCount,
   stockDefaultsFile,
@@ -64,10 +67,12 @@ import {
 import type { PermState } from "./modes.ts";
 import { type NetAskResult, NetworkSession, isHostAllowed, normalizeDomain } from "./network.ts";
 import { isOutside, isProtectedWrite } from "./paths.ts";
+import { promptOutsideFileApproval, scopeMatches } from "./file-approval.ts";
 import { decide, decideBashCommand, mostRestrictive, resolveSurface } from "./resolve.ts";
 import { SandboxController } from "./sandbox.ts";
 import {
   type Action,
+  type FileSurface,
   type ModeDef,
   PLAN_PROMPT_SENTINEL,
   type PermissionModeConfig,
@@ -147,15 +152,6 @@ function filePolicySurfaces(surface: Surface, outside: boolean): Surface[] {
   if (outside) candidates.push("external_directory");
   candidates.push(surface);
   return candidates;
-}
-
-function fileAskSurfaces(mode: ModeDef, surface: Surface, target: string, outside: boolean): Surface[] {
-  const asks = filePolicySurfaces(surface, outside).filter(
-    (candidate) => resolveSurface(mode.permission[candidate], target) === "ask",
-  );
-  // Sparse custom modes fall back to ask when no layer matches. Persist that
-  // boundary decision on the surface the prompt represents.
-  return asks.length > 0 ? [...new Set(asks)] : [outside ? "external_directory" : surface];
 }
 
 function projectPolicyAllowsGlobalFileRule(mode: ModeDef, surface: Surface, target: string, outside: boolean): boolean {
@@ -871,48 +867,56 @@ export default async function (pi: ExtensionAPI) {
         return { block: true, reason: `Path "${path}" is blocked by ${m.label}` };
       }
       if (action === "ask") {
-        const title = outside ? `Outside project — allow ${toolName}? (${path})` : `Allow ${toolName}? (${path})`;
         const reason = outside ? "Access outside project blocked" : "blocked";
         if (!outside) {
+          const title = `Allow ${toolName}? (${path})`;
           if (!(await promptAllow(ctx, surface, path, title))) return { block: true, reason };
           return undefined;
         }
 
-        if (approvals.has(modeName, surface, path)) return undefined;
-        if (!ctx.hasUI) return { block: true, reason };
-        const persistentChoices: Array<{ label: string; project: boolean }> = [];
-        if (isTrustedProject(ctx)) {
-          persistentChoices.push({ label: `Always allow for project: ${path}`, project: true });
+        const fileSurface = surface as FileSurface;
+        const projectEligible = isTrustedProject(ctx);
+        const globalEligible = projectPolicyAllowsGlobalFileRule(m, surface, path, outside);
+        const projectScopes = projectEligible ? m.trustedProjectOutsideFileGrants?.[fileSurface] ?? [] : [];
+        const globalScopes = globalEligible ? m.outsideFileGrants?.[fileSurface] ?? [] : [];
+        if (
+          approvals.hasScope(modeName, fileSurface, path, ctx.cwd) ||
+          projectScopes.some((scope) => scopeMatches(scope, path, ctx.cwd)) ||
+          globalScopes.some((scope) => scopeMatches(scope, path, ctx.cwd))
+        ) {
+          return undefined;
         }
-        if (projectPolicyAllowsGlobalFileRule(m, surface, path, outside)) {
-          persistentChoices.push({ label: `Always allow: ${path}`, project: false });
+
+        const result = await promptOutsideFileApproval(ctx, {
+          toolName,
+          requested: path,
+          cwd: ctx.cwd,
+          projectEligible,
+          globalEligible,
+        });
+        if (result.decision === "once") return undefined;
+        if (result.decision === "session") {
+          approvals.rememberScope(modeName, fileSurface, result.scope);
+          return undefined;
         }
-        const choice = await ctx.ui.select(title, [
-          ALLOW_ONCE,
-          ALLOW_SESSION,
-          ...persistentChoices.map((candidate) => candidate.label),
-          DENY,
-        ]);
-        if (choice === ALLOW_SESSION) {
-          approvals.remember(modeName, surface, path);
-        } else {
-          const selected = persistentChoices.find((candidate) => candidate.label === choice);
-          if (selected) {
-            try {
-              for (const askSurface of fileAskSurfaces(m, surface, path, outside)) {
-                if (selected.project) persistProjectRule(ctx.cwd, modeName, askSurface, path, "allow");
-                else persistModeRule(getAgentDir(), modeName, askSurface, path, "allow");
-              }
-              approvals.remember(modeName, surface, path);
-              config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
-            } catch (e) {
-              ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
-              return { block: true, reason };
+        if (result.decision === "project" || result.decision === "global") {
+          try {
+            if (result.decision === "project") {
+              if (!projectEligible) return { block: true, reason };
+              persistProjectOutsideFileGrant(ctx.cwd, modeName, fileSurface, result.scope);
+            } else {
+              if (!globalEligible) return { block: true, reason };
+              persistOutsideFileGrant(getAgentDir(), modeName, fileSurface, result.scope);
             }
-          } else if (choice !== ALLOW_ONCE) {
+            config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
+            approvals.rememberScope(modeName, fileSurface, result.scope);
+            return undefined;
+          } catch (e) {
+            ctx.ui.notify(`permission-mode: could not save outside-file scope: ${e}`, "error");
             return { block: true, reason };
           }
         }
+        return { block: true, reason };
       }
       return undefined; // allow
     }

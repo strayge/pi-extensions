@@ -38,8 +38,8 @@ const PROTECTED_FILES = new Set([
  * appending the remaining (not-yet-created) tail verbatim. Never throws for
  * missing paths — falls back to the lexical resolution.
  */
-function canonicalize(p: string): string {
-  let current = path.resolve(p);
+export function canonicalizePath(p: string, cwd: string = process.cwd()): string {
+  let current = path.resolve(cwd, p);
   const tail: string[] = [];
   for (;;) {
     try {
@@ -61,8 +61,8 @@ function canonicalize(p: string): string {
  */
 export function isOutside(root: string, p?: string): boolean {
   if (!p) return false;
-  const target = canonicalize(path.resolve(root, p));
-  const realRoot = canonicalize(root);
+  const target = canonicalizePath(path.resolve(root, p));
+  const realRoot = canonicalizePath(root);
   const rel = path.relative(realRoot, target);
   return rel.startsWith("..") || path.isAbsolute(rel);
 }
@@ -121,13 +121,13 @@ export function sandboxMountPath(pattern: string, cwd: string = process.cwd(), h
   const abs = path.resolve(cwd, expandHome(pattern, home));
   const globAt = abs.search(GLOB_CHARS);
   if (globAt === -1) {
-    const real = canonicalize(abs);
+    const real = canonicalizePath(abs);
     return widensScope(abs, real) ? null : real;
   }
   const cut = abs.lastIndexOf("/", globAt);
   if (cut <= 0) return abs; // pattern starts at the root: nothing to canonicalize
   const dir = abs.slice(0, cut);
-  const real = canonicalize(dir);
+  const real = canonicalizePath(dir);
   return widensScope(dir, real) ? null : real + abs.slice(cut);
 }
 
@@ -377,8 +377,8 @@ export function isProtectedPath(p: string): boolean {
  */
 export function isProtectedWrite(root: string, p: string): boolean {
   if (isProtectedPath(p)) return true;
-  const target = canonicalize(path.resolve(root, p));
-  const realRoot = canonicalize(root);
+  const target = canonicalizePath(path.resolve(root, p));
+  const realRoot = canonicalizePath(root);
   const rel = path.relative(realRoot, target);
   const inProject = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
   return isProtectedPath(inProject ? rel : target);

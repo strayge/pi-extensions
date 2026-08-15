@@ -7,8 +7,9 @@
  *   2. <agentDir>/permission-mode/permission-mode.json (global) — FULL authority:
  *      may add modes, redefine built-ins, and change defaultMode / cycleOrder.
  *   3. <cwd>/.pi/permission-mode.json (project) — trusted projects may append
- *      permission rules and additive sandbox entries; untrusted projects are a
- *      most-restrictive overlay. Project configs cannot add modes or change defaults.
+ *      permission rules, typed outside-file grants, and additive sandbox entries;
+ *      untrusted projects are a most-restrictive overlay and their grants are
+ *      ignored. Project configs cannot add modes or change defaults.
  *
  * Pure except for the filesystem reads in `loadModeConfig`; no `pi`/`ctx`
  * dependency so the merge/tighten semantics are unit-testable.
@@ -18,18 +19,22 @@
  * domain-safety check ported from the former config.ts.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import { isRootWidePattern, isValidStoredScope } from "./file-approval.ts";
 import { sandboxMountPath } from "./paths.ts";
 import {
   type Action,
+  type FileScope,
+  type FileSurface,
   type ModeDef,
   type PermissionModeConfig,
   type SandboxProfile,
   type SurfaceValue,
   type Surface,
+  OUTSIDE_FILE_SURFACES,
   SURFACES,
 } from "./schema.ts";
 
@@ -200,6 +205,50 @@ function cleanPermission(raw: unknown, where: string, onError: OnError): Partial
   return out;
 }
 
+function cleanOutsideFileGrants(
+  raw: unknown,
+  where: string,
+  onError: OnError,
+): Partial<Record<FileSurface, FileScope[]>> {
+  const out: Partial<Record<FileSurface, FileScope[]>> = {};
+  if (raw === undefined) return out;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    onError(`permission-mode: invalid outsideFileGrants in ${where}; dropping`);
+    return out;
+  }
+  for (const [surfaceName, entries] of Object.entries(raw as Record<string, unknown>)) {
+    if (!OUTSIDE_FILE_SURFACES.includes(surfaceName as FileSurface)) {
+      onError(`permission-mode: ignoring unknown outside-file surface "${surfaceName}" in ${where}`);
+      continue;
+    }
+    if (!Array.isArray(entries)) {
+      onError(`permission-mode: invalid outsideFileGrants.${surfaceName} in ${where}; dropping`);
+      continue;
+    }
+    const surface = surfaceName as FileSurface;
+    const accepted: FileScope[] = [];
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      if (!isValidStoredScope(entry)) {
+        onError(`permission-mode: dropping malformed or unbound outsideFileGrants.${surfaceName} entry in ${where}`);
+        continue;
+      }
+      if (entry.kind === "glob" && isRootWidePattern(entry.value)) {
+        onError(`permission-mode: dropping root-wide outsideFileGrants.${surfaceName} pattern "${entry.value}" in ${where}`);
+        continue;
+      }
+      // Stored scopes were bound when approved or persisted. Re-resolving them
+      // here would let a later symlink change retarget an existing grant.
+      const key = `${entry.kind}:${entry.value}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      accepted.push({ ...entry });
+    }
+    if (accepted.length > 0) out[surface] = accepted;
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Global (full-authority) merge
 // ---------------------------------------------------------------------------
@@ -212,6 +261,7 @@ function mergeMode(base: ModeDef, over: Partial<ModeDef>): ModeDef {
     // Surface-level shallow merge: an override replaces a whole surface's value.
     permission: { ...base.permission, ...(over.permission ?? {}) },
     hideTools: over.hideTools ?? base.hideTools,
+    outsideFileGrants: over.outsideFileGrants ?? base.outsideFileGrants,
   };
 }
 
@@ -220,6 +270,9 @@ function mergeGlobal(base: PermissionModeConfig, over: Partial<PermissionModeCon
   for (const [name, raw] of Object.entries(over.modes ?? {})) {
     const m = raw as Partial<ModeDef>;
     if (m.permission) m.permission = cleanPermission(m.permission, `global mode "${name}"`, onError) as ModeDef["permission"];
+    if ("outsideFileGrants" in m && m.outsideFileGrants !== undefined) {
+      m.outsideFileGrants = cleanOutsideFileGrants(m.outsideFileGrants, `global mode "${name}"`, onError);
+    }
     const existing = modes[name];
     if (existing) {
       modes[name] = mergeMode(existing, m);
@@ -321,6 +374,17 @@ function applyProject(
         base.sandbox = next;
       } else base.sandbox = tightenSandbox(base.sandbox, pm.sandbox, onError);
     }
+    if (pm.outsideFileGrants !== undefined) {
+      if (projectTrusted) {
+        base.trustedProjectOutsideFileGrants = cleanOutsideFileGrants(
+          pm.outsideFileGrants,
+          `trusted project mode "${name}"`,
+          onError,
+        );
+      } else {
+        onError(`permission-mode: ignoring outsideFileGrants for untrusted project mode "${name}"`);
+      }
+    }
     if (pm.permission) {
       const clean = cleanPermission(pm.permission, `project mode "${name}"`, onError) as ModeDef["permission"];
       if (projectTrusted) {
@@ -399,6 +463,8 @@ export function projectGrantCount(cwd: string, agentDir?: string): number {
         if (value === "allow") count++;
         else if (value && typeof value === "object") count += Object.values(value).filter((action) => action === "allow").length;
       }
+      const grants = cleanOutsideFileGrants((mode as Partial<ModeDef>).outsideFileGrants, `project mode "${name}"`, noop);
+      for (const scopes of Object.values(grants)) count += scopes?.length ?? 0;
     }
     return count;
   } catch {
@@ -509,4 +575,74 @@ function writeRuleInto(file: string, modeName: string, surface: Surface, key: st
 /** Persist an allow rule in the trusted project's permission-mode file. */
 export function persistProjectRule(cwd: string, modeName: string, surface: Surface, key: string, action: Action): string {
   return writeRuleInto(path.join(cwd, CONFIG_DIR_NAME, "permission-mode.json"), modeName, surface, key, action, false);
+}
+
+function writeJsonAtomically(file: string, data: Record<string, unknown>): void {
+  mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(data, null, 2)}\n`);
+    renameSync(temporary, file);
+  } catch (error) {
+    try {
+      if (existsSync(temporary)) unlinkSync(temporary);
+    } catch {
+      // The original error is the useful failure for the caller.
+    }
+    throw error;
+  }
+}
+
+function readMutableJson(file: string): Record<string, unknown> {
+  if (!existsSync(file)) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, "utf-8"));
+  } catch (error) {
+    throw new Error(`cannot update malformed config ${file}: ${error}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`cannot update malformed config ${file}: root must be an object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function persistOutsideFileGrantInto(file: string, modeName: string, surface: FileSurface, scope: FileScope): string {
+  // The prompt already bound this value before approval. Resolving it again here
+  // would make a symlink swap between approval and persistence retarget the grant.
+  const bound = isValidStoredScope(scope) ? { ...scope } : undefined;
+  if (!bound || (bound.kind === "glob" && isRootWidePattern(bound.value))) {
+    throw new Error("cannot persist invalid, unbound, or root-wide outside-file scope");
+  }
+  const data = readMutableJson(file);
+  const modesValue = data.modes;
+  if (modesValue !== undefined && (!modesValue || typeof modesValue !== "object" || Array.isArray(modesValue))) {
+    throw new Error(`cannot update malformed config ${file}: modes must be an object`);
+  }
+  const modes = (data.modes ??= {}) as Record<string, unknown>;
+  const modeValue = modes[modeName];
+  if (modeValue !== undefined && (!modeValue || typeof modeValue !== "object" || Array.isArray(modeValue))) {
+    throw new Error(`cannot update malformed config ${file}: mode must be an object`);
+  }
+  const mode = (modes[modeName] ??= {}) as Record<string, unknown>;
+  const grantsValue = mode.outsideFileGrants;
+  if (grantsValue !== undefined && (!grantsValue || typeof grantsValue !== "object" || Array.isArray(grantsValue))) {
+    throw new Error(`cannot update malformed config ${file}: outsideFileGrants must be an object`);
+  }
+  const grants = (mode.outsideFileGrants ??= {}) as Record<string, unknown>;
+  const existing = cleanOutsideFileGrants(grants, `existing ${file}`, noop)[surface] ?? [];
+  if (!existing.some((entry) => entry.kind === bound.kind && entry.value === bound.value)) existing.push({ ...bound });
+  grants[surface] = existing;
+  writeJsonAtomically(file, data);
+  return file;
+}
+
+/** Persist a deny-safe typed outside-file grant in the global configuration. */
+export function persistOutsideFileGrant(agentDir: string, modeName: string, surface: FileSurface, scope: FileScope): string {
+  return persistOutsideFileGrantInto(globalConfigFile(agentDir), modeName, surface, scope);
+}
+
+/** Persist a deny-safe typed outside-file grant in a trusted project configuration. */
+export function persistProjectOutsideFileGrant(cwd: string, modeName: string, surface: FileSurface, scope: FileScope): string {
+  return persistOutsideFileGrantInto(path.join(cwd, CONFIG_DIR_NAME, "permission-mode.json"), modeName, surface, scope);
 }

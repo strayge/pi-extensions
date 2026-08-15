@@ -21,6 +21,21 @@ export type PatternMap = Record<string, Action>;
 /** A surface value is either a shorthand action or a pattern-map. */
 export type SurfaceValue = Action | PatternMap;
 
+/** A remembered outside-project file scope.
+ *
+ * Tree values are literal directory paths. Their display form adds `/*`, but
+ * the matcher uses canonical path containment rather than glob syntax.
+ */
+export type FileScope =
+  | { kind: "exact"; value: string }
+  | { kind: "tree"; value: string }
+  | { kind: "glob"; value: string };
+
+/** File-tool surfaces that may have typed outside-project grants. */
+export type FileSurface = "read" | "write" | "edit" | "grep" | "find" | "ls";
+
+export const OUTSIDE_FILE_SURFACES: FileSurface[] = ["read", "write", "edit", "grep", "find", "ls"];
+
 /**
  * The gateable surfaces.
  *   path                cross-cutting gate over ALL file access (incl. bash args);
@@ -130,6 +145,10 @@ export interface ModeDef {
    * later project `ask` would override.
    */
   trustedProjectPermission?: Partial<Record<Surface, SurfaceValue>>;
+  /** Deny-safe remembered grants from the global configuration. */
+  outsideFileGrants?: Partial<Record<FileSurface, FileScope[]>>;
+  /** Deny-safe remembered grants from the trusted project configuration. */
+  trustedProjectOutsideFileGrants?: Partial<Record<FileSurface, FileScope[]>>;
 }
 
 /** Top-level config: the mode registry plus cycle/default metadata. */

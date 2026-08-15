@@ -273,18 +273,19 @@ test("outside file access offers project and global persistence in trusted proje
   const h = await setup({ trusted: true });
   try {
     const target = "../shared/input.txt";
-    h.ctx.answers.push(`Always allow for project: ${target}`);
+    h.ctx.answers.push("Remember for this project");
     assert.equal(await h.call("read", { path: target }), undefined);
     assert.deepEqual(h.ctx.prompts[0].options, [
-      "Allow once",
-      "Allow for session",
-      `Always allow for project: ${target}`,
-      `Always allow: ${target}`,
+      "Allow this request once",
+      "Allow scope for session",
+      "Edit scope…",
+      "Remember for this project",
+      "Remember globally",
       "Deny",
     ]);
 
     const saved = JSON.parse(readFileSync(path.join(h.root, ".pi", "permission-mode.json"), "utf-8"));
-    assert.equal(saved.modes.default.permission.external_directory[target], "allow");
+    assert.deepEqual(saved.modes.default.outsideFileGrants.read, [{ kind: "exact", value: path.resolve(h.root, target) }]);
     assert.equal(await h.call("read", { path: target }), undefined);
     assert.equal(h.ctx.prompts.length, 1);
   } finally {
@@ -296,7 +297,7 @@ test("outside file session grant suppresses repeat prompts", { skip }, async () 
   const h = await setup();
   try {
     const target = "../shared/input.txt";
-    h.ctx.answers.push("Allow for session");
+    h.ctx.answers.push("Allow scope for session");
     assert.equal(await h.call("read", { path: target }), undefined);
     assert.equal(h.ctx.prompts.length, 1);
 
@@ -307,24 +308,93 @@ test("outside file session grant suppresses repeat prompts", { skip }, async () 
   }
 });
 
-test("outside file persistence grants every asking policy layer", { skip }, async () => {
+test("outside file persistence is operation-specific and survives config reload", { skip }, async () => {
   const h = await setup();
   try {
     const target = "../shared/output.txt";
-    h.ctx.answers.push(`Always allow: ${target}`);
+    h.ctx.answers.push("Remember globally");
     assert.equal(await h.call("write", { path: target }), undefined);
     assert.deepEqual(h.ctx.prompts[0].options, [
-      "Allow once",
-      "Allow for session",
-      `Always allow: ${target}`,
+      "Allow this request once",
+      "Allow scope for session",
+      "Edit scope…",
+      "Remember globally",
       "Deny",
     ]);
 
     const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
-    assert.equal(saved.modes.default.permission.external_directory[target], "allow");
-    assert.equal(saved.modes.default.permission.write[target], "allow");
+    assert.deepEqual(saved.modes.default.outsideFileGrants.write, [{ kind: "exact", value: path.resolve(h.root, target) }]);
     assert.equal(await h.call("write", { path: target }), undefined);
     assert.equal(h.ctx.prompts.length, 1);
+    assert.equal((await h.call("read", { path: target }))?.block, true);
+    assert.equal(h.ctx.prompts.length, 2);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("outside file scope edits are recursive, operation-specific, and repeatable", { skip }, async () => {
+  const h = await setup();
+  try {
+    const target = "../shared/input.txt";
+    h.ctx.answers.push("Edit scope…", "Directory tree: ../shared/*", "Allow scope for session");
+    assert.equal(await h.call("read", { path: target }), undefined);
+    assert.equal(h.ctx.prompts.length, 3);
+    assert.match(h.ctx.prompts[0].title, /Requested: \.\.\/shared\/input\.txt/);
+    assert.match(h.ctx.prompts[1].title, /Scope:\s+\.\.\/shared\/input\.txt/);
+
+    assert.equal(await h.call("read", { path: "../shared/deep/child.txt" }), undefined);
+    assert.equal(h.ctx.prompts.length, 3);
+    // The typed read scope must not authorize a write to the same tree.
+    h.ctx.answers.push("Deny");
+    assert.equal((await h.call("write", { path: "../shared/deep/child.txt" }))?.block, true);
+    assert.equal(h.ctx.prompts.length, 4);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("remembered outside scopes cannot override an explicit deny", { skip }, async () => {
+  const h = await setup();
+  try {
+    const file = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(
+      file,
+      JSON.stringify({
+        modes: {
+          default: {
+            permission: { external_directory: { "*": "deny" } },
+            outsideFileGrants: { read: [{ kind: "glob", value: "/tmp/*" }] },
+          },
+        },
+      }),
+    );
+    await h.pi.emit("session_start", {}, h.ctx);
+    const blocked = await h.call("read", { path: "/tmp/deep/file.txt" });
+    assert.equal(blocked?.block, true);
+    assert.equal(h.ctx.prompts.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("project restrictions hide global outside persistence", { skip }, async () => {
+  const h = await setup({ trusted: true });
+  try {
+    const file = path.join(h.root, ".pi", "permission-mode.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ modes: { default: { permission: { external_directory: { "*": "ask" } } } } }));
+    await h.pi.emit("session_start", {}, h.ctx);
+    h.ctx.answers.push("Deny");
+    assert.equal((await h.call("read", { path: "../shared/input.txt" }))?.block, true);
+    assert.deepEqual(h.ctx.prompts[0].options, [
+      "Allow this request once",
+      "Allow scope for session",
+      "Edit scope…",
+      "Remember for this project",
+      "Deny",
+    ]);
   } finally {
     h.cleanup();
   }

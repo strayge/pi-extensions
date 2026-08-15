@@ -11,16 +11,23 @@
  * three-way Allow once / Allow for session / Deny prompt).
  */
 
-import type { Surface } from "./schema.ts";
+import type { FileScope, Surface } from "./schema.ts";
 import { matchPattern } from "./resolve.ts";
+import { scopeMatches } from "./file-approval.ts";
 
 export class SessionApprovals {
   private store = new Map<string, Map<Surface, Set<string>>>();
+  private fileScopes = new Map<string, Map<Surface, FileScope[]>>();
 
   has(mode: string, surface: Surface, target: string): boolean {
     const values = this.store.get(mode)?.get(surface);
     if (!values) return false;
     return surface === "bash" ? [...values].some((pattern) => matchPattern(pattern, target)) : values.has(target);
+  }
+
+  hasScope(mode: string, surface: Surface, target: string, cwd?: string): boolean {
+    const scopes = this.fileScopes.get(mode)?.get(surface);
+    return scopes?.some((scope) => scopeMatches(scope, target, cwd)) ?? false;
   }
 
   remember(mode: string, surface: Surface, target: string): void {
@@ -37,12 +44,28 @@ export class SessionApprovals {
     set.add(target);
   }
 
+  rememberScope(mode: string, surface: Surface, scope: FileScope): void {
+    let bySurface = this.fileScopes.get(mode);
+    if (!bySurface) {
+      bySurface = new Map();
+      this.fileScopes.set(mode, bySurface);
+    }
+    let scopes = bySurface.get(surface);
+    if (!scopes) {
+      scopes = [];
+      bySurface.set(surface, scopes);
+    }
+    if (!scopes.some((entry) => entry.kind === scope.kind && entry.value === scope.value)) scopes.push({ ...scope });
+  }
+
   clearMode(mode: string): void {
     this.store.delete(mode);
+    this.fileScopes.delete(mode);
   }
 
   clearAll(): void {
     this.store.clear();
+    this.fileScopes.clear();
   }
 }
 
