@@ -11,6 +11,7 @@
  * output hangs underneath on a `⎿` continuation.
  */
 
+import * as piTui from "@earendil-works/pi-tui";
 import { Markdown, type MarkdownTheme, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { extractText } from "../context.js";
 import type { Theme } from "./agent-widget.js";
@@ -19,6 +20,77 @@ import type { Theme } from "./agent-widget.js";
 const TOOL_OUTPUT_LINES = 7;
 /** Cap on a single argument summary before it is ellipsized. */
 const MAX_ARG_CHARS = 200;
+
+const stripTerminalSequences = "stripTerminalSequences" in piTui
+  ? (piTui as unknown as { stripTerminalSequences: (value: string) => string }).stripTerminalSequences
+  : (value: string) => value;
+
+function skipCsi(value: string, start: number): number {
+  for (let index = start; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0x40 && code <= 0x7e) return index + 1;
+  }
+  return value.length;
+}
+
+function skipEscape(value: string, start: number): number {
+  let index = start;
+  while (index < value.length) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code > 0x2f) break;
+    index++;
+  }
+  const final = value.charCodeAt(index);
+  return final >= 0x30 && final <= 0x7e ? index + 1 : index;
+}
+
+function skipStringSequence(value: string, start: number): number {
+  for (let index = start; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code === 0x07 || code === 0x9c) return index + 1;
+    if (code === 0x1b && value[index + 1] === "\\") return index + 2;
+  }
+  return value.length;
+}
+
+/** Prevent transcript data from being interpreted as terminal instructions. */
+function sanitizeTranscriptText(value: string): string {
+  const normalized = stripTerminalSequences(value.replace(/\r\n?/g, "\n"));
+  let sanitized = "";
+
+  for (let index = 0; index < normalized.length;) {
+    const code = normalized.charCodeAt(index);
+
+    if (code === 0x1b) {
+      const next = normalized[index + 1];
+      if (next === "[") {
+        index = skipCsi(normalized, index + 2);
+      } else if (next === "]" || next === "_" || next === "P" || next === "^" || next === "X") {
+        index = skipStringSequence(normalized, index + 2);
+      } else {
+        index = skipEscape(normalized, index + 1);
+      }
+      continue;
+    }
+
+    if (code === 0x9b) {
+      index = skipCsi(normalized, index + 1);
+      continue;
+    }
+    if (code === 0x90 || code === 0x98 || code === 0x9d || code === 0x9e || code === 0x9f) {
+      index = skipStringSequence(normalized, index + 1);
+      continue;
+    }
+
+    if (code === 0x0a) sanitized += "\n";
+    else if (code === 0x09) sanitized += "   ";
+    else if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) sanitized += " ";
+    else sanitized += normalized[index];
+    index++;
+  }
+
+  return sanitized;
+}
 
 /** Minimal shape of a `toolCall` content part (pi-ai `ToolCall`). */
 interface ToolCallPart {
@@ -63,7 +135,7 @@ export function markdownThemeFrom(theme: Theme): MarkdownTheme {
 }
 
 function collapse(value: string): string {
-  const text = value.replace(/\s+/g, " ").trim();
+  const text = sanitizeTranscriptText(value).replace(/\s+/g, " ").trim();
   return text.length > MAX_ARG_CHARS ? `${text.slice(0, MAX_ARG_CHARS)}…` : text;
 }
 
@@ -167,7 +239,7 @@ function indexCallIds(messages: readonly any[]): Set<string> {
  * reading the text.
  */
 function toolOutputLines(result: RenderedToolResult, width: number, theme: Theme): string[] {
-  const text = result.text.trim();
+  const text = sanitizeTranscriptText(result.text).trim();
   if (!text) return [];
   const color = result.isError ? "error" : "toolOutput";
   const source = text.split("\n");
@@ -224,19 +296,20 @@ export function renderTranscriptLines(
     }
 
     if (message?.role === "user") {
-      const text = typeof message.content === "string"
+      const rawText = typeof message.content === "string"
         ? message.content
         : extractText(Array.isArray(message.content) ? message.content : []);
-      if (!text.trim()) continue;
+      const text = sanitizeTranscriptText(rawText).trim();
+      if (!text) continue;
       pushBlank();
-      for (const line of wrapTextWithAnsi(text.trim(), Math.max(1, width - 2))) {
+      for (const line of wrapTextWithAnsi(text, Math.max(1, width - 2))) {
         lines.push(truncateToWidth(theme.fg("userMessageText", `> ${line}`), width));
       }
       continue;
     }
 
     if (message?.role === "assistant") {
-      const text = extractText(Array.isArray(message.content) ? message.content : []).trim();
+      const text = sanitizeTranscriptText(extractText(Array.isArray(message.content) ? message.content : [])).trim();
       if (text) {
         pushBlank();
         // Markdown owns its own wrapping; it renders to exactly `width`.
@@ -245,8 +318,9 @@ export function renderTranscriptLines(
         }
       }
       for (const call of toolCallParts(message.content)) {
-        const name = call.name ?? "tool";
-        const summary = summarizeToolArgs(name, call.arguments ?? call.args);
+        const rawName = call.name ?? "tool";
+        const name = collapse(rawName) || "tool";
+        const summary = summarizeToolArgs(rawName, call.arguments ?? call.args);
         pushBlank();
         const title = theme.fg("toolTitle", theme.bold(name));
         lines.push(truncateToWidth(summary ? `${title} ${theme.fg("dim", summary)}` : title, width));

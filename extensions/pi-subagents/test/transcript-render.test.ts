@@ -34,6 +34,8 @@ function toolResult(toolCallId: string, text: string, isError = false) {
   return { role: "toolResult", toolCallId, content: [{ type: "text", text }], isError };
 }
 
+const unsafeTerminalControl = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u;
+
 describe("summarizeToolArgs", () => {
   it("leads with the command for bash", () => {
     expect(summarizeToolArgs("bash", { command: "git ls-files", timeout: 30 })).toBe("git ls-files");
@@ -68,6 +70,14 @@ describe("summarizeToolArgs", () => {
     const summary = summarizeToolArgs("bash", { command: "x".repeat(400) });
     expect(summary.endsWith("…")).toBe(true);
     expect(summary.length).toBeLessThanOrEqual(201);
+  });
+
+  it("removes terminal controls from arguments", () => {
+    const summary = summarizeToolArgs("bash", {
+      command: "echo \x1b[2Avisible \x1b]0;hidden-title\x07done",
+    });
+    expect(summary).toBe("echo visible done");
+    expect(summary).not.toMatch(unsafeTerminalControl);
   });
 
   it("survives a missing or wrongly-typed expected field", () => {
@@ -164,6 +174,72 @@ describe("renderTranscriptLines", () => {
     const joined = lines.join("\n");
     expect(joined).toContain("$ ls -la");
     expect(joined).toContain("total 0");
+  });
+
+  it("normalizes CRLF and bare CR across transcript text paths", () => {
+    const lines = render([
+      { role: "user", content: "user one\r\nuser two\ruser three" },
+      assistant([
+        { type: "text", text: "assistant one\r\nassistant two\rassistant three" },
+        toolCall("c1", "bash", { command: "echo arg one\r\narg two\rarg three" }),
+      ]),
+      toolResult("c1", "tool one\r\ntool two\rtool three"),
+      { role: "bashExecution", command: "printf bash\r\ncommand", output: "bash one\r\nbash two\rbash three" },
+    ]);
+    const joined = lines.join("\n");
+
+    for (const text of [
+      "user one", "user two", "user three",
+      "assistant one", "assistant two", "assistant three",
+      "echo arg one arg two arg three",
+      "tool one", "tool two", "tool three",
+      "$ printf bash command", "bash one", "bash two", "bash three",
+    ]) {
+      expect(joined).toContain(text);
+    }
+    expect(joined).not.toContain("\r");
+  });
+
+  it("strips external CSI, OSC, and APC sequences without hiding ordinary text", () => {
+    const csi = "\x1b[2A";
+    const osc = "\x1b]0;hidden-title\x07";
+    const apc = "\x1b_hidden-command\x1b\\";
+    const lines = render([
+      { role: "user", content: `user ${csi}visible ${osc}after-user\bcontrol-visible` },
+      assistant([
+        { type: "text", text: `assistant ${apc}visible` },
+        toolCall("c1", "bash", { command: `echo ${csi}argument-visible` }),
+      ]),
+      toolResult("c1", `tool ${csi}visible ${apc}result-visible`),
+      { role: "bashExecution", command: `printf ${osc}command-visible`, output: `bash ${csi}output-visible` },
+    ]);
+    const joined = lines.join("\n");
+
+    for (const text of [
+      "user visible after-user control-visible",
+      "assistant visible",
+      "echo argument-visible",
+      "tool visible result-visible",
+      "$ printf command-visible",
+      "bash output-visible",
+    ]) {
+      expect(joined).toContain(text);
+    }
+    expect(joined).not.toContain("hidden-title");
+    expect(joined).not.toContain("hidden-command");
+    for (const line of lines) expect(line).not.toMatch(unsafeTerminalControl);
+  });
+
+  it("preserves theme styling added after transcript sanitization", () => {
+    const theme = {
+      fg: (_color: string, text: string) => `\x1b[35m${text}\x1b[0m`,
+      bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
+    } as any;
+    const joined = render([{ role: "user", content: "safe\x1b[2A text" }], 80, theme).join("\n");
+
+    expect(joined).toContain("safe text");
+    expect(joined).toContain("\x1b[35m");
+    expect(joined).not.toContain("\x1b[2A");
   });
 
   it("skips empty messages without leaving blank runs", () => {
