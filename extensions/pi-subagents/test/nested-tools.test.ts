@@ -308,6 +308,30 @@ describe("child-safe nested Agent tools", () => {
     expect(result.content[0].text).toBe("queued done");
   });
 
+  it("returns a nested terminal result when its manager promise stays unresolved", async () => {
+    const [, getResult] = tools();
+    const record = {
+      id: "orphaned-promise-child",
+      status: "running",
+      parentAgentId: "parent-1",
+      promise: new Promise<void>(() => {}),
+      result: undefined as string | undefined,
+    };
+    records.set(record.id, record);
+
+    const waitResult = execute(getResult, { agent_id: record.id, wait: true });
+    record.status = "completed";
+    record.result = "nested terminal result";
+
+    const result = await Promise.race([
+      waitResult,
+      new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 200)),
+    ]);
+
+    expect(result).not.toBe("timed-out");
+    expect((result as any).content[0].text).toBe("nested terminal result");
+  });
+
   it("aborts a nested result wait without aborting the owned child", async () => {
     const [, getResult] = tools();
     let settleChild: (() => void) | undefined;
