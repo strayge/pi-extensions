@@ -163,8 +163,12 @@ function createSession(finalText: string) {
     }),
     // pi's Agent; `beforeToolCall` is an optional, assignable hook the scope
     // installer wraps to block out-of-scope calls on turn 1.
-    agent: { beforeToolCall: undefined } as {
+    agent: {
+      beforeToolCall: undefined,
+      streamFunction: vi.fn(),
+    } as {
       beforeToolCall?: (context: any, signal?: any) => Promise<any>;
+      streamFunction: (...args: any[]) => any;
     },
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
@@ -322,6 +326,15 @@ describe("agent-runner final output capture", () => {
 
     expect(result.text).toBe("RESUMED");
     expect(result.failure).toBeUndefined();
+  });
+
+  it("forwards an already-aborted resume signal before prompting", async () => {
+    const { session } = createSession("IGNORED");
+
+    await resumeAgent(session as any, "Continue", { signal: AbortSignal.abort() });
+
+    expect(session.abort).toHaveBeenCalledOnce();
+    expect(session.abort.mock.invocationCallOrder[0]).toBeLessThan(session.prompt.mock.invocationCallOrder[0]);
   });
 
   it("sets the agent name as session name before binding extensions", async () => {
@@ -1277,7 +1290,7 @@ describe("agent-runner async extension tool registration", () => {
     // asynchronously, so there is no active-set narrowing to maintain.
     expect(createAgentSession.mock.calls[0][0].tools).toEqual(["read"]);
     expect(session.setActiveToolsByName).not.toHaveBeenCalled();
-    expect(session.agent.beforeToolCall).toBeUndefined();
+    expect(session.agent.beforeToolCall).toBeTypeOf("function");
   });
 });
 

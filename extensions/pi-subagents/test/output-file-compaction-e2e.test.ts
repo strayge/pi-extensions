@@ -19,7 +19,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
-import { registerFauxProvider } from "./helpers/pi-ai.js";
+import { fauxModelRuntime, registerFauxProvider } from "./helpers/pi-ai.js";
 
 const TURNS_BEFORE_COMPACT = 6;
 
@@ -88,16 +88,7 @@ describe("output-file streaming across a real compaction (#145)", () => {
       cwd,
       agentDir,
       model,
-      modelRegistry: {
-        find: () => model,
-        getAll: () => [model],
-        getAvailable: () => [model],
-        hasConfiguredAuth: () => true,
-        isUsingOAuth: () => false,
-        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "faux", headers: {} }),
-        registerProvider: () => {},
-        unregisterProvider: () => {},
-      } as never,
+      modelRuntime: fauxModelRuntime(model) as never,
       resourceLoader: loader,
       sessionManager: SessionManager.inMemory(cwd),
       settingsManager: SettingsManager.inMemory({

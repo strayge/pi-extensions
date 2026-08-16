@@ -13,6 +13,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { normalizeMaxTurns, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { isContextBudgetTerminal } from "./context-budget.js";
 import { shortModelName } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, ResultDelivery, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
@@ -215,6 +216,7 @@ export class AgentManager {
       toolUses: 0,
       startedAt: Date.now(),
       abortController,
+      promptState: "idle",
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
       compactionCount: 0,
       // Raw tri-state (not coerced to a boolean): true = background, false =
@@ -236,6 +238,21 @@ export class AgentManager {
     };
     this.agents.set(id, record);
 
+    if (options.signal) {
+      const onParentAbort = () => {
+        record.detachParentSignal = undefined;
+        this.abort(id);
+      };
+      options.signal.addEventListener("abort", onParentAbort, { once: true });
+      record.detachParentSignal = () => options.signal?.removeEventListener("abort", onParentAbort);
+      if (options.signal.aborted) {
+        onParentAbort();
+        record.promise = Promise.resolve("");
+        this.onSpawned?.(id);
+        return id;
+      }
+    }
+
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 
     if (occupiesPoolSlot(record) && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
@@ -249,6 +266,8 @@ export class AgentManager {
     try {
       this.startAgent(id, record, args);
     } catch (err) {
+      record.detachParentSignal?.();
+      record.detachParentSignal = undefined;
       this.agents.delete(id);
       throw err;
     }
@@ -290,18 +309,15 @@ export class AgentManager {
     }
 
     record.status = "running";
+    record.promptState = "running";
     record.startedAt = Date.now();
     if (occupiesPoolSlot(record)) this.runningBackground++;
     this.onStart?.(record);
 
-    // Wire parent abort signal to stop the subagent when the parent is interrupted
-    let detachParentSignal: (() => void) | undefined;
-    if (options.signal) {
-      const onParentAbort = () => this.abort(id);
-      options.signal.addEventListener("abort", onParentAbort, { once: true });
-      detachParentSignal = () => options.signal!.removeEventListener("abort", onParentAbort);
-    }
-    const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
+    const detach = () => {
+      record.detachParentSignal?.();
+      record.detachParentSignal = undefined;
+    };
 
     const promise = runAgent(ctx, type, prompt, {
       pi,
@@ -353,7 +369,7 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     })
-      .then(({ responseText, session, aborted, steered, failure }) => {
+      .then(({ responseText, session, aborted, steered, failure, contextTerminal }) => {
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
@@ -370,6 +386,7 @@ export class AgentManager {
         }
         record.result = responseText;
         record.session = session;
+        record.promptState = contextTerminal ? "guard-terminal" : "idle";
         record.completedAt ??= Date.now();
 
         detach();
@@ -413,6 +430,9 @@ export class AgentManager {
           record.status = "error";
         }
         record.error = err instanceof Error ? err.message : String(err);
+        record.promptState = record.session && isContextBudgetTerminal(record.session)
+          ? "guard-terminal"
+          : "idle";
         record.completedAt ??= Date.now();
 
         detach();
@@ -480,6 +500,8 @@ export class AgentManager {
         record.status = "error";
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt = Date.now();
+        record.detachParentSignal?.();
+        record.detachParentSignal = undefined;
         this.onComplete?.(record);
       }
     }
@@ -534,16 +556,37 @@ export class AgentManager {
     signal?: AbortSignal,
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
-    if (!record?.session) return undefined;
+    if (
+      !record?.session ||
+      record.promptState === "running" ||
+      record.promptState === "guard-terminal" ||
+      isContextBudgetTerminal(record.session)
+    ) {
+      if (record?.session && isContextBudgetTerminal(record.session)) record.promptState = "guard-terminal";
+      return undefined;
+    }
 
+    const abortController = new AbortController();
+    const onCallerAbort = () => { this.abort(id); };
+
+    record.abortController = abortController;
+    record.promptState = "running";
     record.status = "running";
     record.startedAt = Date.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    const isStopped = () => record.status === "stopped";
+    if (signal?.aborted) {
+      onCallerAbort();
+      record.promptState = "idle";
+      record.abortController = undefined;
+      return record;
+    }
+    signal?.addEventListener("abort", onCallerAbort, { once: true });
 
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const { text, failure, contextTerminal } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
         },
@@ -554,18 +597,28 @@ export class AgentManager {
           record.compactionCount++;
           this.onCompact?.(record, info);
         },
-        signal,
+        signal: abortController.signal,
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
-      record.result = text;
-      record.completedAt = Date.now();
+      if (!isStopped()) {
+        record.status = failure ? "error" : "completed";
+        if (failure) record.error = failure;
+        record.result = text;
+        if (contextTerminal) record.promptState = "guard-terminal";
+        record.completedAt = Date.now();
+      }
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+      if (!isStopped()) {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+        record.promptState = isContextBudgetTerminal(record.session) ? "guard-terminal" : "idle";
+        record.completedAt = Date.now();
+      }
+    } finally {
+      signal?.removeEventListener("abort", onCallerAbort);
+      if ((record.promptState as AgentRecord["promptState"]) !== "guard-terminal") record.promptState = "idle";
+      if (record.abortController === abortController) record.abortController = undefined;
     }
 
     // Same contract as the spawn settle paths: children spawned during the
@@ -583,12 +636,20 @@ export class AgentManager {
    * session is created. Returns false if the agent can't accept steering
    * (unknown id, or no longer running/queued).
    */
-  steer(id: string, message: string): boolean {
+  async steer(id: string, message: string): Promise<boolean> {
     const record = this.agents.get(id);
     if (!record) return false;
+    if (record.session && isContextBudgetTerminal(record.session)) {
+      record.promptState = "guard-terminal";
+      return false;
+    }
     if (record.status !== "running" && record.status !== "queued") return false;
     if (record.session) {
-      record.session.steer(message).catch(() => {});
+      try {
+        await record.session.steer(message);
+      } catch {
+        return false;
+      }
     } else {
       if (!record.pendingSteers) record.pendingSteers = [];
       record.pendingSteers.push(message);
@@ -610,6 +671,9 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record) return false;
 
+    record.detachParentSignal?.();
+    record.detachParentSignal = undefined;
+
     // Remove from queue if queued
     if (record.status === "queued") {
       this.queue = this.queue.filter(q => q.id !== id);
@@ -620,6 +684,7 @@ export class AgentManager {
 
     if (record.status !== "running") return false;
     record.abortController?.abort();
+    record.session?.abort?.();
     record.status = "stopped";
     record.completedAt = Date.now();
     return true;
@@ -627,6 +692,8 @@ export class AgentManager {
 
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
+    record.detachParentSignal?.();
+    record.detachParentSignal = undefined;
     record.session?.dispose?.();
     record.session = undefined;
     this.agents.delete(id);
@@ -664,25 +731,12 @@ export class AgentManager {
 
   /** Abort all running and queued agents immediately. */
   abortAll(): number {
+    const activeIds = [...this.agents.values()]
+      .filter(record => record.status === "running" || record.status === "queued")
+      .map(record => record.id);
     let count = 0;
-    // Clear queued agents first
-    for (const queued of this.queue) {
-      const record = this.agents.get(queued.id);
-      if (record) {
-        record.status = "stopped";
-        record.completedAt = Date.now();
-        count++;
-      }
-    }
-    this.queue = [];
-    // Abort running agents
-    for (const record of this.agents.values()) {
-      if (record.status === "running") {
-        record.abortController?.abort();
-        record.status = "stopped";
-        record.completedAt = Date.now();
-        count++;
-      }
+    for (const id of activeIds) {
+      if (this.abort(id)) count++;
     }
     return count;
   }
@@ -707,6 +761,8 @@ export class AgentManager {
     // Clear queue
     this.queue = [];
     for (const record of this.agents.values()) {
+      record.detachParentSignal?.();
+      record.detachParentSignal = undefined;
       record.session?.dispose();
     }
     this.agents.clear();

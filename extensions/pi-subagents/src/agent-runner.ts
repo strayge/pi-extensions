@@ -21,6 +21,12 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getR
 import { runInChildSessionContext } from "./child-context.js";
 import { createChildExtensionUI } from "./child-ui.js";
 import { buildParentContext, extractText } from "./context.js";
+import {
+  beginContextBudgetPrompt,
+  finishContextBudgetPrompt,
+  installContextBudgetGuard,
+  MIN_SUPPORTED_CONTEXT_WINDOW,
+} from "./context-budget.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
@@ -431,6 +437,8 @@ export interface RunResult {
    * stop that produced text (a legitimate truncated answer).
    */
   failure?: string;
+  /** The retained session cannot safely accept another prompt. */
+  contextTerminal?: boolean;
 }
 
 /**
@@ -506,6 +514,10 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
   const onAbort = () => session.abort();
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
 }
@@ -740,6 +752,11 @@ export async function runAgent(
   const model = options.model ?? resolveDefaultModel(
     ctx.model, ctx.modelRegistry, agentConfig?.model,
   );
+  if (model && model.contextWindow <= MIN_SUPPORTED_CONTEXT_WINDOW) {
+    throw new Error(
+      `Model context window (${model.contextWindow.toLocaleString("en-US")} tokens) is too small for subagent context guardrails; more than ${MIN_SUPPORTED_CONTEXT_WINDOW.toLocaleString("en-US")} tokens is required.`,
+    );
+  }
 
   // Resolve thinking level: explicit option > agent config > undefined (inherit)
   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
@@ -840,10 +857,11 @@ export async function runAgent(
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
   // Pass both so the full supported Pi range retains the parent's providers.
-  const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: unknown }).runtime;
+  const parentModelRuntime = (ctx.modelRegistry as unknown as {
+    runtime?: NonNullable<Parameters<typeof createAgentSession>[0]>["modelRuntime"];
+  }).runtime;
   const sessionOpts: Parameters<typeof createAgentSession>[0] & {
     modelRegistry: ExtensionContext["modelRegistry"];
-    modelRuntime?: unknown;
   } = {
     cwd: effectiveCwd,
     agentDir,
@@ -864,6 +882,7 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  installContextBudgetGuard(session, settingsManager);
 
   const baseSessionName = agentConfig?.name ?? type;
   const sessionName = options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName;
@@ -969,16 +988,26 @@ export async function runAgent(
   // Boundary for the history fallback: only assistant text produced from here
   // on counts as this run's output (a fresh session, so usually 0).
   const startLen = session.messages.length;
+  let contextTerminal = false;
   try {
+    beginContextBudgetPrompt(session, options.signal);
     await session.prompt(effectivePrompt);
   } finally {
+    contextTerminal = finishContextBudgetPrompt(session).terminal;
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
   }
 
   const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
-  return { responseText, session, aborted, steered: softLimitReached, failure: finalTurnError(session, startLen) };
+  return {
+    responseText,
+    session,
+    aborted,
+    steered: softLimitReached || contextTerminal,
+    failure: finalTurnError(session, startLen),
+    contextTerminal,
+  };
 }
 
 /**
@@ -993,7 +1022,7 @@ export async function resumeAgent(
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; failure?: string; contextTerminal?: boolean }> {
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
@@ -1019,9 +1048,12 @@ export async function resumeAgent(
       })
     : () => {};
 
+  let contextTerminal = false;
   try {
+    beginContextBudgetPrompt(session, options.signal);
     await session.prompt(prompt);
   } finally {
+    contextTerminal = finishContextBudgetPrompt(session).terminal;
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
@@ -1030,18 +1062,8 @@ export async function resumeAgent(
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
     failure: finalTurnError(session, startLen),
+    contextTerminal,
   };
-}
-
-/**
- * Send a steering message to a running subagent.
- * The message will interrupt the agent after its current tool execution.
- */
-export async function steerAgent(
-  session: AgentSession,
-  message: string,
-): Promise<void> {
-  await session.steer(message);
 }
 
 /**

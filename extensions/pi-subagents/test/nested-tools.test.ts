@@ -80,6 +80,17 @@ beforeEach(() => {
     spawnAndWait,
     getRecord: (id: string) => records.get(id),
     resume: vi.fn(),
+    steer: vi.fn((id: string, message: string) => {
+      const record = records.get(id);
+      if (!record) return false;
+      if (record.session) {
+        record.session.steer(message);
+      } else {
+        record.pendingSteers ??= [];
+        record.pendingSteers.push(message);
+      }
+      return true;
+    }),
   } as any;
 });
 

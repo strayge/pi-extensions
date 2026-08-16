@@ -17,7 +17,7 @@ import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Tex
 import { Type } from "@sinclair/typebox";
 import { waitForTerminalRecord } from "./abortable.js";
 import { AgentManager } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -1568,31 +1568,26 @@ Terse command-style prompts produce shallow, generic work.
       if (record.status !== "running") {
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }
-      if (!record.session) {
-        // Session not ready yet — queue the steer for delivery once initialized
-        if (!record.pendingSteers) record.pendingSteers = [];
-        record.pendingSteers.push(params.message);
-        pi.events.emit("subagents:steered", { id: record.id, message: params.message });
+      const queued = !record.session;
+      if (!await manager.steer(record.id, params.message)) {
+        return textResult(`Agent "${record.id}" cannot accept steering in its current state.`);
+      }
+      pi.events.emit("subagents:steered", { id: record.id, message: params.message });
+      if (queued) {
         return textResult(`Steering message queued for agent ${record.id}. It will be delivered once the session initializes.`);
       }
 
-      try {
-        await steerAgent(record.session, params.message);
-        pi.events.emit("subagents:steered", { id: record.id, message: params.message });
-        const tokens = formatLifetimeTokens(record);
-        const contextPercent = getSessionContextPercent(record.session);
-        const stateParts: string[] = [];
-        if (tokens) stateParts.push(tokens);
-        stateParts.push(`${record.toolUses} tool ${record.toolUses === 1 ? "use" : "uses"}`);
-        if (contextPercent !== null) stateParts.push(`context ${Math.round(contextPercent)}% full`);
-        if (record.compactionCount) stateParts.push(`${record.compactionCount} compaction${record.compactionCount === 1 ? "" : "s"}`);
-        return textResult(
-          `Steering message sent to agent ${record.id}. The agent will process it after its current tool execution.\n` +
-          `Current state: ${stateParts.join(" · ")}`,
-        );
-      } catch (err) {
-        return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      const tokens = formatLifetimeTokens(record);
+      const contextPercent = getSessionContextPercent(record.session);
+      const stateParts: string[] = [];
+      if (tokens) stateParts.push(tokens);
+      stateParts.push(`${record.toolUses} tool ${record.toolUses === 1 ? "use" : "uses"}`);
+      if (contextPercent !== null) stateParts.push(`context ${Math.round(contextPercent)}% full`);
+      if (record.compactionCount) stateParts.push(`${record.compactionCount} compaction${record.compactionCount === 1 ? "" : "s"}`);
+      return textResult(
+        `Steering message sent to agent ${record.id}. The agent will process it after its current tool execution.\n` +
+        `Current state: ${stateParts.join(" · ")}`,
+      );
     },
   }));
 
@@ -1801,7 +1796,7 @@ Terse command-style prompts produce shallow, generic work.
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message));
+        }, keybindings, (message: string) => { void manager.steer(record.id, message); });
       },
       {
         overlay: true,

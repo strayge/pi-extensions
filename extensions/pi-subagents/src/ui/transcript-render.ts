@@ -11,7 +11,6 @@
  * output hangs underneath on a `⎿` continuation.
  */
 
-import * as piTui from "@earendil-works/pi-tui";
 import { Markdown, type MarkdownTheme, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { extractText } from "../context.js";
 import type { Theme } from "./agent-widget.js";
@@ -20,10 +19,6 @@ import type { Theme } from "./agent-widget.js";
 const TOOL_OUTPUT_LINES = 7;
 /** Cap on a single argument summary before it is ellipsized. */
 const MAX_ARG_CHARS = 200;
-
-const stripTerminalSequences = "stripTerminalSequences" in piTui
-  ? (piTui as unknown as { stripTerminalSequences: (value: string) => string }).stripTerminalSequences
-  : (value: string) => value;
 
 function skipCsi(value: string, start: number): number {
   for (let index = start; index < value.length; index++) {
@@ -55,7 +50,7 @@ function skipStringSequence(value: string, start: number): number {
 
 /** Prevent transcript data from being interpreted as terminal instructions. */
 function sanitizeTranscriptText(value: string): string {
-  const normalized = stripTerminalSequences(value.replace(/\r\n?/g, "\n"));
+  const normalized = value.replace(/\r\n?/g, "\n");
   let sanitized = "";
 
   for (let index = 0; index < normalized.length;) {

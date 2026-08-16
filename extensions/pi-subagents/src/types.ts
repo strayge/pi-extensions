@@ -98,6 +98,10 @@ export interface AgentRecord {
   completedAt?: number;
   session?: AgentSession;
   abortController?: AbortController;
+  /** Detaches the parent cancellation listener when this record settles or is removed. */
+  detachParentSignal?: () => void;
+  /** Serializes prompt ownership for the retained session. */
+  promptState?: "idle" | "running" | "guard-terminal";
   promise?: Promise<string>;
   groupId?: string;
   joinMode?: JoinMode;

@@ -26,9 +26,9 @@
     "test:e2e": "vitest run e2e --reporter=verbose"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.80.0",
-    "@earendil-works/pi-coding-agent": ">=0.80.0",
-    "@earendil-works/pi-tui": ">=0.80.0"
+    "@earendil-works/pi-ai": ">=0.84.2",
+    "@earendil-works/pi-coding-agent": ">=0.84.2",
+    "@earendil-works/pi-tui": ">=0.84.2"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.49",
@@ -37,6 +37,9 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.6",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
     "@types/node": "^25.5.0",
     "typescript": "^6.0.0",
     "vitest": "^4.0.18"
