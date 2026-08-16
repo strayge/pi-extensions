@@ -9,9 +9,10 @@ Alacritty, and most other modern emulators do.
 
 Only the session that owns the terminal chimes. Subagent runners (for example
 `@tintinweb/pi-subagents`) load every discovered extension into each nested
-session, and those sessions emit their own `agent_settled` — the chime is gated
-on `ctx.mode === "tui"` so a finishing subagent stays silent and only your turn
-ending pulls you back.
+session, and those sessions emit their own `agent_settled`. The runner marks its
+proxied child UI context with the `Symbol.for("pi-subagents:child-extension-ui")`
+protocol, so a finishing subagent stays silent even though it inherits TUI mode
+to forward permission dialogs.
 
 ## Install
 

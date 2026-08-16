@@ -1,5 +1,12 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
+/**
+ * Cross-extension marker for UI contexts proxied into a nested agent session.
+ * The global symbol registry lets independently loaded extensions recognize the
+ * proxy without importing this package or relying on the inherited run mode.
+ */
+export const CHILD_EXTENSION_UI_MARKER = Symbol.for("pi-subagents:child-extension-ui");
+
 type DialogOptions = Parameters<ExtensionUIContext["select"]>[2];
 
 class DialogQueue {
@@ -60,7 +67,7 @@ export function createChildExtensionUI(
   const queue = queueFor(parent);
   const title = (value: string) => `Subagent ${label}: ${value}`;
 
-  return {
+  const childUI: ExtensionUIContext = {
     select: (value, options, opts) => {
       const merged = dialogOptions(opts, agentSignal);
       return queue.run(() => parent.select(title(value), options, merged), undefined, merged?.signal);
@@ -101,4 +108,8 @@ export function createChildExtensionUI(
     getToolsExpanded: () => parent.getToolsExpanded(),
     setToolsExpanded: () => {},
   };
+  Object.defineProperty(childUI, CHILD_EXTENSION_UI_MARKER, {
+    value: true,
+  });
+  return childUI;
 }

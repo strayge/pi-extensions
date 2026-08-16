@@ -1,6 +1,6 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
-import { createChildExtensionUI } from "../src/child-ui.js";
+import { CHILD_EXTENSION_UI_MARKER, createChildExtensionUI } from "../src/child-ui.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -44,6 +44,14 @@ function parentUI(select: ExtensionUIContext["select"]): ExtensionUIContext {
 }
 
 describe("child extension UI", () => {
+  it("identifies the proxy without exposing the marker to UI consumers", () => {
+    const child = createChildExtensionUI(parentUI(vi.fn(async () => undefined)), "Explore");
+
+    expect(Reflect.get(child, CHILD_EXTENSION_UI_MARKER)).toBe(true);
+    expect(Object.getOwnPropertySymbols(child)).toContain(CHILD_EXTENSION_UI_MARKER);
+    expect(Object.getOwnPropertyDescriptor(child, CHILD_EXTENSION_UI_MARKER)?.enumerable).toBe(false);
+  });
+
   it("forwards permission dialogs with the subagent identity", async () => {
     const select = vi.fn(async () => "Allow once");
     const parent = parentUI(select);

@@ -16,6 +16,10 @@
 import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+// A cross-extension protocol: pi-subagents marks its proxied child UI context
+// with this global symbol without requiring extensions to import one another.
+const CHILD_EXTENSION_UI_MARKER = Symbol.for("pi-subagents:child-extension-ui");
+
 type FocusState = "unknown" | "focused" | "blurred";
 
 let focus: FocusState = "unknown";
@@ -55,12 +59,13 @@ function notify(): void {
 }
 
 /**
- * True only for the session driving the terminal. Nested sessions (subagents)
- * bind no UI context and stay in "print" mode, so this also keeps the focus
- * escape sequences and the terminal-input subscription out of their hands.
+ * True only for the session driving the terminal. Subagent sessions inherit
+ * TUI mode so they can forward permission dialogs, but their proxied UI carries
+ * the cross-extension marker instead of owning terminal input or notifications.
  */
-function ownsTerminal(ctx: Pick<ExtensionContext, "mode">): boolean {
-  return ctx.mode === "tui";
+function ownsTerminal(ctx: Pick<ExtensionContext, "mode" | "ui">): boolean {
+  const ui = ctx.ui as unknown as Record<symbol, unknown>;
+  return ctx.mode === "tui" && ui[CHILD_EXTENSION_UI_MARKER] !== true;
 }
 
 export default function (pi: ExtensionAPI) {
