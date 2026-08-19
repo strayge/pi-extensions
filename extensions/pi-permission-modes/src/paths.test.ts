@@ -253,15 +253,15 @@ test("sandboxMountPath: canonicalizes symlinked mount points bwrap can't mount o
   }
 });
 
-test("isPlanFile: markdown under the in-project plans/ dir only", () => {
+test("isPlanFile: markdown under the in-project docs/plans/ dir only", () => {
   const root = "/home/proj";
-  assert.equal(isPlanFile(root, "plans/2026-06-07_x.md"), true);
-  assert.equal(isPlanFile(root, "plans/sub/y.markdown"), true);
-  assert.equal(isPlanFile(root, "./plans/z.md"), true);
-  assert.equal(isPlanFile(root, "plans/notes.txt"), false); // not markdown
-  assert.equal(isPlanFile(root, "docs/x.md"), false); // not under plans/
-  assert.equal(isPlanFile(root, "planner/x.md"), false); // sibling dir, not plans/
-  assert.equal(isPlanFile(root, "../plans/x.md"), false); // escapes project
+  assert.equal(isPlanFile(root, "docs/plans/2026-06-07_x.md"), true);
+  assert.equal(isPlanFile(root, "docs/plans/sub/y.markdown"), true);
+  assert.equal(isPlanFile(root, "./docs/plans/z.md"), true);
+  assert.equal(isPlanFile(root, "docs/plans/notes.txt"), false); // not markdown
+  assert.equal(isPlanFile(root, "plans/x.md"), false); // legacy root directory
+  assert.equal(isPlanFile(root, "docs/planner/x.md"), false); // sibling directory
+  assert.equal(isPlanFile(root, "../docs/plans/x.md"), false); // escapes project
   assert.equal(isPlanFile(root, undefined), false);
 });
 
@@ -320,10 +320,10 @@ test("removeSandboxPlaceholders deletes 0-byte placeholders, leaves real files/d
 });
 
 test("resolvePlanPath trims and strips a leading @", () => {
-  assert.equal(resolvePlanPath("plans/x.md"), "plans/x.md");
-  assert.equal(resolvePlanPath("  plans/x.md  "), "plans/x.md");
-  assert.equal(resolvePlanPath("@plans/x.md"), "plans/x.md");
-  assert.equal(resolvePlanPath(" @plans/x.md"), "plans/x.md");
+  assert.equal(resolvePlanPath("docs/plans/x.md"), "docs/plans/x.md");
+  assert.equal(resolvePlanPath("  docs/plans/x.md  "), "docs/plans/x.md");
+  assert.equal(resolvePlanPath("@docs/plans/x.md"), "docs/plans/x.md");
+  assert.equal(resolvePlanPath(" @docs/plans/x.md"), "docs/plans/x.md");
   assert.equal(resolvePlanPath(undefined), "");
   assert.equal(resolvePlanPath(null), "");
 });
