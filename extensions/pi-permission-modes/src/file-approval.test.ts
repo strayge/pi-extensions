@@ -377,7 +377,7 @@ test("RPC cancellation walks custom → selector → outer and preserves fail-cl
       ui: {
         custom: async () => undefined as never,
         async select(title) {
-          views.push(title.startsWith("Outside project") ? "outer" : "selector");
+          views.push(title.startsWith("Allow ") ? "outer" : "selector");
           return selects.shift();
         },
         async input() {

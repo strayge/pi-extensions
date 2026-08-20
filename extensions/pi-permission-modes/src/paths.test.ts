@@ -1,16 +1,21 @@
 import assert from "node:assert/strict";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import {
   resolveGitLayout,
   isMarkdown,
   isOutside,
   isPlanFile,
+  isProtectedNormalizedWrite,
   isProtectedPath,
   isProtectedWrite,
+  normalizePiTarget,
+  piReadPathCandidates,
   removeSandboxPlaceholders,
+  resolvePiReadTarget,
   resolvePlanPath,
   SAFE_OUTSIDE_RE,
   SANDBOX_PLACEHOLDER_PATHS,
@@ -36,10 +41,62 @@ test("isOutside: parent traversal escapes", () => {
   assert.equal(isOutside(ROOT, "src/../../escape"), true);
 });
 
+test("normalizePiTarget follows Pi file-tool input normalization", () => {
+  const base = realpathSync(mkdtempSync(path.join(tmpdir(), "perm-normalize-")));
+  try {
+    const existing = path.join(base, "existing.txt");
+    const ordinarySpace = path.join(base, "ordinary name ");
+    const unicodeSpace = path.join(base, "unicode name");
+    writeFileSync(existing, "ok");
+    writeFileSync(ordinarySpace, "ok");
+    writeFileSync(unicodeSpace, "ok");
+    symlinkSync(existing, path.join(base, "alias.txt"));
+    assert.equal(normalizePiTarget("@alias.txt", base).displayTarget, "alias.txt");
+    assert.equal(normalizePiTarget("@alias.txt", base).canonicalTarget, existing);
+    assert.equal(normalizePiTarget(pathToFileURL(existing).href, base).canonicalTarget, existing);
+    assert.equal(isOutside(base, pathToFileURL("/etc/passwd").href), true);
+    assert.equal(normalizePiTarget("ordinary name ", base).canonicalTarget, ordinarySpace);
+    assert.equal(normalizePiTarget("unicode\u202Fname", base).canonicalTarget, unicodeSpace);
+    assert.equal(normalizePiTarget("../outside.txt", base).canonicalTarget, path.join(path.dirname(base), "outside.txt"));
+    // Pi does not expand shell variables in file-tool paths.
+    assert.equal(normalizePiTarget("$HOME/file", base).canonicalTarget, path.join(base, "$HOME", "file"));
+    assert.equal(normalizePiTarget("~/file", base).canonicalTarget, path.join(homedir(), "file"));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("Pi read fallback candidates match NFD and curly-quote resolution", () => {
+  const base = realpathSync(mkdtempSync(path.join(tmpdir(), "perm-read-candidates-")));
+  try {
+    const nfc = path.join(base, "café.txt");
+    const nfd = path.join(base, "cafe\u0301.txt");
+    const curly = path.join(base, "Capture d\u2019ecran.txt");
+    writeFileSync(nfd, "nfd");
+    writeFileSync(curly, "curly");
+
+    assert.deepEqual(piReadPathCandidates("café.txt", base), [nfc, nfd]);
+    assert.equal(resolvePiReadTarget("café.txt", base).canonicalTarget, nfd);
+    assert.equal(resolvePiReadTarget("Capture d'ecran.txt", base).canonicalTarget, curly);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("isOutside: absolute paths classified by containment", () => {
   assert.equal(isOutside(ROOT, "/home/proj/src"), false);
   assert.equal(isOutside(ROOT, "/etc/passwd"), true);
   assert.equal(isOutside(ROOT, "/home/projector"), true); // prefix but not contained
+});
+
+test("isProtectedWrite uses the normalized file URL target", () => {
+  const base = realpathSync(mkdtempSync(path.join(tmpdir(), "perm-protected-url-")));
+  try {
+    const target = pathToFileURL(path.join(base, ".env")).href;
+    assert.equal(isProtectedWrite(base, target), true);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });
 
 test("isProtectedPath: segment-aware match of the expanded protected set", () => {
@@ -371,6 +428,31 @@ test("isProtectedWrite: symlinks cannot smuggle a write past the backstop", () =
     writeFileSync(path.join(root, "real.md"), "");
     symlinkSync(path.join(root, "real.md"), path.join(root, "alias.md"));
     assert.equal(isProtectedWrite(root, "alias.md"), false);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("isProtectedNormalizedWrite: a frozen canonical target cannot switch after a symlink replacement", () => {
+  const base = mkdtempSync(path.join(tmpdir(), "perm-prot-frozen-"));
+  try {
+    const root = path.join(base, "proj");
+    const benign = path.join(root, "benign.txt");
+    const protectedFile = path.join(root, ".env");
+    const alias = path.join(root, "alias.txt");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(benign, "benign");
+    writeFileSync(protectedFile, "protected");
+    symlinkSync(benign, alias);
+
+    const frozen = normalizePiTarget("alias.txt", root);
+    assert.equal(isProtectedNormalizedWrite(root, frozen), false);
+    rmSync(alias);
+    symlinkSync(protectedFile, alias);
+
+    assert.equal(frozen.canonicalTarget, benign);
+    assert.equal(isProtectedNormalizedWrite(root, frozen), false, "the protected check must not resolve alias.txt again");
+    assert.equal(normalizePiTarget("alias.txt", root).canonicalTarget, protectedFile, "a fresh snapshot would switch targets");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

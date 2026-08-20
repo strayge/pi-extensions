@@ -17,10 +17,12 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
+import { overrideBashParserForTesting } from "./bash-parse.ts";
 
 type SetupExtension = (pi: unknown) => Promise<void>;
 
@@ -103,6 +105,7 @@ interface FakeCtx {
   notices: string[];
   status: string;
   answers: (string | undefined)[];
+  selectHooks: Array<() => void>;
   ui: {
     select(title: string, options: string[]): Promise<string | undefined>;
     notify(message: string, level?: string): void;
@@ -130,9 +133,11 @@ function makeCtx(cwd: string, opts: FakeCtxOptions = {}): FakeCtx {
     notices: [],
     status: "",
     answers: [],
+    selectHooks: [],
     ui: {
       async select(title, options) {
         ctx.prompts.push({ title, options });
+        ctx.selectHooks.shift()?.();
         const answer = ctx.answers.shift();
         assert.ok(answer === undefined || options.includes(answer), `answer ${answer} was not offered by: ${options.join(", ")}`);
         return answer;
@@ -174,6 +179,50 @@ async function useUnsandboxedAskMode(h: Harness): Promise<void> {
   );
   await h.pi.emit("session_start", {}, h.ctx);
   await h.perm("confirm-unsandboxed");
+}
+
+async function useUnsandboxedSparseMode(h: Harness): Promise<void> {
+  const dir = path.join(h.agentDir, "permission-mode");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, "permission-mode.json"),
+    JSON.stringify({
+      defaultMode: "sparse-unsandboxed",
+      cycleOrder: ["sparse-unsandboxed"],
+      modes: {
+        "sparse-unsandboxed": {
+          label: "Sparse unsandboxed",
+          color: "error",
+          sandbox: { enabled: false, writable: true },
+          permission: {},
+        },
+      },
+    }),
+  );
+  await h.pi.emit("session_start", {}, h.ctx);
+  await h.perm("sparse-unsandboxed");
+}
+
+async function useUnsandboxedAllowMode(h: Harness): Promise<void> {
+  const dir = path.join(h.agentDir, "permission-mode");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, "permission-mode.json"),
+    JSON.stringify({
+      defaultMode: "allow-unsandboxed",
+      cycleOrder: ["allow-unsandboxed"],
+      modes: {
+        "allow-unsandboxed": {
+          label: "Allow unsandboxed",
+          color: "error",
+          sandbox: { enabled: false, writable: true },
+          permission: { bash: "allow", path: "allow", external_directory: "allow" },
+        },
+      },
+    }),
+  );
+  await h.pi.emit("session_start", {}, h.ctx);
+  await h.perm("allow-unsandboxed");
 }
 
 // --- harness ------------------------------------------------------------------
@@ -277,11 +326,312 @@ test("default mode: reads free, writes prompt, protected paths hard-block", { sk
     assert.equal(h.ctx.prompts.length, 0);
 
     // A normal write prompts; Allow once passes, Deny blocks.
-    h.ctx.answers.push("Allow once", "Deny");
+    h.ctx.answers.push("Allow this request once", "Deny");
     assert.equal(await h.call("write", { path: "notes.txt" }), undefined);
     const denied = await h.call("write", { path: "notes.txt" });
     assert.equal(denied?.block, true);
     assert.equal(h.ctx.prompts.length, 2);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher uses Pi's file URL target and preserves ordinary spaces", { skip }, async () => {
+  const h = await setup();
+  try {
+    h.ctx.answers.push("Deny");
+    const external = await h.call("read", { path: pathToFileURL("/etc/passwd").href });
+    assert.equal(external?.block, true);
+    assert.match(external?.reason ?? "", /not approved/);
+    assert.equal(h.ctx.prompts.length, 1);
+
+    // A trailing ordinary space is meaningful to Pi and must not be trimmed
+    // into the protected `.env` target.
+    h.ctx.answers.push("Allow this request once");
+    assert.equal(await h.call("write", { path: ".env " }), undefined);
+    assert.equal(h.ctx.prompts.length, 2);
+
+    const protectedUrl = pathToFileURL(path.join(h.root, ".env")).href;
+    const blocked = await h.call("write", { path: protectedUrl });
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /protected/);
+    assert.equal(h.ctx.prompts.length, 2);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher uses ctx.cwd consistently for boundaries and protected writes", { skip }, async () => {
+  const h = await setup();
+  try {
+    const contextCwd = path.join(h.root, "nested");
+    mkdirSync(contextCwd, { recursive: true });
+    h.ctx.cwd = contextCwd;
+    mkdirSync(path.join(h.agentDir, "permission-mode"), { recursive: true });
+    writeFileSync(
+      path.join(h.agentDir, "permission-mode", "permission-mode.json"),
+      JSON.stringify({ modes: { default: { permission: { external_directory: "deny" } } } }),
+    );
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    // `..` resolves to the startup root, but it is outside the current tool cwd.
+    const outside = await h.call("read", { path: ".." });
+    assert.equal(outside?.block, true);
+    assert.equal(h.ctx.prompts.length, 0);
+
+    // A link in the current cwd reaches the startup root's protected .git.
+    mkdirSync(path.join(h.root, ".git"));
+    symlinkSync(path.join(h.root, ".git"), path.join(contextCwd, "git-link"), "dir");
+    const protectedWrite = await h.call("write", { path: "git-link/config" });
+    assert.equal(protectedWrite?.block, true);
+    assert.match(protectedWrite?.reason ?? "", /protected/);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher denies Pi NFD read fallback candidates", { skip }, async () => {
+  const h = await setup();
+  try {
+    const requested = path.join(h.root, "café.txt");
+    const actual = path.join(h.root, "cafe\u0301.txt");
+    writeFileSync(actual, "NFD");
+    mkdirSync(path.dirname(path.join(h.agentDir, "permission-mode", "permission-mode.json")), { recursive: true });
+    writeFileSync(
+      path.join(h.agentDir, "permission-mode", "permission-mode.json"),
+      JSON.stringify({ modes: { default: { permission: { read: { [actual]: "deny" } } } } }),
+    );
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    const blocked = await h.call("read", { path: requested });
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /blocked/);
+    assert.equal(h.ctx.prompts.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher rewrites file URLs and read fallbacks to the authorized canonical target", { skip }, async () => {
+  const h = await setup();
+  try {
+    const direct = path.join(h.root, "direct.txt");
+    writeFileSync(direct, "direct");
+    const urlInput = { path: pathToFileURL(direct).href };
+    assert.equal(await h.call("read", urlInput), undefined);
+    assert.equal(urlInput.path, direct);
+
+    const requested = path.join(h.root, "café.txt");
+    const fallback = path.join(h.root, "cafe\u0301.txt");
+    writeFileSync(fallback, "fallback");
+    const fallbackInput = { path: requested };
+    assert.equal(await h.call("read", fallbackInput), undefined);
+    assert.equal(fallbackInput.path, fallback);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher preserves an existing canonical symlink target selected before approval", { skip }, async () => {
+  const h = await setup();
+  try {
+    const selected = path.join(h.root, "selected.txt");
+    const replacement = path.join(h.root, "replacement.txt");
+    const alias = path.join(h.root, "alias.txt");
+    writeFileSync(selected, "selected");
+    writeFileSync(replacement, "replacement");
+    symlinkSync(selected, alias);
+    h.ctx.selectHooks.push(() => {
+      rmSync(alias);
+      symlinkSync(replacement, alias);
+    });
+    h.ctx.answers.push("Remember globally");
+    const input = { path: "alias.txt" };
+    assert.equal(await h.call("write", input), undefined);
+    assert.equal(input.path, selected);
+    assert.match(h.ctx.prompts[0]?.title ?? "", /Requested: alias\.txt/);
+    const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
+    assert.deepEqual(saved.modes.default.permissionGrants, [
+      { permission: "write", scope: { kind: "exact", value: selected } },
+    ]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher keeps the pre-backstop canonical write target when a symlink switches to protected", { skip }, async () => {
+  const h = await setup();
+  try {
+    const selected = path.join(h.root, "selected.txt");
+    const protectedFile = path.join(h.root, ".env");
+    const alias = path.join(h.root, "alias.txt");
+    writeFileSync(selected, "selected");
+    writeFileSync(protectedFile, "protected");
+    symlinkSync(selected, alias);
+    h.ctx.selectHooks.push(() => {
+      rmSync(alias);
+      symlinkSync(protectedFile, alias);
+    });
+    h.ctx.answers.push("Allow this request once");
+    const input = { path: "alias.txt" };
+    assert.equal(await h.call("write", input), undefined);
+    assert.equal(input.path, selected, "execution must retain the canonical target checked by the backstop");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher blocks write when a missing component becomes a .git symlink during approval", { skip }, async () => {
+  const h = await setup();
+  try {
+    const protectedDir = path.join(h.root, ".git");
+    const missingDir = path.join(h.root, "pending-write");
+    const frozenTarget = path.join(missingDir, "config");
+    mkdirSync(protectedDir);
+    h.ctx.selectHooks.push(() => symlinkSync(protectedDir, missingDir, "dir"));
+    h.ctx.answers.push("Remember globally");
+
+    const input = { path: "pending-write/config" };
+    const blocked = await h.call("write", input);
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /changed after authorization/);
+    assert.equal(input.path, "pending-write/config", "a blocked call must not receive an execution path");
+    assert.ok(h.ctx.notices.some((notice) => /authorized path changed before execution/.test(notice)));
+
+    const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
+    assert.deepEqual(saved.modes.default.permissionGrants, [
+      { permission: "write", scope: { kind: "exact", value: frozenTarget } },
+    ], "the separately persisted approval remains bound to the frozen target, not .git");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher blocks edit when a missing component becomes a protected symlink during approval", { skip }, async () => {
+  const h = await setup();
+  try {
+    const protectedDir = path.join(h.root, ".vscode");
+    const missingDir = path.join(h.root, "pending-edit");
+    mkdirSync(protectedDir);
+    h.ctx.selectHooks.push(() => symlinkSync(protectedDir, missingDir, "dir"));
+    h.ctx.answers.push("Allow this request once");
+
+    const input = { path: "pending-edit/settings.json" };
+    const blocked = await h.call("edit", input);
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /changed after authorization/);
+    assert.equal(input.path, "pending-edit/settings.json", "a blocked call must not receive an execution path");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher blocks a missing write target that switches outside during approval", { skip }, async () => {
+  const h = await setup();
+  try {
+    const outsideDir = path.join(path.dirname(h.root), "outside");
+    const missingDir = path.join(h.root, "pending-outside");
+    mkdirSync(outsideDir);
+    h.ctx.selectHooks.push(() => symlinkSync(outsideDir, missingDir, "dir"));
+    h.ctx.answers.push("Allow this request once");
+
+    const input = { path: "pending-outside/result.txt" };
+    const blocked = await h.call("write", input);
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /changed after authorization/);
+    assert.equal(input.path, "pending-outside/result.txt", "the outside target must not be accepted for execution");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher accepts an unchanged missing write target after approval", { skip }, async () => {
+  const h = await setup();
+  try {
+    h.ctx.answers.push("Allow this request once");
+    const input = { path: "still-missing/result.txt" };
+    assert.equal(await h.call("write", input), undefined);
+    assert.equal(input.path, path.join(h.root, "still-missing", "result.txt"));
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher denies Pi curly-quote read fallback candidates", { skip }, async () => {
+  const h = await setup();
+  try {
+    const requested = "Capture d'ecran.txt";
+    const actual = path.join(h.root, "Capture d\u2019ecran.txt");
+    writeFileSync(actual, "curly");
+    mkdirSync(path.join(h.agentDir, "permission-mode"), { recursive: true });
+    writeFileSync(
+      path.join(h.agentDir, "permission-mode", "permission-mode.json"),
+      JSON.stringify({ modes: { default: { permission: { read: { [actual]: "deny" } } } } }),
+    );
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    const blocked = await h.call("read", { path: requested });
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /blocked/);
+    assert.equal(h.ctx.prompts.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dispatcher keeps literal $HOME file paths distinct from configured home aliases", { skip }, async () => {
+  const h = await setup();
+  try {
+    mkdirSync(path.join(h.agentDir, "permission-mode"), { recursive: true });
+    writeFileSync(
+      path.join(h.agentDir, "permission-mode", "permission-mode.json"),
+      JSON.stringify({ modes: { default: { permission: { read: { "*": "allow", "$HOME/*": "deny" } } } } }),
+    );
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    // Pi opens this below the project, not below the user's home directory.
+    assert.equal(await h.call("read", { path: "$HOME/literal.txt" }), undefined);
+    const homeBlocked = await h.call("read", { path: "~/literal.txt" });
+    assert.equal(homeBlocked?.block, true);
+    assert.equal(h.ctx.prompts.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("optional-path file tools deny omitted paths", { skip }, async () => {
+  const h = await setup();
+  try {
+    const file = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ modes: { default: { permission: { grep: "deny", find: "deny", ls: "deny" } } } }));
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    for (const [toolName, input] of [["grep", { pattern: "x" }], ["find", { pattern: "*" }], ["ls", {}]] as const) {
+      const blocked = await h.call(toolName, input);
+      assert.equal(blocked?.block, true, `${toolName} without path should be denied`);
+      assert.match(blocked?.reason ?? "", /blocked/);
+    }
+    assert.equal(h.ctx.prompts.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("optional-path file tools ask on omitted paths", { skip }, async () => {
+  const h = await setup();
+  try {
+    const file = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ modes: { default: { permission: { grep: "ask", find: "ask", ls: "ask" } } } }));
+    await h.pi.emit("session_start", {}, h.ctx);
+    h.ctx.answers.push("Deny", "Deny", "Deny");
+
+    for (const [toolName, input] of [["grep", { pattern: "x" }], ["find", { pattern: "*" }], ["ls", {}]] as const) {
+      const blocked = await h.call(toolName, input);
+      assert.equal(blocked?.block, true, `${toolName} without path should ask`);
+    }
+    assert.equal(h.ctx.prompts.length, 3);
   } finally {
     h.cleanup();
   }
@@ -303,7 +653,9 @@ test("outside file access offers project and global persistence in trusted proje
     ]);
 
     const saved = JSON.parse(readFileSync(path.join(h.root, ".pi", "permission-mode.json"), "utf-8"));
-    assert.deepEqual(saved.modes.default.outsideFileGrants.read, [{ kind: "exact", value: path.resolve(h.root, target) }]);
+    assert.deepEqual(saved.modes.default.permissionGrants, [
+      { permission: "external_directory", scope: { kind: "exact", value: path.resolve(h.root, target) } },
+    ]);
     assert.equal(await h.call("read", { path: target }), undefined);
     assert.equal(h.ctx.prompts.length, 1);
   } finally {
@@ -330,7 +682,7 @@ test("outside file persistence is operation-specific and survives config reload"
   const h = await setup();
   try {
     const target = "../shared/output.txt";
-    h.ctx.answers.push("Remember globally");
+    h.ctx.answers.push("Allow this request once", "Remember globally");
     assert.equal(await h.call("write", { path: target }), undefined);
     assert.deepEqual(h.ctx.prompts[0].options, [
       "Allow this request once",
@@ -341,11 +693,15 @@ test("outside file persistence is operation-specific and survives config reload"
     ]);
 
     const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
-    assert.deepEqual(saved.modes.default.outsideFileGrants.write, [{ kind: "exact", value: path.resolve(h.root, target) }]);
+    assert.deepEqual(saved.modes.default.permissionGrants, [
+      { permission: "write", scope: { kind: "exact", value: path.resolve(h.root, target) } },
+    ]);
+    h.ctx.answers.push("Allow this request once");
     assert.equal(await h.call("write", { path: target }), undefined);
-    assert.equal(h.ctx.prompts.length, 1);
-    assert.equal((await h.call("read", { path: target }))?.block, true);
-    assert.equal(h.ctx.prompts.length, 2);
+    assert.equal(h.ctx.prompts.length, 3);
+    h.ctx.answers.push("Allow this request once");
+    assert.equal((await h.call("read", { path: target }))?.block, undefined);
+    assert.equal(h.ctx.prompts.length, 4);
   } finally {
     h.cleanup();
   }
@@ -358,8 +714,8 @@ test("outside file scope edits are recursive, operation-specific, and repeatable
     h.ctx.answers.push("Edit scope…", "Directory tree: ../shared/*", "Allow scope for session");
     assert.equal(await h.call("read", { path: target }), undefined);
     assert.equal(h.ctx.prompts.length, 3);
-    assert.match(h.ctx.prompts[0].title, /Requested: \.\.\/shared\/input\.txt/);
-    assert.match(h.ctx.prompts[1].title, /Scope:\s+\.\.\/shared\/input\.txt/);
+    assert.match(h.ctx.prompts[0].title, /Allow external directory/);
+    assert.match(h.ctx.prompts[1].title, /Choose access scope/);
 
     assert.equal(await h.call("read", { path: "../shared/deep/child.txt" }), undefined);
     assert.equal(h.ctx.prompts.length, 3);
@@ -383,7 +739,7 @@ test("remembered outside scopes cannot override an explicit deny", { skip }, asy
         modes: {
           default: {
             permission: { external_directory: { "*": "deny" } },
-            outsideFileGrants: { read: [{ kind: "glob", value: "/tmp/*" }] },
+            permissionGrants: [{ permission: "external_directory", scope: { kind: "glob", value: "/tmp/*" } }],
           },
         },
       }),
@@ -413,6 +769,95 @@ test("project restrictions hide global outside persistence", { skip }, async () 
       "Remember for this project",
       "Deny",
     ]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("read fallback project policy checks every authorized identity before using or offering global grants", { skip }, async () => {
+  const h = await setup({ trusted: true });
+  try {
+    const requestedDisplay = "café.txt";
+    const selectedDisplay = "cafe\u0301.txt";
+    const selectedCanonical = path.join(h.root, selectedDisplay);
+    writeFileSync(selectedCanonical, "fallback");
+
+    const globalFile = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    mkdirSync(path.dirname(globalFile), { recursive: true });
+    writeFileSync(globalFile, JSON.stringify({
+      modes: {
+        default: {
+          permissionGrants: [{ permission: "read", scope: { kind: "exact", value: selectedCanonical } }],
+        },
+      },
+    }));
+    const projectFile = path.join(h.root, ".pi", "permission-mode.json");
+    mkdirSync(path.dirname(projectFile), { recursive: true });
+    writeFileSync(projectFile, JSON.stringify({
+      modes: { default: { permission: { read: { [selectedDisplay]: "ask" } } } },
+    }));
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    h.ctx.answers.push("Deny");
+    assert.equal((await h.call("read", { path: requestedDisplay }))?.block, true);
+    assert.equal(h.ctx.prompts.length, 1, "the global grant must not suppress the project ask");
+    assert.ok(!h.ctx.prompts[0]!.options.includes("Remember globally"));
+    assert.ok(h.ctx.prompts[0]!.options.includes("Remember for this project"));
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("mixed project requirements keep global eligibility per permission", { skip }, async () => {
+  const pathRestricted = await setup({ trusted: true });
+  try {
+    const projectFile = path.join(pathRestricted.root, ".pi", "permission-mode.json");
+    mkdirSync(path.dirname(projectFile), { recursive: true });
+    writeFileSync(projectFile, JSON.stringify({ modes: { default: { permission: { path: "ask" } } } }));
+    await pathRestricted.pi.emit("session_start", {}, pathRestricted.ctx);
+    pathRestricted.ctx.answers.push("Allow this request once", "Deny");
+    assert.equal((await pathRestricted.call("write", { path: "src/mixed.ts" }))?.block, true);
+    assert.ok(!pathRestricted.ctx.prompts[0]!.options.includes("Remember globally"));
+    assert.ok(pathRestricted.ctx.prompts[1]!.options.includes("Remember globally"));
+  } finally {
+    pathRestricted.cleanup();
+  }
+
+  const writeRestricted = await setup({ trusted: true });
+  try {
+    const globalFile = path.join(writeRestricted.agentDir, "permission-mode", "permission-mode.json");
+    mkdirSync(path.dirname(globalFile), { recursive: true });
+    writeFileSync(globalFile, JSON.stringify({ modes: { default: { permission: { path: "ask" } } } }));
+    const projectFile = path.join(writeRestricted.root, ".pi", "permission-mode.json");
+    mkdirSync(path.dirname(projectFile), { recursive: true });
+    writeFileSync(projectFile, JSON.stringify({ modes: { default: { permission: { write: "ask" } } } }));
+    await writeRestricted.pi.emit("session_start", {}, writeRestricted.ctx);
+    writeRestricted.ctx.answers.push("Allow this request once", "Deny");
+    assert.equal((await writeRestricted.call("write", { path: "src/mixed.ts" }))?.block, true);
+    assert.ok(writeRestricted.ctx.prompts[0]!.options.includes("Remember globally"));
+    assert.ok(!writeRestricted.ctx.prompts[1]!.options.includes("Remember globally"));
+  } finally {
+    writeRestricted.cleanup();
+  }
+});
+
+test("a project ask on one permission does not suppress another permission's global grant", { skip }, async () => {
+  const h = await setup({ trusted: true });
+  try {
+    const target = path.join(h.root, "src", "granted.ts");
+    const globalFile = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    mkdirSync(path.dirname(globalFile), { recursive: true });
+    writeFileSync(globalFile, JSON.stringify({
+      modes: { default: { permissionGrants: [{ permission: "write", scope: { kind: "exact", value: target } }] } },
+    }));
+    const projectFile = path.join(h.root, ".pi", "permission-mode.json");
+    mkdirSync(path.dirname(projectFile), { recursive: true });
+    writeFileSync(projectFile, JSON.stringify({ modes: { default: { permission: { path: "ask" } } } }));
+    await h.pi.emit("session_start", {}, h.ctx);
+    h.ctx.answers.push("Allow this request once");
+    assert.equal(await h.call("write", { path: "src/granted.ts" }), undefined);
+    assert.equal(h.ctx.prompts.length, 1);
+    assert.match(h.ctx.prompts[0]?.title ?? "", /Allow path/);
   } finally {
     h.cleanup();
   }
@@ -506,6 +951,7 @@ test("environment startup does not export a stale child snapshot", { skip }, asy
 test("bash: session grant covers the same command, not a longer chain", { skip }, async () => {
   const h = await setup();
   try {
+    await useUnsandboxedAskMode(h);
     h.ctx.answers.push("Allow for session");
     assert.equal(await h.call("bash", { command: "git status" }), undefined);
     assert.equal(h.ctx.prompts.length, 1);
@@ -526,15 +972,300 @@ test("bash: session grant covers the same command, not a longer chain", { skip }
   }
 });
 
-test("bash: session grant covers repeated outside-project commands", { skip }, async () => {
+test("bash: an existing grant never suppresses repeated outside safeguards", { skip }, async () => {
   const h = await setup();
   try {
-    h.ctx.answers.push("Allow for session");
-    assert.equal(await h.call("bash", { command: "cat ../secret.txt" }), undefined);
-    assert.match(h.ctx.prompts[0]?.title ?? "", /path outside project/);
+    await useUnsandboxedAskMode(h);
+    h.ctx.answers.push("Remember globally: cat *");
+    assert.equal(await h.call("bash", { command: "cat README.md" }), undefined);
 
+    h.ctx.answers.push("Allow once", "Allow once");
     assert.equal(await h.call("bash", { command: "cat ../secret.txt" }), undefined);
-    assert.equal(h.ctx.prompts.length, 1);
+    assert.equal(await h.call("bash", { command: "cat ../secret.txt" }), undefined);
+    assert.match(h.ctx.prompts[1]?.title ?? "", /path outside project/);
+    assert.match(h.ctx.prompts[2]?.title ?? "", /path outside project/);
+    assert.deepEqual(h.ctx.prompts[1]?.options, ["Allow once", "Deny"]);
+    assert.equal(h.ctx.prompts.length, 3);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: dynamic commands remain one-shot even with a broad grant", { skip }, async () => {
+  const h = await setup();
+  try {
+    await useUnsandboxedAskMode(h);
+    const file = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    const configured = JSON.parse(readFileSync(file, "utf-8"));
+    configured.modes["confirm-unsandboxed"].permissionGrants = [{ permission: "bash", pattern: "*" }];
+    writeFileSync(file, JSON.stringify(configured));
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    const dynamicCommands = [
+      "$command --flag",
+      "eval 'echo safe'",
+      `script="echo safe"; sh -c "$script"`,
+      `bash "$script"`,
+      `source "$script"`,
+      `. "$script"`,
+      `env sh -c "$code"`,
+      "bash --norc script.sh",
+      "bash --rcfile scripts/evil -ic 'echo safe'",
+      "bash --init-file scripts/evil -ic 'echo safe'",
+      `fish -C "$init" -c 'echo safe'`,
+      "env --unknown X echo safe",
+    ];
+    h.ctx.answers.push(...dynamicCommands.map(() => "Allow once"));
+    for (const command of dynamicCommands) {
+      assert.equal(await h.call("bash", { command }), undefined);
+      const prompt = h.ctx.prompts.at(-1)!;
+      assert.match(prompt.title, /dynamically interpreted command/);
+      assert.deepEqual(prompt.options, ["Allow once", "Deny"]);
+    }
+
+    const before = h.ctx.prompts.length;
+    for (const command of [
+      "sh -c 'echo safe'",
+      "bash -lc 'echo safe'",
+      "env sh -c 'echo safe'",
+      "fish -C 'echo init' -c 'echo safe'",
+    ]) {
+      assert.equal(await h.call("bash", { command }), undefined);
+    }
+    assert.equal(h.ctx.prompts.length, before, "recursively understood literal scripts are covered by the grant");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: command-prefix assignments always require an ungrantable one-shot safeguard", { skip }, async () => {
+  const h = await setup();
+  try {
+    await useUnsandboxedAskMode(h);
+    const file = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    const configured = JSON.parse(readFileSync(file, "utf-8"));
+    configured.modes["confirm-unsandboxed"].permissionGrants = [{ permission: "bash", pattern: "*" }];
+    writeFileSync(file, JSON.stringify(configured));
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    const commands = [
+      "PATH=./evil:$PATH git status",
+      "BASH_ENV=./evil bash -c ':'",
+      "ENV=./evil sh -c ':'",
+      "VALUE=$dynamic git status",
+      "ONLY=literal",
+      "PATH=./evil env sh -c 'echo safe'",
+      "DEST=../secret.txt git status",
+    ];
+    h.ctx.answers.push(...commands.map(() => "Allow once"));
+    for (const command of commands) {
+      assert.equal(await h.call("bash", { command }), undefined);
+      const prompt = h.ctx.prompts.at(-1)!;
+      assert.deepEqual(prompt.options, ["Allow once", "Deny"], command);
+      assert.match(prompt.title, /dynamically interpreted command|path outside project/, command);
+      assert.match(prompt.title, new RegExp(command.split(" ")[0]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), command);
+    }
+    assert.equal(h.ctx.prompts.length, commands.length, "existing grants cannot suppress assignment safeguards");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: assignment values and effective nested commands cannot bypass denies", { skip }, async () => {
+  const h = await setup({ hasUI: false });
+  try {
+    const file = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({
+      defaultMode: "guarded",
+      cycleOrder: ["guarded"],
+      modes: {
+        guarded: {
+          label: "Guarded",
+          color: "error",
+          sandbox: { enabled: false, writable: true },
+          permission: {
+            bash: { "*": "allow", "git status": "deny", "sudo*": "deny" },
+            path: { "*": "allow", "../secret*": "deny", "/etc/*": "deny" },
+          },
+        },
+      },
+    }));
+    await h.pi.emit("session_start", {}, h.ctx);
+    await h.perm("guarded");
+
+    for (const command of [
+      "PATH=./evil git status",
+      "PATH=./evil env sh -c 'sudo id'",
+      "DEST=../secret.txt printf safe",
+      "DEST=/etc/passwd printf safe",
+    ]) {
+      const blocked = await h.call("bash", { command });
+      assert.equal(blocked?.block, true, command);
+      assert.match(blocked?.reason ?? "", /blocked/, command);
+    }
+    assert.equal(h.ctx.prompts.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: command-prefix assignments block headless allow mode but YOLO bypasses safeguards", { skip }, async () => {
+  const headless = await setup({ hasUI: false });
+  try {
+    await useUnsandboxedAllowMode(headless);
+    for (const command of ["PATH=./evil:$PATH git status", "BASH_ENV=./evil bash -c ':'", "ONLY=literal"]) {
+      assert.equal((await headless.call("bash", { command }))?.block, true, command);
+    }
+  } finally {
+    headless.cleanup();
+  }
+
+  const yolo = await setup();
+  try {
+    await yolo.perm("yolo");
+    for (const command of ["PATH=./evil:$PATH git status", "BASH_ENV=./evil bash -c ':'", "ONLY=literal"]) {
+      assert.equal(await yolo.call("bash", { command }), undefined, command);
+    }
+    assert.equal(yolo.ctx.prompts.length, 0);
+  } finally {
+    yolo.cleanup();
+  }
+});
+
+test("bash: wrapped and initialization commands cannot bypass denies", { skip }, async () => {
+  const h = await setup({ hasUI: false });
+  try {
+    const file = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({
+      modes: {
+        default: {
+          permission: {
+            bash: {
+              "*": "allow",
+              "sudo*": "deny",
+              "rm*": "deny",
+              "bash --rcfile scripts/evil*": "deny",
+              "bash --init-file scripts/evil*": "deny",
+            },
+            path: { "*": "allow", "secret.txt": "deny" },
+          },
+        },
+      },
+    }));
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    for (const command of [
+      "env -u X bash -c 'sudo id'",
+      "env --unset X sudo id",
+      "stdbuf -o L sudo id",
+      "timeout 5s sudo id",
+      "xargs -I {} sudo id",
+      "fish -C 'sudo id' -c 'echo safe'",
+      "fish --init-command 'sudo id' -c 'echo safe'",
+      "fish -C'rm *' -c 'echo safe'",
+      "fish --init-command='rm *' -c 'echo safe'",
+      "fish --init-command-exit='rm *' -c 'echo safe'",
+      "fish --command='rm *'",
+      "bash --rcfile scripts/evil -ic 'echo safe'",
+      "bash --init-file scripts/evil -ic 'echo safe'",
+      "env -u X bash -c 'cat secret.txt'",
+    ]) {
+      const blocked = await h.call("bash", { command });
+      assert.equal(blocked?.block, true, command);
+      assert.match(blocked?.reason ?? "", /blocked/);
+    }
+    assert.equal(h.ctx.prompts.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: wrapped privilege escalation remains a one-shot safeguard", { skip }, async () => {
+  const h = await setup();
+  try {
+    await useUnsandboxedAskMode(h);
+    const file = path.join(h.agentDir, "permission-mode", "permission-mode.json");
+    const configured = JSON.parse(readFileSync(file, "utf-8"));
+    configured.modes["confirm-unsandboxed"].permissionGrants = [{ permission: "bash", pattern: "*" }];
+    writeFileSync(file, JSON.stringify(configured));
+    await h.pi.emit("session_start", {}, h.ctx);
+
+    const commands = [
+      "env -u X bash -c 'sudo id'",
+      "stdbuf -o L sudo id",
+      "timeout 5s sudo id",
+      "xargs -I {} sudo id",
+      "fish -C 'sudo id' -c 'echo safe'",
+    ];
+    h.ctx.answers.push(...commands.map(() => "Allow once"));
+    for (const command of commands) {
+      assert.equal(await h.call("bash", { command }), undefined);
+      const prompt = h.ctx.prompts.at(-1)!;
+      assert.match(prompt.title, /privilege escalation/);
+      assert.deepEqual(prompt.options, ["Allow once", "Deny"]);
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: parser ambiguity and deep wrappers safeguard unsandboxed allow policy", { skip }, async () => {
+  const h = await setup();
+  try {
+    await useUnsandboxedAllowMode(h);
+    const deepPrivilege = `${Array.from({ length: 12 }, () => "env").join(" ")} sudo id`;
+    let depthExhausted = "echo safe";
+    for (let depth = 0; depth < 5; depth++) {
+      depthExhausted = `bash -c '${depthExhausted.replaceAll("'", "'\\''")}'`;
+    }
+    h.ctx.answers.push("Allow once", "Allow once", "Allow once");
+
+    assert.equal(await h.call("bash", { command: "env -S 'sudo id'" }), undefined);
+    assert.match(h.ctx.prompts[0]?.title ?? "", /dynamically interpreted command/);
+    assert.deepEqual(h.ctx.prompts[0]?.options, ["Allow once", "Deny"]);
+
+    assert.equal(await h.call("bash", { command: deepPrivilege }), undefined);
+    assert.match(h.ctx.prompts[1]?.title ?? "", /privilege escalation/);
+    assert.deepEqual(h.ctx.prompts[1]?.options, ["Allow once", "Deny"]);
+
+    assert.equal(await h.call("bash", { command: depthExhausted }), undefined);
+    assert.match(h.ctx.prompts[2]?.title ?? "", /script could not be fully parsed/);
+    assert.deepEqual(h.ctx.prompts[2]?.options, ["Allow once", "Deny"]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: parser safeguards block unsandboxed allow policy without UI", { skip }, async () => {
+  const h = await setup({ hasUI: false });
+  try {
+    await useUnsandboxedAllowMode(h);
+    const deepPrivilege = `${Array.from({ length: 12 }, () => "env").join(" ")} sudo id`;
+    let depthExhausted = "echo safe";
+    for (let depth = 0; depth < 5; depth++) {
+      depthExhausted = `bash -c '${depthExhausted.replaceAll("'", "'\\''")}'`;
+    }
+    for (const command of ["env -S 'sudo id'", deepPrivilege, depthExhausted]) {
+      const blocked = await h.call("bash", { command });
+      assert.equal(blocked?.block, true, command);
+      assert.match(blocked?.reason ?? "", /requires approval|privilege escalation/, command);
+    }
+    assert.equal(h.ctx.prompts.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bash: dynamic commands fail closed without UI", { skip }, async () => {
+  const h = await setup({ hasUI: false });
+  try {
+    for (const command of ["$command --flag", `bash "$script"`, `env sh -c "$code"`]) {
+      const blocked = await h.call("bash", { command });
+      assert.equal(blocked?.block, true, command);
+    }
+    assert.equal(h.ctx.prompts.length, 0);
   } finally {
     h.cleanup();
   }
@@ -544,19 +1275,20 @@ test("bash: flattened global choices persist both narrow patterns", { skip }, as
   const h = await setup();
   try {
     await useUnsandboxedAskMode(h);
-    h.ctx.answers.push("Always allow: git fetch *", "Allow once");
+    h.ctx.answers.push("Remember globally: git fetch *", "Allow once");
     assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
     assert.deepEqual(h.ctx.prompts[0].options, [
       "Allow once",
       "Allow for session",
-      "Always allow: git fetch *",
-      "Always allow: git *",
+      "Remember globally: git fetch *",
+      "Remember globally: git *",
       "Deny",
     ]);
     const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
-    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch"], "allow");
-    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch *"], "allow");
-    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash.git, undefined);
+    assert.deepEqual(saved.modes["confirm-unsandboxed"].permissionGrants, [
+      { permission: "bash", pattern: "git fetch" },
+      { permission: "bash", pattern: "git fetch *" },
+    ]);
     assert.equal(await h.call("bash", { command: "git fetch-pack origin" }), undefined);
     assert.equal(h.ctx.prompts.length, 2);
   } finally {
@@ -581,16 +1313,30 @@ test("bash: multi-command persistence displays one flattened global scope", { sk
   const h = await setup();
   try {
     await useUnsandboxedAskMode(h);
-    h.ctx.answers.push("Always allow: git, npm");
+    h.ctx.answers.push("Remember globally: git *", "Remember globally: npm *");
     assert.equal(await h.call("bash", { command: "git status && npm test" }), undefined);
-    assert.deepEqual(h.ctx.prompts[0].options, ["Allow once", "Allow for session", "Always allow: git, npm", "Deny"]);
+    assert.deepEqual(h.ctx.prompts[0].options, [
+      "Allow once",
+      "Allow for session",
+      "Remember globally: git status *",
+      "Remember globally: git *",
+      "Deny",
+    ]);
+    assert.deepEqual(h.ctx.prompts[1].options, [
+      "Allow once",
+      "Allow for session",
+      "Remember globally: npm test *",
+      "Remember globally: npm *",
+      "Deny",
+    ]);
 
     const saved = JSON.parse(readFileSync(path.join(h.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
-    const bash = saved.modes["confirm-unsandboxed"].permission.bash;
-    assert.equal(bash.git, "allow");
-    assert.equal(bash["git *"], "allow");
-    assert.equal(bash.npm, "allow");
-    assert.equal(bash["npm *"], "allow");
+    assert.deepEqual(saved.modes["confirm-unsandboxed"].permissionGrants, [
+      { permission: "bash", pattern: "git" },
+      { permission: "bash", pattern: "git *" },
+      { permission: "bash", pattern: "npm" },
+      { permission: "bash", pattern: "npm *" },
+    ]);
   } finally {
     h.cleanup();
   }
@@ -600,21 +1346,23 @@ test("bash: flattened project/global choices persist a project subcommand scope"
   const h = await setup({ trusted: true });
   try {
     await useUnsandboxedAskMode(h);
-    h.ctx.answers.push("Always allow for project: git fetch *");
+    h.ctx.answers.push("Remember for this project: git fetch *");
     assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
     assert.deepEqual(h.ctx.prompts[0].options, [
       "Allow once",
       "Allow for session",
-      "Always allow for project: git fetch *",
-      "Always allow: git fetch *",
-      "Always allow for project: git *",
-      "Always allow: git *",
+      "Remember for this project: git fetch *",
+      "Remember globally: git fetch *",
+      "Remember for this project: git *",
+      "Remember globally: git *",
       "Deny",
     ]);
     const file = path.join(h.root, ".pi", "permission-mode.json");
     const saved = JSON.parse(readFileSync(file, "utf-8"));
-    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch"], "allow");
-    assert.equal(saved.modes["confirm-unsandboxed"].permission.bash["git fetch *"], "allow");
+    assert.deepEqual(saved.modes["confirm-unsandboxed"].permissionGrants, [
+      { permission: "bash", pattern: "git fetch" },
+      { permission: "bash", pattern: "git fetch *" },
+    ]);
 
     assert.equal(await h.call("bash", { command: "git fetch upstream" }), undefined);
     assert.equal(h.ctx.prompts.length, 1);
@@ -637,13 +1385,13 @@ test("bash: a trusted project ask offers only project persistence", { skip }, as
     writeFileSync(file, JSON.stringify({ modes: { "confirm-unsandboxed": { permission: { bash: { "git *": "ask" } } } } }));
     await h.pi.emit("session_start", {}, h.ctx);
 
-    h.ctx.answers.push("Always allow for project: git fetch *");
+    h.ctx.answers.push("Remember for this project: git fetch *");
     assert.equal(await h.call("bash", { command: "git fetch origin" }), undefined);
     assert.deepEqual(h.ctx.prompts[0].options, [
       "Allow once",
       "Allow for session",
-      "Always allow for project: git fetch *",
-      "Always allow for project: git *",
+      "Remember for this project: git fetch *",
+      "Remember for this project: git *",
       "Deny",
     ]);
   } finally {
@@ -697,7 +1445,7 @@ test("project grants notice is hidden in active agent children", { skip }, async
   }
 });
 
-test("bash: prompt details omit commands already allowed by policy", { skip }, async () => {
+test("bash: sandbox safeguard is separate from per-command policy asks", { skip }, async () => {
   const h = await setup();
   try {
     const dir = path.join(h.agentDir, "permission-mode");
@@ -708,39 +1456,31 @@ test("bash: prompt details omit commands already allowed by policy", { skip }, a
     );
     await h.pi.emit("session_start", {}, h.ctx);
 
-    h.ctx.answers.push("Allow once");
+    h.ctx.answers.push("Allow once", "Allow once", "Allow once");
     assert.equal(await h.call("bash", { command: "ls -la && echo okay && git status" }), undefined);
-    assert.equal(
-      h.ctx.prompts[0]?.title,
-      "Allow ls, git commands? (sandbox unavailable)\n\nCommands to allow: ls -la, git status",
-    );
+    assert.match(h.ctx.prompts[0]?.title ?? "", /sandbox unavailable/);
+    assert.deepEqual(h.ctx.prompts[0]?.options, ["Allow once", "Deny"]);
+    assert.match(h.ctx.prompts[1]?.title ?? "", /Commands to allow: ls -la/);
+    assert.match(h.ctx.prompts[2]?.title ?? "", /Commands to allow: git status/);
   } finally {
     h.cleanup();
   }
 });
 
-test("bash: prompts show every full command still missing a grant", { skip }, async () => {
+test("bash: parsed commands are granted independently", { skip }, async () => {
   const h = await setup();
   try {
-    h.ctx.answers.push("Allow for session");
+    await useUnsandboxedAskMode(h);
+    h.ctx.answers.push("Allow for session", "Allow for session");
     assert.equal(await h.call("bash", { command: 'ls -la && echo "---" && ls src' }), undefined);
-    // The suffix comes from the harness running without a sandbox.
-    assert.equal(
-      h.ctx.prompts[0]?.title,
-      "Allow ls, echo commands? (sandbox unavailable)\n\nCommands to allow: ls -la, echo ---, ls src",
-    );
+    assert.equal(h.ctx.prompts.length, 2);
+    assert.match(h.ctx.prompts[0]?.title ?? "", /Commands to allow: ls -la/);
+    assert.match(h.ctx.prompts[1]?.title ?? "", /Commands to allow: echo ---/);
 
-    // A repeated multi-command call is fully covered even in degraded mode.
+    // The option-only ls grant is the documented broad ls/ls-* pair, so it
+    // also covers the later ls entry in the same request.
     assert.equal(await h.call("bash", { command: 'ls -la && echo "---" && ls src' }), undefined);
-    assert.equal(h.ctx.prompts.length, 1);
-
-    // echo is already granted, so only the full commands that reopened the prompt appear.
-    h.ctx.answers.push("Allow for session");
-    assert.equal(await h.call("bash", { command: 'cd src && git remote -v && echo "---" && git status | head -20' }), undefined);
-    assert.equal(
-      h.ctx.prompts[1]?.title,
-      "Allow cd, git, head commands? (sandbox unavailable)\n\nCommands to allow: cd src, git remote -v, git status, head -20",
-    );
+    assert.equal(h.ctx.prompts.length, 2);
   } finally {
     h.cleanup();
   }
@@ -782,10 +1522,15 @@ test("yolo: never prompts, never blocks, protected paths bypassed", { skip }, as
     assert.match(h.ctx.status, /^YOLO$/);
     assert.equal(await h.call("bash", { command: "sudo rm -rf /" }), undefined);
     assert.equal(await h.call("bash", { command: "printf one\nprintf two" }), undefined);
+    assert.equal(await h.call("bash", { command: "env -S 'sudo id'" }), undefined);
     assert.equal(
       await h.call("bash", { command: "fish -i -c 'for f in *.ts; echo $f; end'" }),
       undefined,
       "an incomplete parse must not override YOLO's explicit allow policy",
+    );
+    assert.equal(
+      await h.call("bash", { command: `${Array.from({ length: 12 }, () => "env").join(" ")} sudo id` }),
+      undefined,
     );
     assert.equal(await h.call("edit", { path: ".env" }), undefined);
     assert.equal(await h.call("write", { path: ".git/config" }), undefined);
@@ -1154,6 +1899,63 @@ test("custom unsandboxed mode still honors bash ask", { skip }, async () => {
     assert.match(h.ctx.prompts[0]?.title ?? "", /will run unsandboxed/);
   } finally {
     h.cleanup();
+  }
+});
+
+test("sparse unsandboxed parser fallback asks with UI", { skip }, async () => {
+  const restoreParser = overrideBashParserForTesting(undefined);
+  const h = await setup();
+  try {
+    await useUnsandboxedSparseMode(h);
+    h.ctx.answers.push("Allow once", "Allow once");
+    assert.equal(await h.call("bash", { command: "printf safe" }), undefined);
+    assert.deepEqual(h.ctx.prompts[0]?.options, ["Allow once", "Deny"]);
+    assert.match(h.ctx.prompts[0]?.title ?? "", /parser unavailable/);
+    assert.deepEqual(h.ctx.prompts[1]?.options, ["Allow once", "Deny"]);
+  } finally {
+    h.cleanup();
+    restoreParser();
+  }
+});
+
+test("parser fallback approval cannot suppress a later parsed Bash ask", { skip }, async () => {
+  const restoreFallback = overrideBashParserForTesting(undefined);
+  const h = await setup();
+  try {
+    await useUnsandboxedAskMode(h);
+    h.ctx.answers.push("Allow once", "Allow once");
+    assert.equal(await h.call("bash", { command: "printf safe" }), undefined);
+    assert.deepEqual(h.ctx.prompts[0]?.options, ["Allow once", "Deny"]);
+    assert.deepEqual(h.ctx.prompts[1]?.options, ["Allow once", "Deny"]);
+
+    const restoreParsed = overrideBashParserForTesting({
+      parse: () => ({ commands: [{ name: "printf", args: ["safe"], isNested: false }], hasError: false }),
+    });
+    try {
+      h.ctx.answers.push("Deny");
+      const blocked = await h.call("bash", { command: "printf safe" });
+      assert.equal(blocked?.block, true);
+      assert.ok(h.ctx.prompts[2]?.options.includes("Allow for session"));
+    } finally {
+      restoreParsed();
+    }
+  } finally {
+    h.cleanup();
+    restoreFallback();
+  }
+});
+
+test("sparse unsandboxed parser fallback fails closed without UI", { skip }, async () => {
+  const restoreParser = overrideBashParserForTesting(undefined);
+  const h = await setup({ hasUI: false });
+  try {
+    await useUnsandboxedSparseMode(h);
+    const blocked = await h.call("bash", { command: "printf safe" });
+    assert.equal(blocked?.block, true);
+    assert.equal(h.ctx.prompts.length, 0);
+  } finally {
+    h.cleanup();
+    restoreParser();
   }
 });
 

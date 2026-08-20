@@ -1,36 +1,33 @@
-/**
- * Session-scoped approvals — "Allow for session" memory.
- *
- * When an `ask` is granted "for session", the (mode, surface, target) is
- * remembered so the same action isn't re-prompted for the rest of the session.
- * The store is keyed per-mode (switching Build → Default → Build restores
- * Default's grants), session-lifetime only (never persisted to disk), and
- * cleared on session shutdown.
- *
- * The store is pure and unit-tested; `askWithSession` is the thin UI glue (a
- * three-way Allow once / Allow for session / Deny prompt).
- */
+/** Session-scoped approvals and prompt primitives. */
 
-import type { FileScope, Surface } from "./schema.ts";
+import type { PermissionGrant, Surface } from "./schema.ts";
+import { permissionGrantIdentity } from "./permission-requirements.ts";
 import { matchPattern } from "./resolve.ts";
-import { scopeMatches } from "./file-approval.ts";
 
 export class SessionApprovals {
   private store = new Map<string, Map<Surface, Set<string>>>();
-  private fileScopes = new Map<string, Map<Surface, FileScope[]>>();
+  private grantsByMode = new Map<string, PermissionGrant[]>();
 
   has(mode: string, surface: Surface, target: string): boolean {
-    const values = this.store.get(mode)?.get(surface);
-    if (!values) return false;
-    return surface === "bash" ? [...values].some((pattern) => matchPattern(pattern, target)) : values.has(target);
+    if (surface === "bash") {
+      return this.grantsByMode.get(mode)?.some(
+        (grant) => grant.permission === "bash" && matchPattern(grant.pattern, target, { expandTarget: true }),
+      ) ?? false;
+    }
+    return this.store.get(mode)?.get(surface)?.has(target) ?? false;
   }
 
-  hasScope(mode: string, surface: Surface, target: string, cwd?: string): boolean {
-    const scopes = this.fileScopes.get(mode)?.get(surface);
-    return scopes?.some((scope) => scopeMatches(scope, target, cwd)) ?? false;
+  grants(mode: string): PermissionGrant[] {
+    return (this.grantsByMode.get(mode) ?? []).map((grant) =>
+      grant.permission === "bash" ? { ...grant } : { permission: grant.permission, scope: { ...grant.scope } },
+    );
   }
 
   remember(mode: string, surface: Surface, target: string): void {
+    if (surface === "bash") {
+      this.rememberGrant(mode, { permission: "bash", pattern: target });
+      return;
+    }
     let bySurface = this.store.get(mode);
     if (!bySurface) {
       bySurface = new Map();
@@ -44,32 +41,27 @@ export class SessionApprovals {
     set.add(target);
   }
 
-  rememberScope(mode: string, surface: Surface, scope: FileScope): void {
-    let bySurface = this.fileScopes.get(mode);
-    if (!bySurface) {
-      bySurface = new Map();
-      this.fileScopes.set(mode, bySurface);
+  rememberGrant(mode: string, grant: PermissionGrant): void {
+    const grants = this.grantsByMode.get(mode) ?? [];
+    const identity = permissionGrantIdentity(grant);
+    if (!grants.some((entry) => permissionGrantIdentity(entry) === identity)) {
+      grants.push(grant.permission === "bash" ? { ...grant } : { permission: grant.permission, scope: { ...grant.scope } });
     }
-    let scopes = bySurface.get(surface);
-    if (!scopes) {
-      scopes = [];
-      bySurface.set(surface, scopes);
-    }
-    if (!scopes.some((entry) => entry.kind === scope.kind && entry.value === scope.value)) scopes.push({ ...scope });
+    this.grantsByMode.set(mode, grants);
   }
 
   clearMode(mode: string): void {
     this.store.delete(mode);
-    this.fileScopes.delete(mode);
+    this.grantsByMode.delete(mode);
   }
 
   clearAll(): void {
     this.store.clear();
-    this.fileScopes.clear();
+    this.grantsByMode.clear();
   }
 }
 
-/** Minimal UI surface needed by `askWithSession` (a subset of ctx.ui + hasUI). */
+/** Minimal UI surface needed by `askWithSession`. */
 export interface ApprovalUI {
   hasUI: boolean;
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -95,21 +87,7 @@ export async function askApproval(
   return "deny";
 }
 
-/**
- * Prompt for approval, honoring prior "Allow for session" grants. Returns true
- * to allow, false to deny. With no UI, denies (most-restrictive).
- *
- * `target` may be a single key or a list (e.g. every command name extracted
- * from a bash chain). The prompt is skipped only when EVERY target is already
- * granted — so "allow git this session" never silently covers
- * `git status && curl ... | sh`. Granting for session (or forever) remembers
- * ALL targets, so re-running the exact same approved chain passes silently.
- * An empty list never auto-allows.
- *
- * When `onForever` is provided, a fourth "Allow forever" option appears; choosing
- * it records the session grant AND invokes `onForever` (which persists the rule
- * to the user's config). Used for first-seen extension tools / skills.
- */
+/** Prompt for a surface approval while honoring the legacy untyped session store. */
 export async function askWithSession(
   ui: ApprovalUI,
   approvals: SessionApprovals,
@@ -119,20 +97,19 @@ export async function askWithSession(
   title: string,
   onForever?: () => void | Promise<void>,
 ): Promise<boolean> {
-  if (!ui.hasUI) return false; // no way to confirm → deny
+  if (!ui.hasUI) return false;
   const targets = Array.isArray(target) ? target : [target];
-  // Already granted this session — every target must be covered.
-  if (targets.length > 0 && targets.every((t) => approvals.has(mode, surface, t))) return true;
+  if (targets.length > 0 && targets.every((value) => approvals.has(mode, surface, value))) return true;
 
   const options = onForever ? [ALLOW_ONCE, ALLOW_SESSION, ALLOW_FOREVER, DENY] : [ALLOW_ONCE, ALLOW_SESSION, DENY];
   const choice = await askApproval(ui, title, options);
   if (choice === "forever-global") {
-    for (const t of targets) approvals.remember(mode, surface, t); // cover the rest of this session immediately
+    for (const value of targets) approvals.remember(mode, surface, value);
     await onForever?.();
     return true;
   }
   if (choice === "session") {
-    for (const t of targets) approvals.remember(mode, surface, t);
+    for (const value of targets) approvals.remember(mode, surface, value);
     return true;
   }
   return choice === "once";

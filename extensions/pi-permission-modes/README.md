@@ -214,25 +214,40 @@ forever") and apply instantly — no sandbox restart.
 ### Session approvals
 
 For ordinary prompts, the choices remain **Allow once / Allow for session / Deny**.
-Outside-project file prompts show **Allow this request once**, **Allow scope for
-session**, optional project/global memory choices, and **Deny**. `[edit]` (or `e`/
-Tab) opens the scope editor. Escape from custom input returns to the selector;
-Escape from the selector returns to the outer prompt without changing the
-committed scope; Escape from the outer prompt denies the request.
+Bash safeguards for outside/privileged execution, unavailable containment,
+unparsed or dynamically interpreted commands, and parser fallback are independent
+one-shot confirmations (**Allow once / Deny**). A remembered Bash grant can satisfy
+only the separate Bash-policy ask; it never suppresses a safeguard. Dynamic command
+heads, `eval`, sourced or file-backed shell scripts, and shell command strings produced
+by expansion have no inspectable command identity and cannot be remembered.
+Outside-project file prompts show **Allow this request once**, **Allow
+scope for session**, optional project/global memory choices, and **Deny**. `[edit]`
+(or `e`/Tab) opens the scope editor. Escape from custom input returns to the
+selector; Escape from the selector returns to the outer prompt without changing
+the committed scope; Escape from the outer prompt denies the request.
 
-Typed file grants are operation-specific (`read`, `write`, `edit`, `grep`, `find`,
-or `ls`). Exact scopes keep literal `*` and `?` characters literal; glob scopes
-use this extension's recursive matcher. `outsideFileGrants` are **ask-only**
-remembered grants: they may turn an effective `ask` into `allow`, but never
-override an effective `deny` or the protected-write backstop. Dismissing a
-prompt, or failing to write a selected persistent grant, denies the request.
-Clear session grants with `/perm clear-approvals`.
+Remembered approvals use one typed `permissionGrants` list. A path grant names
+`path`, `external_directory`, `read`, `write`, `edit`, `grep`, `find`, or `ls`
+plus an exact, tree, or glob scope. A Bash grant names a command pattern. Grants
+are ask-only: they satisfy a matching `ask`, never override `deny`, and never
+cross permission identities. Direct file calls prompt independently for boundary
+and operation requirements. Dismissing a prompt, or failing to write a selected
+persistent grant, denies the current requirement. Clear session grants with
+`/perm clear-approvals`.
 
-Bash keeps its existing choices and semantics. Persistent bash choices are shown
-directly in the main prompt. **Always allow: PATTERN** saves globally; **Always
-allow for project: PATTERN** saves to a trusted project. Narrow and broad scopes
-appear as different patterns in those labels. The legacy ordered `permission`
-maps remain last-match-wins, including rules written by `/perm allow`.
+File-tool paths follow Pi's execution semantics: `~` is expanded, but `$HOME/...`
+is passed literally because Pi does not invoke a shell for file paths. Permission
+patterns may still use `$HOME` as a configured alias; that alias is expanded on
+the pattern side only, so a literal `$HOME` directory cannot be mistaken for the
+home directory. Pi read's filename fallbacks (including decomposed Unicode and
+curly-quote variants) are authorized against the candidate it will actually open.
+After approval, the tool input is rewritten to that selected canonical candidate,
+so a fallback or symlink spelling is not resolved again for execution.
+
+Bash path-policy asks are one-shot confirmations. Bash-surface asks offer the
+narrow and broad command patterns and save paired Bash grants together. These
+remembered grants are separate from explicit policy rules; `/perm allow` continues
+to write full-authority ordered `permission` maps.
 
 Use `/perm init -p` to scaffold a project file, or
 `/perm allow [-p|-g] [surface] <pattern>` to write an allow rule. Flags follow
@@ -322,6 +337,14 @@ list: `.git/`, `node_modules/`, `.vscode/`, `.idea/`, `.env`/`.env.*`, and commo
 dotfiles (`.bashrc`, `.zshrc`, `.profile`, `.gitconfig`, `.npmrc`, …).
 This matters most in Build, where file tools aren't OS-sandboxed.
 
+For direct `edit`/`write`, the extension re-resolves the frozen authorized target
+immediately before returning the canonical path to Pi and blocks if an absent
+component or ancestor changed into a symlink. A small TOCTOU window remains
+after that hook check because Pi subsequently performs its own path-based tool
+execution. This extension is not a complete security boundary against a hostile
+local process that can mutate the same filesystem; use OS-level isolation for
+that threat model.
+
 ---
 
 ## Configuration
@@ -335,9 +358,8 @@ Modes are data, layered in this order:
    redefine built-in modes, add your own, and set `defaultMode` / `cycleOrder`.
    (Stable location, independent of where `pi install` placed the extension.)
 3. `<project>/.pi/permission-mode.json`: trusted projects append permission maps
-   after global maps and union `allowWrite` and `allowedDomains`. They may also
-   store `outsideFileGrants`, which are loaded only when the project is trusted.
-   Duplicate permission keys move to the end. Untrusted projects use a
+   after global maps, load `permissionGrants`, and union `allowWrite` and
+   `allowedDomains`. Duplicate permission keys move to the end. Untrusted projects use a
    most-restrictive permission overlay and tighten every sandbox field; their
    remembered grants are ignored. In either case, `denyRead`, `denyWrite`, denied domains, `writable`, and
    `askOnBlockedHost` remain tighten-only; projects cannot change defaults, cycle
@@ -349,6 +371,10 @@ The `.pi/permission-mode.json` file alone is not a pi trust-triggering resource.
 In a cloned repository with no other `.pi` resource, its grants may therefore
 apply without a trust prompt. Session start reports the accepted project grant
 count so this limitation is visible.
+
+`outsideFileGrants` is obsolete. It is warned about and ignored on load, is not
+migrated, and is removed only from a mode when a new `permissionGrants` write
+successfully rewrites that mode. This is a breaking configuration change.
 
 ### Shape
 
@@ -382,9 +408,11 @@ count so this limitation is visible.
         "tool": "allow",                            // any non-builtin/extension tool, by name
         "skill": "allow"                            // skills, by name
       },
-      "outsideFileGrants": {                         // ask-only; typed per file surface
-        "read": [{ "kind": "glob", "value": "/tmp/*" }]
-      },
+      "permissionGrants": [                          // satisfy matching asks only
+        { "permission": "external_directory", "scope": { "kind": "tree", "value": "/tmp" } },
+        { "permission": "bash", "pattern": "git fetch *" },
+        { "permission": "bash", "pattern": "git fetch" }
+      ],
       "hideTools": []                               // tools removed from the model in this mode
     }
   }
@@ -397,20 +425,16 @@ characters incl. `/`**, `?` matches one, `~`/`$HOME` expand, **the last matching
 pattern wins** (put `"*"` first as the default), and across the `path` /
 `external_directory` / per-surface layers the **most restrictive wins**.
 
-`outsideFileGrants` uses `{ "kind": "exact" | "tree" | "glob", "value": "…" }`
-entries. Exact entries are literal even when their value contains `*` or `?`.
-Tree entries contain a canonical literal directory (the UI displays it as
-`<directory>/*`) and use canonical containment, so wildcard characters in a
-directory name are never interpreted as pattern syntax. Glob entries use the
-recursive matcher and are bound to the canonical static prefix when created.
-Stored absolute values are fixed targets: reloads do not re-resolve their
-symlinks, while runtime matching canonicalizes the requested target against that
-stored value. Grants are consulted only after normal policy resolution returns `ask`, and
-never loosen a deny. The prompt refuses empty, malformed, control-character,
-overlong, or root-wide patterns. Global grants are suppressed when project
-policy tightens the target; project grants require a trusted project. Relative
-paths are resolved against the current project cwd, while the original request
-is retained for display.
+`permissionGrants` path entries use `{ "permission": "…", "scope": { "kind": "exact" | "tree" | "glob", "value": "…" } }`.
+Exact scopes keep wildcard characters literal. Tree scopes contain a canonical
+literal directory and use canonical containment; glob scopes use the recursive
+matcher and are bound to the canonical static prefix when created. Bash entries
+use `{ "permission": "bash", "pattern": "…" }`; paired narrow and broad patterns
+are stored together. Grants are consulted only after policy resolves to `ask` and
+never loosen a deny. Malformed, unsafe, control-character, overlong, or root-wide
+grants are rejected. Project grants require a trusted project, and each grant is
+scoped to the active mode. All direct-file path, boundary, and operation asks are
+independent.
 
 ### Defining your own mode
 

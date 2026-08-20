@@ -7,7 +7,7 @@
  *   2. <agentDir>/permission-mode/permission-mode.json (global) — FULL authority:
  *      may add modes, redefine built-ins, and change defaultMode / cycleOrder.
  *   3. <cwd>/.pi/permission-mode.json (project) — trusted projects may append
- *      permission rules, typed outside-file grants, and additive sandbox entries;
+ *      permission rules, typed permission grants, and additive sandbox entries;
  *      untrusted projects are a most-restrictive overlay and their grants are
  *      ignored. Project configs cannot add modes or change defaults.
  *
@@ -23,18 +23,19 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import { isRootWidePattern, isValidStoredScope } from "./file-approval.ts";
+import { isValidStoredScope } from "./file-approval.ts";
+import { deduplicatePermissionGrants } from "./permission-requirements.ts";
 import { sandboxMountPath } from "./paths.ts";
 import {
   type Action,
-  type FileScope,
-  type FileSurface,
   type ModeDef,
+  type PermissionGrant,
+  type PathGrantPermission,
   type PermissionModeConfig,
   type SandboxProfile,
   type SurfaceValue,
   type Surface,
-  OUTSIDE_FILE_SURFACES,
+  PATH_GRANT_PERMISSIONS,
   SURFACES,
 } from "./schema.ts";
 
@@ -205,48 +206,46 @@ function cleanPermission(raw: unknown, where: string, onError: OnError): Partial
   return out;
 }
 
-function cleanOutsideFileGrants(
-  raw: unknown,
-  where: string,
-  onError: OnError,
-): Partial<Record<FileSurface, FileScope[]>> {
-  const out: Partial<Record<FileSurface, FileScope[]>> = {};
-  if (raw === undefined) return out;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    onError(`permission-mode: invalid outsideFileGrants in ${where}; dropping`);
-    return out;
+const MAX_BASH_PATTERN_LENGTH = 4096;
+
+function validBashGrantPattern(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_BASH_PATTERN_LENGTH) return false;
+  return ![...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 0x1f || code === 0x7f || (code >= 0x80 && code <= 0x9f);
+  });
+}
+
+function cleanPermissionGrants(raw: unknown, where: string, onError: OnError): PermissionGrant[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    onError(`permission-mode: invalid permissionGrants in ${where}; dropping`);
+    return [];
   }
-  for (const [surfaceName, entries] of Object.entries(raw as Record<string, unknown>)) {
-    if (!OUTSIDE_FILE_SURFACES.includes(surfaceName as FileSurface)) {
-      onError(`permission-mode: ignoring unknown outside-file surface "${surfaceName}" in ${where}`);
+  const accepted: PermissionGrant[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      onError(`permission-mode: dropping malformed permissionGrants entry in ${where}`);
       continue;
     }
-    if (!Array.isArray(entries)) {
-      onError(`permission-mode: invalid outsideFileGrants.${surfaceName} in ${where}; dropping`);
+    const candidate = entry as Record<string, unknown>;
+    if (candidate.permission === "bash" && Object.keys(candidate).every((key) => key === "permission" || key === "pattern") && validBashGrantPattern(candidate.pattern)) {
+      accepted.push({ permission: "bash", pattern: candidate.pattern });
       continue;
     }
-    const surface = surfaceName as FileSurface;
-    const accepted: FileScope[] = [];
-    const seen = new Set<string>();
-    for (const entry of entries) {
-      if (!isValidStoredScope(entry)) {
-        onError(`permission-mode: dropping malformed or unbound outsideFileGrants.${surfaceName} entry in ${where}`);
-        continue;
-      }
-      if (entry.kind === "glob" && isRootWidePattern(entry.value)) {
-        onError(`permission-mode: dropping root-wide outsideFileGrants.${surfaceName} pattern "${entry.value}" in ${where}`);
-        continue;
-      }
-      // Stored scopes were bound when approved or persisted. Re-resolving them
-      // here would let a later symlink change retarget an existing grant.
-      const key = `${entry.kind}:${entry.value}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      accepted.push({ ...entry });
+    if (
+      typeof candidate.permission === "string" &&
+      Object.keys(candidate).every((key) => key === "permission" || key === "scope") &&
+      PATH_GRANT_PERMISSIONS.includes(candidate.permission as PathGrantPermission) &&
+      isValidStoredScope(candidate.scope)
+    ) {
+      const permission = candidate.permission as PathGrantPermission;
+      accepted.push({ permission, scope: { ...candidate.scope } });
+      continue;
     }
-    if (accepted.length > 0) out[surface] = accepted;
+    onError(`permission-mode: dropping malformed permissionGrants entry in ${where}`);
   }
-  return out;
+  return deduplicatePermissionGrants(accepted);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +260,7 @@ function mergeMode(base: ModeDef, over: Partial<ModeDef>): ModeDef {
     // Surface-level shallow merge: an override replaces a whole surface's value.
     permission: { ...base.permission, ...(over.permission ?? {}) },
     hideTools: over.hideTools ?? base.hideTools,
-    outsideFileGrants: over.outsideFileGrants ?? base.outsideFileGrants,
+    permissionGrants: over.permissionGrants ?? base.permissionGrants,
   };
 }
 
@@ -269,9 +268,16 @@ function mergeGlobal(base: PermissionModeConfig, over: Partial<PermissionModeCon
   const modes: Record<string, ModeDef> = { ...base.modes };
   for (const [name, raw] of Object.entries(over.modes ?? {})) {
     const m = raw as Partial<ModeDef>;
+    delete (m as Record<string, unknown>).projectOverlay;
+    delete (m as Record<string, unknown>).trustedProjectPermission;
+    delete (m as Record<string, unknown>).trustedProjectPermissionGrants;
     if (m.permission) m.permission = cleanPermission(m.permission, `global mode "${name}"`, onError) as ModeDef["permission"];
-    if ("outsideFileGrants" in m && m.outsideFileGrants !== undefined) {
-      m.outsideFileGrants = cleanOutsideFileGrants(m.outsideFileGrants, `global mode "${name}"`, onError);
+    if ("outsideFileGrants" in m) {
+      onError(`permission-mode: outsideFileGrants in global mode "${name}" is obsolete; ignoring`);
+      delete (m as Record<string, unknown>).outsideFileGrants;
+    }
+    if ("permissionGrants" in m && m.permissionGrants !== undefined) {
+      m.permissionGrants = cleanPermissionGrants(m.permissionGrants, `global mode "${name}"`, onError);
     }
     const existing = modes[name];
     if (existing) {
@@ -374,15 +380,18 @@ function applyProject(
         base.sandbox = next;
       } else base.sandbox = tightenSandbox(base.sandbox, pm.sandbox, onError);
     }
-    if (pm.outsideFileGrants !== undefined) {
+    if ("outsideFileGrants" in pm) {
+      onError(`permission-mode: outsideFileGrants in project mode "${name}" is obsolete; ignoring`);
+    }
+    if (pm.permissionGrants !== undefined) {
       if (projectTrusted) {
-        base.trustedProjectOutsideFileGrants = cleanOutsideFileGrants(
-          pm.outsideFileGrants,
+        base.trustedProjectPermissionGrants = cleanPermissionGrants(
+          pm.permissionGrants,
           `trusted project mode "${name}"`,
           onError,
         );
       } else {
-        onError(`permission-mode: ignoring outsideFileGrants for untrusted project mode "${name}"`);
+        onError(`permission-mode: ignoring permissionGrants for untrusted project mode "${name}"`);
       }
     }
     if (pm.permission) {
@@ -463,8 +472,12 @@ export function projectGrantCount(cwd: string, agentDir?: string): number {
         if (value === "allow") count++;
         else if (value && typeof value === "object") count += Object.values(value).filter((action) => action === "allow").length;
       }
-      const grants = cleanOutsideFileGrants((mode as Partial<ModeDef>).outsideFileGrants, `project mode "${name}"`, noop);
-      for (const scopes of Object.values(grants)) count += scopes?.length ?? 0;
+      const grants = cleanPermissionGrants(
+        (mode as Partial<ModeDef>).permissionGrants,
+        `project mode "${name}"`,
+        noop,
+      );
+      count += grants.length;
     }
     return count;
   } catch {
@@ -607,13 +620,33 @@ function readMutableJson(file: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function persistOutsideFileGrantInto(file: string, modeName: string, surface: FileSurface, scope: FileScope): string {
-  // The prompt already bound this value before approval. Resolving it again here
-  // would make a symlink swap between approval and persistence retarget the grant.
-  const bound = isValidStoredScope(scope) ? { ...scope } : undefined;
-  if (!bound || (bound.kind === "glob" && isRootWidePattern(bound.value))) {
-    throw new Error("cannot persist invalid, unbound, or root-wide outside-file scope");
+function validatePermissionGrant(grant: PermissionGrant): PermissionGrant {
+  if (!grant || typeof grant !== "object") throw new Error("cannot persist malformed permission grant");
+  if (grant.permission === "bash") {
+    if (Object.keys(grant).some((key) => key !== "permission" && key !== "pattern") || !validBashGrantPattern(grant.pattern)) {
+      throw new Error("cannot persist malformed Bash permission grant");
+    }
+    return { permission: "bash", pattern: grant.pattern };
   }
+  if (
+    Object.keys(grant).some((key) => key !== "permission" && key !== "scope") ||
+    !PATH_GRANT_PERMISSIONS.includes(grant.permission) ||
+    !isValidStoredScope(grant.scope)
+  ) {
+    throw new Error("cannot persist malformed or unbound path permission grant");
+  }
+  return { permission: grant.permission, scope: { ...grant.scope } };
+}
+
+function strictExistingPermissionGrants(raw: unknown, file: string, modeName: string): PermissionGrant[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new Error(`cannot update malformed config ${file}: ${modeName}.permissionGrants must be an array`);
+  return deduplicatePermissionGrants(raw.map((grant) => validatePermissionGrant(grant as PermissionGrant)));
+}
+
+function persistPermissionGrantsInto(file: string, modeName: string, grants: PermissionGrant[]): string {
+  const validated = deduplicatePermissionGrants(grants.map(validatePermissionGrant));
+  if (validated.length === 0) throw new Error("cannot persist an empty permission grant batch");
   const data = readMutableJson(file);
   const modesValue = data.modes;
   if (modesValue !== undefined && (!modesValue || typeof modesValue !== "object" || Array.isArray(modesValue))) {
@@ -625,24 +658,22 @@ function persistOutsideFileGrantInto(file: string, modeName: string, surface: Fi
     throw new Error(`cannot update malformed config ${file}: mode must be an object`);
   }
   const mode = (modes[modeName] ??= {}) as Record<string, unknown>;
-  const grantsValue = mode.outsideFileGrants;
-  if (grantsValue !== undefined && (!grantsValue || typeof grantsValue !== "object" || Array.isArray(grantsValue))) {
-    throw new Error(`cannot update malformed config ${file}: outsideFileGrants must be an object`);
-  }
-  const grants = (mode.outsideFileGrants ??= {}) as Record<string, unknown>;
-  const existing = cleanOutsideFileGrants(grants, `existing ${file}`, noop)[surface] ?? [];
-  if (!existing.some((entry) => entry.kind === bound.kind && entry.value === bound.value)) existing.push({ ...bound });
-  grants[surface] = existing;
+  const existing = strictExistingPermissionGrants(mode.permissionGrants, file, modeName);
+  const merged = deduplicatePermissionGrants([...existing, ...validated]);
+  mode.permissionGrants = merged;
+  // Old grants are deliberately inert on load and disappear only when this
+  // mode is successfully rewritten.
+  delete mode.outsideFileGrants;
   writeJsonAtomically(file, data);
   return file;
 }
 
-/** Persist a deny-safe typed outside-file grant in the global configuration. */
-export function persistOutsideFileGrant(agentDir: string, modeName: string, surface: FileSurface, scope: FileScope): string {
-  return persistOutsideFileGrantInto(globalConfigFile(agentDir), modeName, surface, scope);
+/** Persist a same-destination batch of generic grants globally. */
+export function persistPermissionGrants(agentDir: string, modeName: string, grants: PermissionGrant[]): string {
+  return persistPermissionGrantsInto(globalConfigFile(agentDir), modeName, grants);
 }
 
-/** Persist a deny-safe typed outside-file grant in a trusted project configuration. */
-export function persistProjectOutsideFileGrant(cwd: string, modeName: string, surface: FileSurface, scope: FileScope): string {
-  return persistOutsideFileGrantInto(path.join(cwd, CONFIG_DIR_NAME, "permission-mode.json"), modeName, surface, scope);
+/** Persist a same-destination batch of generic grants in a trusted project. */
+export function persistProjectPermissionGrants(cwd: string, modeName: string, grants: PermissionGrant[]): string {
+  return persistPermissionGrantsInto(path.join(cwd, CONFIG_DIR_NAME, "permission-mode.json"), modeName, grants);
 }

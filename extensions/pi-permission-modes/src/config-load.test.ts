@@ -11,8 +11,8 @@ import {
   loadStockDefaults,
   persistModeDomains,
   persistModeRule,
-  persistOutsideFileGrant,
-  persistProjectOutsideFileGrant,
+  persistPermissionGrants,
+  persistProjectPermissionGrants,
   persistProjectRule,
   profileToConfig,
   projectGrantCount,
@@ -410,112 +410,106 @@ test("trusted project sandbox additions warn once and preserve tighten-only fiel
   s.cleanup();
 });
 
-test("typed outside-file grants round-trip globally and for trusted projects", () => {
+test("permission grants round-trip globally and for trusted projects", () => {
   const s = sandbox();
-  const globalFile = persistOutsideFileGrant(s.agentDir, "default", "read", { kind: "glob", value: "/tmp/*" });
-  const projectFile = persistProjectOutsideFileGrant(s.cwd, "default", "write", { kind: "exact", value: "/tmp/out" });
+  const globalFile = persistPermissionGrants(s.agentDir, "default", [
+    { permission: "read", scope: { kind: "glob", value: "/tmp/*" } },
+  ]);
+  const projectFile = persistProjectPermissionGrants(s.cwd, "default", [
+    { permission: "write", scope: { kind: "exact", value: "/tmp/out" } },
+  ]);
   assert.ok(existsSync(globalFile) && existsSync(projectFile));
   const trusted = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
-  assert.deepEqual(trusted.modes.default.outsideFileGrants?.read, [{ kind: "glob", value: "/tmp/*" }]);
-  assert.deepEqual(trusted.modes.default.trustedProjectOutsideFileGrants?.write, [{ kind: "exact", value: "/tmp/out" }]);
+  assert.deepEqual(trusted.modes.default.permissionGrants, [{ permission: "read", scope: { kind: "glob", value: "/tmp/*" } }]);
+  assert.deepEqual(trusted.modes.default.trustedProjectPermissionGrants, [
+    { permission: "write", scope: { kind: "exact", value: "/tmp/out" } },
+  ]);
   assert.equal(projectGrantCount(s.cwd, s.agentDir), 1);
   const untrusted = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), false);
-  assert.equal(untrusted.modes.default.trustedProjectOutsideFileGrants, undefined);
-  assert.ok(s.errors.some((error) => /untrusted project mode/.test(error)));
+  assert.equal(untrusted.modes.default.trustedProjectPermissionGrants, undefined);
+  assert.ok(s.errors.some((error) => /ignoring permissionGrants for untrusted/.test(error)));
   s.cleanup();
 });
 
-test("stored outside-file grants stay bound when a target is later replaced by a symlink", () => {
+test("permission grants preserve canonical bindings when a target is replaced by a symlink", () => {
   const s = sandbox();
   const fixedTarget = path.join(s.cwd, "fixed.txt");
   const replacementTarget = path.join(s.cwd, "replacement.txt");
-  const laterTarget = path.join(s.cwd, "later.txt");
   writeFileSync(fixedTarget, "fixed");
   writeFileSync(replacementTarget, "replacement");
-  writeFileSync(laterTarget, "later");
   const bound = canonicalizeScope({ kind: "exact", value: fixedTarget }, s.cwd);
   assert.deepEqual(bound, { kind: "exact", value: fixedTarget });
-  persistOutsideFileGrant(s.agentDir, "default", "read", bound!);
+  persistPermissionGrants(s.agentDir, "default", [{ permission: "read", scope: bound! }]);
 
   rmSync(fixedTarget);
   symlinkSync(replacementTarget, fixedTarget);
-
-  const reloaded = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.deepEqual(reloaded.modes.default.outsideFileGrants?.read, [{ kind: "exact", value: fixedTarget }]);
-  assert.notEqual(reloaded.modes.default.outsideFileGrants?.read?.[0]?.value, replacementTarget);
-
-  // The approval bound `fixedTarget` before the replacement. Persistence must
-  // not resolve that value again and turn it into the replacement target.
-  persistOutsideFileGrant(s.agentDir, "default", "read", bound!);
-  persistOutsideFileGrant(s.agentDir, "default", "read", { kind: "exact", value: laterTarget });
-  const saved = JSON.parse(readFileSync(path.join(s.agentDir, "permission-mode", "permission-mode.json"), "utf-8"));
-  assert.deepEqual(saved.modes.default.outsideFileGrants.read, [
-    { kind: "exact", value: fixedTarget },
-    { kind: "exact", value: laterTarget },
-  ]);
+  const reloaded = loadModeConfig(s.cwd, s.agentDir, () => {});
+  assert.deepEqual(reloaded.modes.default.permissionGrants, [{ permission: "read", scope: bound }]);
   s.cleanup();
 });
 
-test("outside-file loader drops malformed, universal, and duplicate grants safely", () => {
+test("obsolete outside-file grants are warned about and inert", () => {
   const s = sandbox({
-    global: {
-      modes: {
-        default: {
-          outsideFileGrants: {
-            read: [
-              { kind: "glob", value: "/tmp/*" },
-              { kind: "glob", value: "/tmp/*" },
-              { kind: "glob", value: "/*" },
-              { kind: "glob", value: "/?*" },
-              { kind: "glob", value: "/*?" },
-              { kind: "glob", value: "?*" },
-              { kind: "glob", value: "/tmp/../?*" },
-              { kind: "glob", value: "*" },
-              { kind: "bad", value: "/tmp/x" },
-              { kind: "exact", value: "/tmp/literal*" },
-              { kind: "tree", value: "/tmp/literal*" },
-              { kind: "glob", value: "relative/*" },
-              { kind: "exact", value: "\u0000" },
-            ],
-          },
-        },
-      },
-    },
+    global: { modes: { default: { outsideFileGrants: { read: [{ kind: "glob", value: "/tmp/*" }] } } } },
+    project: { modes: { default: { outsideFileGrants: { write: [{ kind: "exact", value: "/tmp/out" }] } } } },
   });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.deepEqual(c.modes.default.outsideFileGrants?.read, [
-    { kind: "glob", value: "/tmp/*" },
-    { kind: "exact", value: "/tmp/literal*" },
-    { kind: "tree", value: "/tmp/literal*" },
-  ]);
-  assert.ok(s.errors.some((error) => /malformed|root-wide/.test(error)));
+  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
+  assert.equal(c.modes.default.permissionGrants, undefined);
+  assert.equal(c.modes.default.trustedProjectPermissionGrants, undefined);
+  assert.ok(s.errors.filter((error) => /outsideFileGrants.*obsolete/.test(error)).length >= 2);
   s.cleanup();
 });
 
-test("typed grant persistence preserves schema and unrelated mode policy, and refuses malformed JSON", () => {
+test("generic grant persistence is atomic, deduplicated, and removes stale grants only when touched", () => {
   const s = sandbox({
     global: {
       $schema: "./custom-schema.json",
-      modes: { default: { permission: { bash: { "git *": "deny" } } } },
+      modes: {
+        default: {
+          permission: { bash: { "git *": "deny" } },
+          outsideFileGrants: { read: [{ kind: "exact", value: "/tmp/old" }] },
+        },
+        build: { outsideFileGrants: { read: [{ kind: "exact", value: "/tmp/keep" }] } },
+      },
     },
   });
   const file = path.join(s.agentDir, "permission-mode", "permission-mode.json");
-  assert.equal(persistOutsideFileGrant(s.agentDir, "default", "read", { kind: "exact", value: "/tmp/file" }), file);
+  const grant = { permission: "read" as const, scope: { kind: "exact" as const, value: "/tmp/file" } };
+  assert.equal(persistPermissionGrants(s.agentDir, "default", [grant, grant]), file);
   const saved = JSON.parse(readFileSync(file, "utf-8"));
   assert.equal(saved.$schema, "./custom-schema.json");
   assert.deepEqual(saved.modes.default.permission.bash, { "git *": "deny" });
-  assert.deepEqual(saved.modes.default.outsideFileGrants.read, [{ kind: "exact", value: "/tmp/file" }]);
+  assert.deepEqual(saved.modes.default.permissionGrants, [grant]);
+  assert.equal(saved.modes.default.outsideFileGrants, undefined);
+  assert.deepEqual(saved.modes.build.outsideFileGrants.read, [{ kind: "exact", value: "/tmp/keep" }]);
   for (const value of ["/?*", "/*?", "?*", "/tmp/../?*"]) {
     assert.throws(
-      () => persistOutsideFileGrant(s.agentDir, "default", "read", { kind: "glob", value }),
-      /invalid|root-wide/,
+      () => persistPermissionGrants(s.agentDir, "default", [{ permission: "read", scope: { kind: "glob", value } }]),
+      /malformed|root-wide/,
     );
   }
-  writeFileSync(file, "{ malformed");
+  const malformedGrantFile = JSON.stringify({
+    modes: {
+      default: {
+        permissionGrants: [
+          { permission: "read", scope: { kind: "exact", value: "/tmp/existing" }, unexpected: true },
+        ],
+      },
+    },
+  });
+  writeFileSync(file, malformedGrantFile);
+  assert.throws(() => persistPermissionGrants(s.agentDir, "default", [grant]), /malformed/);
+  assert.equal(readFileSync(file, "utf-8"), malformedGrantFile, "a malformed touched mode must remain untouched");
   assert.throws(
-    () => persistOutsideFileGrant(s.agentDir, "default", "read", { kind: "glob", value: "/tmp/*" }),
-    /malformed config/,
+    () => persistPermissionGrants(s.agentDir, "default", [
+      { permission: "read", scope: { kind: "exact", value: "/tmp/new" }, unexpected: true } as never,
+    ]),
+    /malformed/,
   );
+  assert.equal(readFileSync(file, "utf-8"), malformedGrantFile);
+
+  writeFileSync(file, "{ malformed");
+  assert.throws(() => persistPermissionGrants(s.agentDir, "default", [grant]), /malformed config/);
   assert.equal(readFileSync(file, "utf-8"), "{ malformed");
   s.cleanup();
 });

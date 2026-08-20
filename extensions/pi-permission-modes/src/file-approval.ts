@@ -13,8 +13,8 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { expandHome, matchPattern } from "./resolve.ts";
-import { canonicalizePath } from "./paths.ts";
-import type { FileScope } from "./schema.ts";
+import { canonicalizePath, normalizePiTarget } from "./paths.ts";
+import type { FileScope, PathGrantPermission } from "./schema.ts";
 
 export type { FileScope } from "./schema.ts";
 
@@ -26,8 +26,13 @@ export interface OutsideFilePromptResult {
 }
 
 export interface OutsideFilePromptRequest {
-  toolName: string;
+  /** Kept as a compatibility label for callers that do not provide permission. */
+  toolName?: string;
+  /** The exact permission being approved. */
+  permission?: PathGrantPermission;
   requested: string;
+  /** Canonical execution target selected before any approval interaction. */
+  canonicalTarget?: string;
   /** The cwd against which model-supplied relative paths are resolved. */
   cwd?: string;
   projectEligible: boolean;
@@ -213,13 +218,11 @@ function scopeShape(scope: unknown): scope is FileScope {
   );
 }
 
-function targetForComparison(target: string, cwd?: string): string {
-  if (cwd === undefined && !path.isAbsolute(target)) return normalizedPath(target);
-  return canonicalizePath(expandHome(target), cwd);
+function targetForComparison(target: string, cwd?: string, alreadyCanonical = false): string {
+  return alreadyCanonical ? path.normalize(target) : normalizePiTarget(target, cwd ?? process.cwd()).canonicalTarget;
 }
 
-function boundScopeValue(scope: FileScope, cwd?: string): string {
-  if (cwd === undefined && !path.isAbsolute(scope.value)) return normalizedPath(scope.value);
+function boundScopeValue(scope: FileScope): string {
   return normalizedPath(scope.value);
 }
 
@@ -229,10 +232,10 @@ function containsPath(parent: string, child: string): boolean {
 }
 
 /** Match a typed scope without allowing a failed matcher to become an allow. */
-export function scopeMatches(scope: FileScope, target: string, cwd?: string): boolean {
+export function scopeMatches(scope: FileScope, target: string, cwd?: string, targetIsCanonical = false): boolean {
   if (!scopeShape(scope)) return false;
-  const targetValue = targetForComparison(target, cwd);
-  const scopeValue = boundScopeValue(scope, cwd);
+  const targetValue = targetForComparison(target, cwd, targetIsCanonical);
+  const scopeValue = boundScopeValue(scope);
   if (scope.kind === "exact") return scopeValue === targetValue;
   if (scope.kind === "tree") return containsPath(scopeValue, targetValue);
   try {
@@ -246,10 +249,15 @@ export function scopeKey(scope: FileScope): string {
   return `${scope.kind}:${scope.value}`;
 }
 
-function scopeDirectoryCandidates(requested: string, cwd?: string): Array<{ scope: FileScope; displayValue: string }> {
-  const expanded = expandHome(requested);
-  const source = cwd === undefined ? normalizedPath(expanded) : path.resolve(cwd, expanded);
-  const displaySource = normalizedPath(expanded);
+function scopeDirectoryCandidates(
+  requested: string,
+  cwd?: string,
+  canonicalTarget?: string,
+): Array<{ scope: FileScope; displayValue: string }> {
+  const target = cwd === undefined ? undefined : normalizePiTarget(requested, cwd);
+  const expanded = target ? undefined : expandHome(requested);
+  const source = canonicalTarget ?? target?.canonicalTarget ?? normalizedPath(expanded ?? "");
+  const displaySource = target?.displayTarget ?? normalizedPath(expanded ?? "");
   const targetIsDirectory = (() => {
     try {
       return fs.statSync(source).isDirectory();
@@ -264,7 +272,9 @@ function scopeDirectoryCandidates(requested: string, cwd?: string): Array<{ scop
 
   while (current && current !== root && current !== ".") {
     const displayValue = `${displayCurrent}${path.sep}*`;
-    const value = cwd === undefined ? normalizedPath(current) : canonicalizePath(current, cwd);
+    const value = cwd === undefined || canonicalTarget !== undefined
+      ? normalizedPath(current)
+      : canonicalizePath(current, cwd);
     if (value !== path.parse(value).root) result.push({ scope: { kind: "tree", value }, displayValue });
     const parent = path.dirname(current);
     if (parent === current) break;
@@ -279,16 +289,16 @@ export function ancestorScopes(requested: string, cwd?: string): FileScope[] {
   return scopeDirectoryCandidates(requested, cwd).map(({ scope }) => scope);
 }
 
-function requestPath(requested: string, cwd?: string): string {
-  return cwd === undefined ? requested : canonicalizePath(expandHome(requested), cwd);
+function requestPath(requested: string, cwd?: string, canonicalTarget?: string): string {
+  return canonicalTarget ?? normalizePiTarget(requested, cwd ?? process.cwd()).canonicalTarget;
 }
 
 /** Build selector choices while retaining a separate display form for each value. */
-export function scopeChoices(requested: string, cwd?: string): ScopeChoice[] {
-  const exact: FileScope = { kind: "exact", value: requestPath(requested, cwd) };
+export function scopeChoices(requested: string, cwd?: string, canonicalTarget?: string): ScopeChoice[] {
+  const exact: FileScope = { kind: "exact", value: requestPath(requested, cwd, canonicalTarget) };
   const seen = new Set<string>([scopeKey(exact)]);
   const choices: ScopeChoice[] = [{ scope: exact, label: "Exact", displayValue: requested }];
-  for (const candidate of scopeDirectoryCandidates(requested, cwd)) {
+  for (const candidate of scopeDirectoryCandidates(requested, cwd, canonicalTarget)) {
     if (seen.has(scopeKey(candidate.scope))) continue;
     seen.add(scopeKey(candidate.scope));
     const index = choices.length;
@@ -345,7 +355,12 @@ export function canonicalizeScope(scope: FileScope, cwd: string = process.cwd())
 }
 
 /** Validate a custom glob and require it to cover the original request. */
-export function validateCustomPattern(raw: string, requested: string, cwd?: string): ScopeValidation {
+export function validateCustomPattern(
+  raw: string,
+  requested: string,
+  cwd?: string,
+  canonicalTarget?: string,
+): ScopeValidation {
   const display = raw.trim();
   if (!display) return { ok: false, error: "Pattern cannot be empty." };
   if (display.length > MAX_SCOPE_LENGTH) return { ok: false, error: "Pattern is too long." };
@@ -354,8 +369,8 @@ export function validateCustomPattern(raw: string, requested: string, cwd?: stri
 
   const value = cwd === undefined ? display : canonicalizeGlobPattern(display, cwd);
   if (!value || isRootWidePattern(value)) return { ok: false, error: "Pattern cannot be safely bound to this path." };
-  const target = requestPath(requested, cwd);
-  if (!scopeMatches({ kind: "glob", value }, target, cwd)) {
+  const target = requestPath(requested, cwd, canonicalTarget);
+  if (!scopeMatches({ kind: "glob", value }, target, cwd, canonicalTarget !== undefined)) {
     return { ok: false, error: "Pattern does not match the requested path." };
   }
   return cwd === undefined ? { ok: true, value } : { ok: true, value, display };
@@ -427,10 +442,10 @@ export class OutsideFileApprovalComponent implements Component, Focusable {
     this.request = request;
     this.cwd = request.cwd ?? process.cwd();
     this.done = done;
-    this.scope = { kind: "exact", value: requestPath(request.requested, this.cwd) };
+    this.scope = { kind: "exact", value: requestPath(request.requested, this.cwd, request.canonicalTarget) };
     this.scopeDisplay = request.requested;
     this.draftScope = this.scope;
-    this.choices = scopeChoices(request.requested, this.cwd);
+    this.choices = scopeChoices(request.requested, this.cwd, request.canonicalTarget);
     this.selectorIndex = this.findChoice(this.scope);
     this.input = new Input();
     this.input.onEscape = () => this.backFromCustom();
@@ -545,7 +560,12 @@ export class OutsideFileApprovalComponent implements Component, Focusable {
   }
 
   private commitCustom(raw: string): void {
-    const validation = validateCustomPattern(raw, this.request.requested, this.cwd);
+    const validation = validateCustomPattern(
+      raw,
+      this.request.requested,
+      this.cwd,
+      this.request.canonicalTarget,
+    );
     if (!validation.ok || !validation.value) {
       this.customError = validation.error;
       this.refresh();
@@ -681,7 +701,7 @@ export class OutsideFileApprovalComponent implements Component, Focusable {
 
   private renderOuter(width: number): string[] {
     const lines = [
-      this.theme.fg("accent", `Outside project — allow ${sanitizeForDisplay(this.request.toolName)}?`),
+      this.theme.fg("accent", `Allow ${sanitizeForDisplay(permissionLabel(this.request))}?`),
       "",
       fit(`Requested: ${styledPath(this.theme, this.request.requested)}`, width),
       this.renderScopeLine(width),
@@ -751,6 +771,12 @@ function choiceLabel(choice: ScopeChoice): string {
   return choice.scope ? `${choice.label}: ${sanitizeForDisplay(choice.displayValue ?? choice.scope.value)}` : choice.label;
 }
 
+function permissionLabel(request: OutsideFilePromptRequest): string {
+  if (request.permission === "external_directory") return "external directory";
+  if (request.permission) return request.permission;
+  return request.toolName ?? "file";
+}
+
 /**
  * Prompt in TUI mode with the stateful component, or use the RPC select/input
  * primitives. Custom cancellation returns to the selector, selector
@@ -771,7 +797,7 @@ export async function promptOutsideFileApproval(
   request: OutsideFilePromptRequest,
 ): Promise<OutsideFilePromptResult> {
   const cwd = request.cwd ?? process.cwd();
-  const exact: FileScope = { kind: "exact", value: requestPath(request.requested, cwd) };
+  const exact: FileScope = { kind: "exact", value: requestPath(request.requested, cwd, request.canonicalTarget) };
   if (!ctx.hasUI) return { decision: "deny", scope: exact };
 
   if (ctx.mode === "tui") {
@@ -783,7 +809,7 @@ export async function promptOutsideFileApproval(
 
   let scope: FileScope = exact;
   let scopeDisplay = request.requested;
-  const choices = scopeChoices(request.requested, cwd);
+  const choices = scopeChoices(request.requested, cwd, request.canonicalTarget);
   const selectorOptions = choices.map(choiceLabel);
   const decisionOptions = [OUTSIDE_ALLOW_ONCE, OUTSIDE_ALLOW_SESSION];
   if (request.projectEligible) decisionOptions.push(OUTSIDE_REMEMBER_PROJECT);
@@ -794,7 +820,7 @@ export async function promptOutsideFileApproval(
   while (true) {
     if (view === "outer") {
       const choice = await ctx.ui.select(
-        `Outside project — allow ${sanitizeForDisplay(request.toolName)}?\n${displayScopeLines(request, scopeDisplay)}`,
+        `Allow ${sanitizeForDisplay(permissionLabel(request))}?\n${displayScopeLines(request, scopeDisplay)}`,
         [...decisionOptions.slice(0, 2), OUTSIDE_EDIT_SCOPE, ...decisionOptions.slice(2)],
       );
       if (choice === undefined || choice === OUTSIDE_DENY) return { decision: "deny", scope };
@@ -832,7 +858,7 @@ export async function promptOutsideFileApproval(
       view = "selector";
       continue;
     }
-    const validation = validateCustomPattern(value, request.requested, cwd);
+    const validation = validateCustomPattern(value, request.requested, cwd, request.canonicalTarget);
     if (!validation.ok || !validation.value) {
       ctx.ui.notify(validation.error ?? "Invalid pattern.", "warning");
       continue;

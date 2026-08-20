@@ -48,7 +48,6 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { CONFIG_DIR_NAME, createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { ALLOW_ONCE, ALLOW_SESSION, askWithSession, DENY, SessionApprovals } from "./approvals.ts";
 import { sandboxAwarenessPrompt } from "./awareness.ts";
 import { bashExecPlan, bashGate, bashPromptTitle, bashSubject } from "./bash-enforce.ts";
 import { analyzeBash } from "./bash-parse.ts";
@@ -58,21 +57,45 @@ import {
   loadStockDefaults,
   persistModeDomains,
   persistModeRule,
-  persistOutsideFileGrant,
-  persistProjectOutsideFileGrant,
+  persistPermissionGrants,
+  persistProjectPermissionGrants,
   persistProjectRule,
   projectGrantCount,
   stockDefaultsFile,
 } from "./config-load.ts";
 import type { PermState } from "./modes.ts";
 import { type NetAskResult, NetworkSession, isHostAllowed, normalizeDomain } from "./network.ts";
-import { isOutside, isProtectedWrite } from "./paths.ts";
-import { promptOutsideFileApproval, scopeMatches } from "./file-approval.ts";
-import { decide, decideBashCommand, mostRestrictive, resolveSurface } from "./resolve.ts";
+import {
+  canonicalizePath,
+  isCanonicalTargetOutside,
+  isProtectedNormalizedWrite,
+  normalizePiTarget,
+  resolvePiReadTarget,
+} from "./paths.ts";
+import { promptOutsideFileApproval } from "./file-approval.ts";
+import {
+  ALLOW_ONCE,
+  ALLOW_SESSION,
+  DENY,
+  SessionApprovals,
+  askWithSession,
+} from "./approvals.ts";
+import {
+  aggregateBashDecision,
+  decide,
+  decideBashCommand,
+  decideBashText,
+  resolvePolicySurface,
+} from "./resolve.ts";
+import {
+  buildCommandRequirement,
+  buildFileRequirements,
+  evaluateRequirements,
+} from "./permission-requirements.ts";
 import { SandboxController } from "./sandbox.ts";
 import {
-  type Action,
-  type FileSurface,
+  type PermissionGrant,
+  type PathGrantPermission,
   type ModeDef,
   PLAN_PROMPT_SENTINEL,
   type PermissionModeConfig,
@@ -93,6 +116,9 @@ const FILE_TOOL_SURFACE: Record<string, Surface> = {
   grep: "grep",
   find: "find",
 };
+
+/** Optional-path file tools use the current working directory when omitted. */
+const OPTIONAL_PATH_FILE_TOOLS = new Set(["grep", "find", "ls"]);
 
 /** Tools with a dedicated branch in the dispatcher (not gated via the `tool` surface). */
 const BUILTIN_HANDLED = new Set([
@@ -129,40 +155,18 @@ function bashRulePatterns(name: string, args: string[]): { narrow: string[]; bro
   return { narrow: [`${name} ${sub}`, `${name} ${sub} *`], broad, command };
 }
 
-function isPersistableBashAsk(
-  mode: ModeDef,
-  command: { name: string; args: string[]; command: string },
-  scope: "global" | "project",
-): boolean {
-  if (resolveSurface(mode.permission.bash, command.command) !== "ask") return false;
-  const targets = [command.command, command.name, ...command.args];
-  const otherActions = targets.map((target) => resolveSurface(mode.permission.path, target));
-  if (mode.projectOverlay) {
-    otherActions.push(resolveSurface(mode.projectOverlay.bash, command.command));
-    otherActions.push(...targets.map((target) => resolveSurface(mode.projectOverlay?.path, target)));
-  }
-  if (scope === "global" && mode.trustedProjectPermission) {
-    otherActions.push(resolveSurface(mode.trustedProjectPermission.bash, command.command));
-  }
-  return otherActions.every((action) => action === undefined || action === "allow");
-}
-
-function filePolicySurfaces(surface: Surface, outside: boolean): Surface[] {
-  const candidates: Surface[] = ["path"];
-  if (outside) candidates.push("external_directory");
-  candidates.push(surface);
-  return candidates;
-}
-
-function projectPolicyAllowsGlobalFileRule(mode: ModeDef, surface: Surface, target: string, outside: boolean): boolean {
-  return [mode.projectOverlay, mode.trustedProjectPermission].every(
-    (permission) =>
-      !permission ||
-      filePolicySurfaces(surface, outside).every((candidate) => {
-        const action = resolveSurface(permission[candidate], target);
-        return action === undefined || action === "allow";
-      }),
+function projectLayerAllowsGlobal(mode: ModeDef, surfaces: Surface[], targets: string | string[]): boolean {
+  return [mode.projectOverlay, mode.trustedProjectPermission].every((layer) =>
+    !layer || surfaces.every((surface) => {
+      const decision = resolvePolicySurface({ ...mode, permission: layer, projectOverlay: undefined }, surface, targets);
+      return decision.action === undefined || decision.action === "allow";
+    }),
   );
+}
+
+function bashGrantable(mode: ModeDef, command: string, scope: "global" | "project"): boolean {
+  if (scope === "project") return true;
+  return projectLayerAllowsGlobal(mode, ["bash"], command);
 }
 
 const isTrustedProject = (ctx: ExtensionContext): boolean =>
@@ -775,193 +779,305 @@ export default async function (pi: ExtensionAPI) {
     // tools surface as Record<string, unknown> anyway) and guard each field.
     const input = event.input as Record<string, unknown>;
     const inPath = typeof input.path === "string" ? input.path : undefined;
+    // Pi's grep/find/ls tools pass `path || "."` to resolveToCwd; required-path
+    // tools remain untouched when their schema input is absent or invalid.
+    const filePath = inPath ?? (OPTIONAL_PATH_FILE_TOOLS.has(toolName) ? "." : undefined);
+    // Direct file tools execute relative to the current session context. Keep
+    // normalization, boundary checks, and protected-write checks on that same
+    // cwd; `root` remains the startup cwd used by Bash and its sandbox routing.
+    const toolCwd = ctx.cwd;
+    const normalizedFileTarget = FILE_TOOL_SURFACE[toolName] && filePath !== undefined
+      ? normalizePiTarget(filePath, toolCwd)
+      : undefined;
 
     // Hard backstop: never write to protected paths (file tools aren't sandboxed),
-    // unless the mode explicitly trusts everything (YOLO). Matched lexically AND
-    // on the symlink-resolved canonical path, so a link can't smuggle the write.
-    if (!m.bypassProtectedPaths && (toolName === "edit" || toolName === "write") && inPath !== undefined) {
-      if (isProtectedWrite(root, inPath)) {
-        if (ctx.hasUI) ctx.ui.notify(`Blocked write to protected path: ${inPath}`, "warning");
-        return { block: true, reason: `Path "${inPath}" is protected` };
-      }
+    // unless the mode explicitly trusts everything (YOLO). This initial snapshot
+    // is bound to authorization and later revalidated immediately before Pi sees
+    // the rewritten path.
+    if (
+      !m.bypassProtectedPaths &&
+      (toolName === "edit" || toolName === "write") &&
+      inPath !== undefined &&
+      normalizedFileTarget &&
+      isProtectedNormalizedWrite(toolCwd, normalizedFileTarget)
+    ) {
+      if (ctx.hasUI) ctx.ui.notify(`Blocked write to protected path: ${inPath}`, "warning");
+      return { block: true, reason: `Path "${inPath}" is protected` };
     }
 
     // Bash.
     if (toolName === "bash") {
       const command = String(input.command ?? "");
-      // Real AST when available: judge each (possibly nested) command against the
-      // bash surface AND the cross-cutting path gate (joined string + each token,
-      // see decideBashCommand), most-restrictive across the chain; detect
-      // escapes/privilege.
       const analysis = await analyzeBash(command, root);
-      let action: Action;
-      if (analysis.commands.length > 0) {
-        action = analysis.commands
-          .map((c) => decideBashCommand(m, c.name, c.args) ?? "allow")
-          .reduce<Action>((a, b) => mostRestrictive(a, b) ?? "allow", "allow");
-      } else {
-        action = decide(m, "bash", command);
+      const entries = analysis.commands.length > 0
+        ? analysis.commands.map((candidate) => {
+            const patterns = bashRulePatterns(candidate.name, candidate.args);
+            const assignmentPrefix = candidate.assignments?.map((assignment) => assignment.source).join(" ");
+            return {
+              ...patterns,
+              displayCommand: [assignmentPrefix, patterns.command].filter(Boolean).join(" "),
+              name: candidate.name || "environment assignment",
+              args: candidate.args,
+              decision: decideBashCommand(
+                m,
+                candidate.name,
+                candidate.args,
+                candidate.assignments?.map((assignment) => assignment.value),
+              ),
+            };
+          })
+        : [{
+            ...bashRulePatterns(command, []),
+            displayCommand: command,
+            name: "bash",
+            args: [],
+            decision: decideBashText(m, command),
+          }];
+      const denied = entries.find((entry) => aggregateBashDecision(entry.decision) === "deny");
+      if (denied) return { block: true, reason: `bash command blocked by ${m.label}` };
+
+      const trusted = isTrustedProject(ctx);
+      const grants = (entry: (typeof entries)[number]): PermissionGrant[] => [
+        ...(bashGrantable(m, entry.command, "global") ? m.permissionGrants ?? [] : []),
+        ...(trusted ? m.trustedProjectPermissionGrants ?? [] : []),
+        ...approvals.grants(modeName),
+      ];
+      const hasBashGrant = (entry: (typeof entries)[number]): boolean => {
+        const requirement = buildCommandRequirement(entry.command, entry.decision.bashAction);
+        return requirement ? evaluateRequirements([requirement], grants(entry)).pending.length === 0 : true;
+      };
+
+      for (const entry of entries) {
+        if (entry.decision.pathAction !== "ask") continue;
+        if (!ctx.hasUI) return { block: true, reason: USER_DENIED_COMMAND_REASON };
+        const choice = await ctx.ui.select(`Path policy requires confirmation\n\nCommand: ${entry.displayCommand}`, [ALLOW_ONCE, DENY]);
+        if (choice !== ALLOW_ONCE) return { block: true, reason: USER_DENIED_COMMAND_REASON };
       }
-      // Confirm rather than trust an `allow` derived from an incomplete command
-      // list when containment is expected. An explicitly unsandboxed mode keeps
-      // its policy authoritative: in particular, YOLO must never prompt.
-      if (analysis.unparsed && m.sandbox.enabled) action = mostRestrictive(action, "ask") ?? "ask";
-      const extracted = analysis.commands.map((c) => ({ ...bashRulePatterns(c.name, c.args), name: c.name, args: c.args }));
-      const keyed = !analysis.unparsed && extracted.length > 0;
-      const policyAsks = keyed ? extracted.filter((c) => decideBashCommand(m, c.name, c.args) === "ask") : [];
-      const approvalTargets = policyAsks.length > 0 ? policyAsks : extracted;
-      const pending = keyed
-        ? approvalTargets.filter((c) => !approvals.has(modeName, "bash", c.command))
-        : [];
-      const sessionApproved = keyed ? pending.length === 0 : approvals.has(modeName, "bash", command);
-      if (sessionApproved && action === "ask") action = "allow";
-      if (action !== "deny" && sessionApproved) {
-        // Escape approvals must mark each new tool call so the replacement bash
-        // tool runs this invocation outside the sandbox without prompting again.
-        if (analysis.outsideReason) approvedUnsandboxed.add(event.toolCallId);
-        return undefined;
-      }
-      const gate = bashGate(
-        action,
-        analysis.outsideReason,
-        m.sandbox.enabled,
-        sandbox.ready,
-        bashSubject([...new Set(pending.map((c) => c.name))]),
+
+      const parserSafeguard = analysis.unparsed || analysis.usedFallback || analysis.dynamic;
+      const safeguardNeeded = !m.bypassProtectedPaths && Boolean(
+        analysis.outsideReason || parserSafeguard || (m.sandbox.enabled && !sandbox.ready),
       );
-      if (gate.kind === "block") return { block: true, reason: gate.reason };
-      if (gate.kind === "prompt") {
-        const baseTitle = analysis.unparsed ? `${gate.title} (script could not be fully parsed)` : gate.title;
-        const commandsToAllow = keyed ? pending.map((c) => c.command) : [command];
-        const title = bashPromptTitle(baseTitle, commandsToAllow);
-        const persistenceBase =
-          !analysis.unparsed &&
-          !analysis.outsideReason &&
-          (sandbox.ready || !m.sandbox.enabled) &&
-          policyAsks.length > 0;
-        const globalEligible = persistenceBase && policyAsks.every((c) => isPersistableBashAsk(m, c, "global"));
-        const projectEligible =
-          persistenceBase && isTrustedProject(ctx) && policyAsks.every((c) => isPersistableBashAsk(m, c, "project"));
-        const persistCommands = policyAsks;
-        const broadLabel = [...new Set(persistCommands.map((candidate) => candidate.name))].join(", ");
-        const broadPatterns = persistCommands.flatMap((candidate) => candidate.broad);
-        const persistentChoices: Array<{ label: string; project: boolean; patterns: string[] }> = [];
-        const addPersistentChoices = (commandLabel: string, patterns: string[]) => {
-          if (projectEligible) {
-            persistentChoices.push({ label: `Always allow for project: ${commandLabel}`, project: true, patterns });
-          }
-          if (globalEligible) persistentChoices.push({ label: `Always allow: ${commandLabel}`, project: false, patterns });
-        };
-        if (persistCommands.length === 1) {
-          addPersistentChoices(persistCommands[0].narrow[1], persistCommands[0].narrow);
-          if (persistCommands[0].broad[1] !== persistCommands[0].narrow[1]) {
-            addPersistentChoices(persistCommands[0].broad[1], persistCommands[0].broad);
-          }
-        } else if (persistCommands.length > 1) {
-          addPersistentChoices(broadLabel, broadPatterns);
+      if (safeguardNeeded) {
+        const subject = bashSubject([...new Set(entries.map((entry) => entry.name))]);
+        const baseGate = bashGate("allow", analysis.outsideReason, m.sandbox.enabled, sandbox.ready, subject);
+        const qualifier = analysis.unparsed
+          ? "script could not be fully parsed"
+          : analysis.usedFallback
+            ? "parser unavailable"
+            : analysis.dynamic
+              ? "dynamically interpreted command"
+              : undefined;
+        const title = baseGate.title || `Allow ${subject}?${analysis.outsideReason ? ` (${analysis.outsideReason})` : ""}`;
+        if (!ctx.hasUI) return { block: true, reason: baseGate.reason || "bash safeguard requires approval" };
+        const choice = await ctx.ui.select(
+          bashPromptTitle(qualifier ? `${title} (${qualifier})` : title, entries.map((entry) => entry.displayCommand)),
+          [ALLOW_ONCE, DENY],
+        );
+        if (choice !== ALLOW_ONCE) return { block: true, reason: USER_DENIED_COMMAND_REASON };
+        if (analysis.outsideReason) approvedUnsandboxed.add(event.toolCallId);
+      }
+
+      const grantable = !analysis.outsideReason && !analysis.unparsed && !analysis.usedFallback && !analysis.dynamic;
+      for (const entry of entries) {
+        if (entry.decision.bashAction !== "ask" || hasBashGrant(entry)) continue;
+        const gate = bashGate("ask", undefined, m.sandbox.enabled, true, bashSubject([entry.name]));
+        const patterns = bashRulePatterns(entry.name, entry.args);
+        if (!grantable) {
+          if (!ctx.hasUI) return { block: true, reason: gate.reason };
+          const choice = await ctx.ui.select(bashPromptTitle(gate.title, [entry.displayCommand]), [ALLOW_ONCE, DENY]);
+          if (choice !== ALLOW_ONCE) return { block: true, reason: USER_DENIED_COMMAND_REASON };
+          continue;
         }
 
-        if (!ctx.hasUI) return { block: true, reason: gate.reason };
-        const choice = await ctx.ui.select(title, [
-          ALLOW_ONCE,
-          ALLOW_SESSION,
-          ...persistentChoices.map((candidate) => candidate.label),
-          DENY,
-        ]);
-        if (choice === ALLOW_SESSION) {
-          for (const c of keyed ? approvalTargets : [{ command, narrow: [command], broad: [command] }]) {
-            const patterns = keyed ? c.narrow : [command];
-            for (const pattern of patterns) approvals.remember(modeName, "bash", pattern);
-          }
-        } else {
-          const selected = persistentChoices.find((candidate) => candidate.label === choice);
-          if (selected) {
-            try {
-              for (const pattern of [...new Set(selected.patterns)]) {
-                if (selected.project) persistProjectRule(ctx.cwd, modeName, "bash", pattern, "allow");
-                else persistModeRule(getAgentDir(), modeName, "bash", pattern, "allow");
-                approvals.remember(modeName, "bash", pattern);
-              }
-              config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
-            } catch (e) {
-              ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
-              return { block: true, reason: gate.reason };
-            }
-          } else if (choice !== ALLOW_ONCE) {
-            return { block: true, reason: USER_DENIED_COMMAND_REASON };
-          }
+        const projectEligible = trusted;
+        const globalEligible = bashGrantable(m, entry.command, "global");
+        const persistentChoices: Array<{ label: string; project: boolean; grants: PermissionGrant[] }> = [];
+        const addChoices = (pair: string[], project: boolean, prefix: string) => {
+          const candidateGrants = pair.map((pattern) => ({ permission: "bash" as const, pattern }));
+          const identity = `${project ? "project" : "global"}:${pair.join("\u0000")}`;
+          if (persistentChoices.some((candidate) => `${candidate.project ? "project" : "global"}:${candidate.grants.map((grant) => grant.permission === "bash" ? grant.pattern : "").join("\u0000")}` === identity)) return;
+          persistentChoices.push({ label: `${prefix}: ${pair[1] ?? pair[0]}`, project, grants: candidateGrants });
+        };
+        if (projectEligible) addChoices(patterns.narrow, true, "Remember for this project");
+        if (globalEligible) addChoices(patterns.narrow, false, "Remember globally");
+        if (patterns.broad.join("\u0000") !== patterns.narrow.join("\u0000")) {
+          if (projectEligible) addChoices(patterns.broad, true, "Remember for this project");
+          if (globalEligible) addChoices(patterns.broad, false, "Remember globally");
         }
-        if (gate.onApproveUnsandboxed) approvedUnsandboxed.add(event.toolCallId);
+        if (!ctx.hasUI) return { block: true, reason: gate.reason };
+        const choice = await ctx.ui.select(
+          bashPromptTitle(gate.title, [entry.displayCommand]),
+          [ALLOW_ONCE, ALLOW_SESSION, ...persistentChoices.map((candidate) => candidate.label), DENY],
+        );
+        if (choice === ALLOW_SESSION) {
+          for (const pattern of patterns.narrow) approvals.rememberGrant(modeName, { permission: "bash", pattern });
+          continue;
+        }
+        const selected = persistentChoices.find((candidate) => candidate.label === choice);
+        if (!selected) {
+          if (choice !== ALLOW_ONCE) return { block: true, reason: USER_DENIED_COMMAND_REASON };
+          continue;
+        }
+        try {
+          const file = selected.project
+            ? persistProjectPermissionGrants(ctx.cwd, modeName, selected.grants)
+            : persistPermissionGrants(getAgentDir(), modeName, selected.grants);
+          for (const grant of selected.grants) approvals.rememberGrant(modeName, grant);
+          config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), trusted);
+          ctx.ui.notify(`permission-mode: remembered Bash grant — saved to ${file}`, "info");
+        } catch (error) {
+          ctx.ui.notify(`permission-mode: could not save Bash grant: ${error}`, "error");
+          return { block: true, reason: gate.reason };
+        }
       }
       return undefined;
     }
 
     // File tools (read/edit/write/ls/grep/find).
     const surface = FILE_TOOL_SURFACE[toolName];
-    if (surface && inPath !== undefined) {
-      const path = inPath;
-      const outside = isOutside(root, path);
-      const action = decide(m, surface, path, { isOutside: outside });
-      if (action === "deny") {
-        // Friendly message for the Plan-mode "Markdown only" case (read-only mode).
+    if (surface && filePath !== undefined) {
+      const requestedTarget = normalizedFileTarget!;
+      const target = toolName === "read" ? resolvePiReadTarget(filePath, toolCwd) : requestedTarget;
+      const readFallbackUsed =
+        target.displayTarget !== requestedTarget.displayTarget || target.canonicalTarget !== requestedTarget.canonicalTarget;
+      const globalPolicyTargets = [
+        ...new Set([
+          requestedTarget.displayTarget,
+          requestedTarget.canonicalTarget,
+          target.displayTarget,
+          target.canonicalTarget,
+        ]),
+      ];
+      const outside = isCanonicalTargetOutside(toolCwd, target.canonicalTarget);
+      const requestedOutside = isCanonicalTargetOutside(toolCwd, requestedTarget.canonicalTarget);
+      const requirements = buildFileRequirements(
+        m,
+        surface as Exclude<PathGrantPermission, "path" | "external_directory">,
+        target,
+        outside,
+      );
+      const requestedRequirements = readFallbackUsed
+        ? buildFileRequirements(
+            m,
+            surface as Exclude<PathGrantPermission, "path" | "external_directory">,
+            requestedTarget,
+            requestedOutside,
+          )
+        : [];
+      const trusted = isTrustedProject(ctx);
+      // A fallback target is the one Pi will execute. Check the original
+      // spelling for denies too, but bind any resulting approval to the actual
+      // candidate so a grant cannot authorize a different path.
+      const requestedPolicy = readFallbackUsed
+        ? evaluateRequirements(requestedRequirements, [])
+        : { denied: [], pending: [] };
+      const denied = evaluateRequirements([...requirements, ...requestedRequirements], []).denied;
+      if (requestedPolicy.denied.length > 0 || denied.length > 0) {
         if ((surface === "edit" || surface === "write") && !m.sandbox.writable) {
-          if (ctx.hasUI) ctx.ui.notify(`${m.label} allows editing Markdown files only: ${path}`, "warning");
+          if (ctx.hasUI) ctx.ui.notify(`${m.label} allows editing Markdown files only: ${filePath}`, "warning");
           return { block: true, reason: `${m.label} allows editing Markdown files only` };
         }
-        return { block: true, reason: `Path "${path}" is blocked by ${m.label}` };
+        return { block: true, reason: `Path "${filePath}" is blocked by ${m.label}` };
       }
-      if (action === "ask") {
-        const reason = outside ? "Access outside project blocked" : "blocked";
-        if (!outside) {
-          const title = `Allow ${toolName}? (${path})`;
-          if (!(await promptAllow(ctx, surface, path, title))) return { block: true, reason };
-          return undefined;
+      const pendingPermissions = new Set<PathGrantPermission>(
+        requestedPolicy.pending.flatMap((pending) => pending.kind === "path" ? [pending.permission] : []),
+      );
+      const boundRequirements = requirements.map((requirement) =>
+        requirement.kind === "path"
+          ? {
+              ...requirement,
+              displayTarget: filePath,
+              ...(pendingPermissions.has(requirement.permission) ? { action: "ask" as const } : {}),
+            }
+          : requirement,
+      );
+      for (const permission of pendingPermissions) {
+        if (!boundRequirements.some((requirement) => requirement.kind === "path" && requirement.permission === permission)) {
+          boundRequirements.push({
+            kind: "path",
+            permission,
+            displayTarget: filePath,
+            canonicalTarget: target.canonicalTarget,
+            action: "ask",
+          });
         }
-
-        const fileSurface = surface as FileSurface;
-        const projectEligible = isTrustedProject(ctx);
-        const globalEligible = projectPolicyAllowsGlobalFileRule(m, surface, path, outside);
-        const projectScopes = projectEligible ? m.trustedProjectOutsideFileGrants?.[fileSurface] ?? [] : [];
-        const globalScopes = globalEligible ? m.outsideFileGrants?.[fileSurface] ?? [] : [];
-        if (
-          approvals.hasScope(modeName, fileSurface, path, ctx.cwd) ||
-          projectScopes.some((scope) => scopeMatches(scope, path, ctx.cwd)) ||
-          globalScopes.some((scope) => scopeMatches(scope, path, ctx.cwd))
-        ) {
-          return undefined;
-        }
-
-        const result = await promptOutsideFileApproval(ctx, {
+      }
+      const grantsFor = (permission: PathGrantPermission): PermissionGrant[] => {
+        const globalEligible = projectLayerAllowsGlobal(m, [permission], globalPolicyTargets);
+        return [
+          ...(globalEligible ? m.permissionGrants ?? [] : []),
+          ...(trusted ? m.trustedProjectPermissionGrants ?? [] : []),
+          ...approvals.grants(modeName),
+        ];
+      };
+      const pendingRequirements = boundRequirements.flatMap((requirement) => {
+        if (requirement.kind !== "path") return [];
+        return evaluateRequirements([requirement], grantsFor(requirement.permission)).pending;
+      });
+      for (const pending of pendingRequirements) {
+        if (pending.kind !== "path") continue;
+        const permission = pending.permission;
+        const projectEligible = trusted;
+        const globalEligible = projectLayerAllowsGlobal(m, [permission], globalPolicyTargets);
+        const prompt = await promptOutsideFileApproval(ctx, {
           toolName,
-          requested: path,
+          permission,
+          requested: pending.displayTarget,
+          canonicalTarget: pending.canonicalTarget,
           cwd: ctx.cwd,
           projectEligible,
           globalEligible,
         });
-        if (result.decision === "once") return undefined;
-        if (result.decision === "session") {
-          approvals.rememberScope(modeName, fileSurface, result.scope);
-          return undefined;
+        if (prompt.decision === "deny") return { block: true, reason: `Path "${filePath}" was not approved` };
+        if (prompt.decision === "once") continue;
+        const grant: PermissionGrant = { permission, scope: prompt.scope };
+        if (prompt.decision === "session") {
+          approvals.rememberGrant(modeName, grant);
+          continue;
         }
-        if (result.decision === "project" || result.decision === "global") {
-          try {
-            if (result.decision === "project") {
-              if (!projectEligible) return { block: true, reason };
-              persistProjectOutsideFileGrant(ctx.cwd, modeName, fileSurface, result.scope);
-            } else {
-              if (!globalEligible) return { block: true, reason };
-              persistOutsideFileGrant(getAgentDir(), modeName, fileSurface, result.scope);
-            }
-            config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
-            approvals.rememberScope(modeName, fileSurface, result.scope);
-            return undefined;
-          } catch (e) {
-            ctx.ui.notify(`permission-mode: could not save outside-file scope: ${e}`, "error");
-            return { block: true, reason };
+        try {
+          if (prompt.decision === "project") {
+            if (!projectEligible) return { block: true, reason: `Path "${filePath}" was not approved` };
+            persistProjectPermissionGrants(ctx.cwd, modeName, [grant]);
+          } else {
+            if (!globalEligible) return { block: true, reason: `Path "${filePath}" was not approved` };
+            persistPermissionGrants(getAgentDir(), modeName, [grant]);
           }
+          config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
+          approvals.rememberGrant(modeName, grant);
+        } catch (error) {
+          ctx.ui.notify(`permission-mode: could not save permission grant: ${error}`, "error");
+          return { block: true, reason: `Path "${filePath}" was not approved` };
         }
-        return { block: true, reason };
       }
-      return undefined; // allow
+      if (surface === "edit" || surface === "write") {
+        // Prompts and persistence can yield while an initially absent component
+        // is replaced by a symlink. Re-resolve the frozen absolute target itself,
+        // never the model's spelling, so a changed spelling cannot gain authority.
+        const finalCanonicalTarget = canonicalizePath(target.canonicalTarget);
+        const finalTarget = {
+          displayTarget: target.canonicalTarget,
+          canonicalTarget: finalCanonicalTarget,
+        };
+        const finalTargetProtected = isProtectedNormalizedWrite(toolCwd, finalTarget);
+        if (finalCanonicalTarget !== target.canonicalTarget) {
+          const message = `Blocked ${toolName}: authorized path changed before execution: ${target.canonicalTarget} now resolves to ${finalCanonicalTarget}`;
+          if (ctx.hasUI) ctx.ui.notify(message, "warning");
+          return { block: true, reason: `Path "${filePath}" changed after authorization; refusing ${toolName}` };
+        }
+        // Defense in depth on the final filesystem snapshot. The equality check
+        // above is intentionally separate: a changed target is never authorized,
+        // even when both old and new paths are otherwise permitted.
+        if (!m.bypassProtectedPaths && finalTargetProtected) {
+          if (ctx.hasUI) ctx.ui.notify(`Blocked write to protected path: ${target.canonicalTarget}`, "warning");
+          return { block: true, reason: `Path "${filePath}" is protected` };
+        }
+      }
+      // Pi documents tool-call input as mutable and executes this same object.
+      // Freeze execution to the canonical target that all approvals authorized.
+      input.path = target.canonicalTarget;
+      return undefined;
     }
 
     // web_search.

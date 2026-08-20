@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/wynainfo/pi-permission-modes/main/schemas/permission-mode.schema.json",
   "title": "permission-mode configuration",
-  "description": "Declarative permission modes for the pi coding agent. Global config has full authority. A trusted project config may add permission grants, typed outsideFileGrants, allowWrite paths, and allowedDomains. outsideFileGrants are ask-only and cannot override denies. Project writable, askOnBlockedHost, denyRead, denyWrite, and deniedDomains remain tighten-only. Project files cannot change sandbox.enabled, defaultMode, cycleOrder, or add modes. An untrusted project config is entirely tighten-only and its remembered grants are ignored.",
+  "description": "Declarative permission modes for the pi coding agent. Global config has full authority. A trusted project config may add permission grants, allowWrite paths, and allowedDomains. Permission grants satisfy only matching ask decisions and cannot override denies. Project writable, askOnBlockedHost, denyRead, denyWrite, and deniedDomains remain tighten-only. Project files cannot change sandbox.enabled, defaultMode, cycleOrder, or add modes. An untrusted project config is entirely tighten-only and its remembered grants are ignored.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -87,9 +87,32 @@
         "value": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "UI-created values are canonical absolute paths; exact and tree values never interpret wildcard characters" }
       }
     },
-    "fileGrantList": {
+    "permissionGrant": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["permission", "scope"],
+          "properties": {
+            "permission": { "enum": ["path", "external_directory", "read", "write", "edit", "grep", "find", "ls"] },
+            "scope": { "$ref": "#/$defs/fileScope" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["permission", "pattern"],
+          "properties": {
+            "permission": { "const": "bash" },
+            "pattern": { "type": "string", "minLength": 1, "maxLength": 4096 }
+          }
+        }
+      ],
+      "description": "A remembered grant satisfies only a matching ask and never overrides deny. File scopes are canonical absolute bindings."
+    },
+    "permissionGrantList": {
       "type": "array",
-      "items": { "$ref": "#/$defs/fileScope" }
+      "items": { "$ref": "#/$defs/permissionGrant" }
     },
     "mode": {
       "type": "object",
@@ -101,18 +124,9 @@
         "injectSandboxInfo": { "type": "boolean", "description": "Inject the mode's sandbox boundaries (writable paths, denied reads, network allowlist) into the system prompt each turn (default true). Modes with sandbox.enabled:false never inject." },
         "sandbox": { "$ref": "#/$defs/sandbox" },
         "permission": { "$ref": "#/$defs/permission" },
-        "outsideFileGrants": {
-          "type": "object",
-          "additionalProperties": false,
-          "description": "Deny-safe remembered outside-project file scopes. These grants apply only when the effective policy asks and never override a deny.",
-          "properties": {
-            "read": { "$ref": "#/$defs/fileGrantList" },
-            "write": { "$ref": "#/$defs/fileGrantList" },
-            "edit": { "$ref": "#/$defs/fileGrantList" },
-            "grep": { "$ref": "#/$defs/fileGrantList" },
-            "find": { "$ref": "#/$defs/fileGrantList" },
-            "ls": { "$ref": "#/$defs/fileGrantList" }
-          }
+        "permissionGrants": {
+          "$ref": "#/$defs/permissionGrantList",
+          "description": "Typed remembered grants. A grant satisfies only a matching ask and never overrides a configured deny."
         },
         "hideTools": { "type": "array", "items": { "type": "string" }, "description": "Tools hidden from the model in this mode." },
         "bypassProtectedPaths": { "type": "boolean", "description": "Skip the .git/.env/dotfile write backstop (only trusted modes)." }

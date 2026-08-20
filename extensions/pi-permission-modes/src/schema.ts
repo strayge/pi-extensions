@@ -21,7 +21,7 @@ export type PatternMap = Record<string, Action>;
 /** A surface value is either a shorthand action or a pattern-map. */
 export type SurfaceValue = Action | PatternMap;
 
-/** A remembered outside-project file scope.
+/** A remembered file scope.
  *
  * Tree values are literal directory paths. Their display form adds `/*`, but
  * the matcher uses canonical path containment rather than glob syntax.
@@ -31,10 +31,35 @@ export type FileScope =
   | { kind: "tree"; value: string }
   | { kind: "glob"; value: string };
 
-/** File-tool surfaces that may have typed outside-project grants. */
-export type FileSurface = "read" | "write" | "edit" | "grep" | "find" | "ls";
+/** File permissions that can be remembered independently. */
+export type PathGrantPermission =
+  | "path"
+  | "external_directory"
+  | "read"
+  | "write"
+  | "edit"
+  | "grep"
+  | "find"
+  | "ls";
 
-export const OUTSIDE_FILE_SURFACES: FileSurface[] = ["read", "write", "edit", "grep", "find", "ls"];
+/** A typed remembered approval. */
+export type PermissionGrant =
+  | { permission: PathGrantPermission; scope: FileScope }
+  | { permission: "bash"; pattern: string };
+
+/** File-tool surfaces (excluding the cross-cutting path gates). */
+export type FileSurface = Exclude<PathGrantPermission, "path" | "external_directory">;
+
+export const PATH_GRANT_PERMISSIONS: PathGrantPermission[] = [
+  "path",
+  "external_directory",
+  "read",
+  "write",
+  "edit",
+  "grep",
+  "find",
+  "ls",
+];
 
 /**
  * The gateable surfaces.
@@ -146,9 +171,9 @@ export interface ModeDef {
    */
   trustedProjectPermission?: Partial<Record<Surface, SurfaceValue>>;
   /** Deny-safe remembered grants from the global configuration. */
-  outsideFileGrants?: Partial<Record<FileSurface, FileScope[]>>;
+  permissionGrants?: PermissionGrant[];
   /** Deny-safe remembered grants from the trusted project configuration. */
-  trustedProjectOutsideFileGrants?: Partial<Record<FileSurface, FileScope[]>>;
+  trustedProjectPermissionGrants?: PermissionGrant[];
 }
 
 /** Top-level config: the mode registry plus cycle/default metadata. */

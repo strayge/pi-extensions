@@ -140,29 +140,16 @@ test("SessionApprovals: non-bash wildcard characters remain literal", () => {
   assert.equal(a.has("default", "tool", "builder"), false);
 });
 
-test("SessionApprovals: typed file globs recurse but stay scoped to mode and surface", () => {
+test("SessionApprovals: typed grants deduplicate and clear per mode", () => {
   const a = new SessionApprovals();
-  a.rememberScope("default", "read", { kind: "glob", value: "/tmp/*" });
-  assert.equal(a.hasScope("default", "read", "/tmp/a/deep/file"), true);
-  assert.equal(a.hasScope("default", "read", "/var/file"), false);
-  assert.equal(a.hasScope("default", "write", "/tmp/a/deep/file"), false);
-  assert.equal(a.hasScope("build", "read", "/tmp/a/deep/file"), false);
-});
-
-test("SessionApprovals: typed exact scopes keep wildcard-containing filenames literal", () => {
-  const a = new SessionApprovals();
-  a.rememberScope("default", "read", { kind: "exact", value: "/tmp/literal*?.txt" });
-  assert.equal(a.hasScope("default", "read", "/tmp/literal*?.txt"), true);
-  assert.equal(a.hasScope("default", "read", "/tmp/literal123.txt"), false);
-});
-
-test("SessionApprovals: clear operations remove typed scopes", () => {
-  const a = new SessionApprovals();
-  a.rememberScope("default", "read", { kind: "glob", value: "/tmp/*" });
-  a.rememberScope("build", "write", { kind: "exact", value: "/tmp/out" });
+  const readGrant = { permission: "read" as const, scope: { kind: "glob" as const, value: "/tmp/*" } };
+  a.rememberGrant("default", readGrant);
+  a.rememberGrant("default", readGrant);
+  a.rememberGrant("build", { permission: "write", scope: { kind: "exact", value: "/tmp/out" } });
+  assert.deepEqual(a.grants("default"), [readGrant]);
   a.clearMode("default");
-  assert.equal(a.hasScope("default", "read", "/tmp/a"), false);
-  assert.equal(a.hasScope("build", "write", "/tmp/out"), true);
+  assert.deepEqual(a.grants("default"), []);
+  assert.equal(a.grants("build").length, 1);
   a.clearAll();
-  assert.equal(a.hasScope("build", "write", "/tmp/out"), false);
+  assert.deepEqual(a.grants("build"), []);
 });

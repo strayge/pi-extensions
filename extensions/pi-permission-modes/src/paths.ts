@@ -11,9 +11,10 @@
  * only containment guard.
  */
 
-import { lstatSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { accessSync, constants, lstatSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Device pseudo-files that are "outside" the project but harmless to allow. */
 export const SAFE_OUTSIDE_RE = /^\/dev\/(null|zero|stdin|stdout|stderr|tty|urandom|random)$/;
@@ -54,6 +55,107 @@ export function canonicalizePath(p: string, cwd: string = process.cwd()): string
   }
 }
 
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+function normalizeWindowsShellPath(filePath: string): string {
+  if (!filePath.startsWith("/") || filePath.startsWith("//") || filePath.includes("\\")) return filePath;
+  const match = filePath.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+  if (!match) return filePath;
+  const suffix = match[2]?.replaceAll("/", "\\");
+  return `${match[1].toUpperCase()}:\\${suffix ?? ""}`;
+}
+
+/** Apply the same input normalization used by Pi's built-in file tools. */
+function normalizePiPathInput(raw: unknown): string {
+  let value = String(raw ?? "").replace(UNICODE_SPACES, " ");
+  if (value.startsWith("@")) value = value.slice(1);
+  if (process.platform === "win32") value = normalizeWindowsShellPath(value);
+  value = expandPathHome(value);
+  if (/^file:\/\//.test(value)) return fileURLToPath(value);
+  return value;
+}
+
+/** The two forms authorization needs to compare with policy and grants. */
+export interface NormalizedTarget {
+  /** Normalized user spelling after Pi-style marker and Pi's tilde expansion. */
+  displayTarget: string;
+  /** Absolute target with existing symlink components resolved. */
+  canonicalTarget: string;
+}
+
+/**
+ * Normalize a model path exactly once for authorization and execution. Pi's
+ * file tools normalize Unicode-space variants, strip an optional `@` marker,
+ * expand `~`, and convert local `file://` URLs without trimming ordinary
+ * whitespace; `$HOME` remains literal because Pi does not invoke a shell for
+ * file-tool paths; missing tails remain lexical.
+ */
+export function normalizePiTarget(raw: unknown, cwd: string = process.cwd()): NormalizedTarget {
+  const value = normalizePiPathInput(raw);
+  const displayTarget = path.normalize(value || ".");
+  const executionTarget = path.resolve(cwd, displayTarget);
+  return { displayTarget, canonicalTarget: canonicalizePath(executionTarget, cwd) };
+}
+
+/** Expand Pi-compatible tilde aliases without interpreting arbitrary variables. */
+export function expandPathHome(value: string, home: string = homedir()): string {
+  if (value === "~") return home;
+  if (value.startsWith("~/") || (process.platform === "win32" && value.startsWith("~\\"))) {
+    return path.join(home, value.slice(2));
+  }
+  return value;
+}
+
+function resolvePiExecutionPath(raw: unknown, cwd: string): string {
+  const value = normalizePiPathInput(raw);
+  return path.resolve(cwd, value || ".");
+}
+
+function macOSScreenshotCandidates(resolved: string): string[] {
+  const nfd = resolved.normalize("NFD");
+  const amPm = resolved.replace(/ (AM|PM)\./gi, "\u202F$1.");
+  const curly = resolved.replace(/'/g, "\u2019");
+  const nfdCurly = nfd.replace(/'/g, "\u2019");
+  return [...new Set([resolved, amPm, nfd, curly, nfdCurly])];
+}
+
+function fileExistsForPiRead(filePath: string): boolean {
+  try {
+    accessSync(filePath, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Return the same fallback spellings used by Pi's `resolveReadPathAsync`. */
+export function piReadPathCandidates(raw: unknown, cwd: string = process.cwd()): string[] {
+  return macOSScreenshotCandidates(resolvePiExecutionPath(raw, cwd));
+}
+
+/**
+ * Resolve the path that Pi's read tool will execute, including its macOS
+ * filename fallbacks. Authorization must bind to this target rather than an
+ * absent spelling, while the caller can separately retain the original target
+ * for deny-safe policy checks.
+ */
+export function resolvePiReadTarget(raw: unknown, cwd: string = process.cwd()): NormalizedTarget {
+  const requested = normalizePiTarget(raw, cwd);
+  const candidates = piReadPathCandidates(raw, cwd);
+  const executionPath = candidates.find(fileExistsForPiRead) ?? candidates[0];
+  const displayTarget = path.isAbsolute(requested.displayTarget)
+    ? executionPath
+    : path.relative(cwd, executionPath) || ".";
+  return normalizePiTarget(displayTarget, cwd);
+}
+
+/** Check containment of a frozen canonical target without resolving it again. */
+export function isCanonicalTargetOutside(root: string, canonicalTarget: string): boolean {
+  const realRoot = canonicalizePath(root);
+  const rel = path.relative(realRoot, canonicalTarget);
+  return rel.startsWith("..") || path.isAbsolute(rel);
+}
+
 /**
  * True when `p`, resolved against `root` (with symlinks followed), escapes the
  * project directory. Empty/undefined paths are treated as in-project (tools
@@ -61,10 +163,7 @@ export function canonicalizePath(p: string, cwd: string = process.cwd()): string
  */
 export function isOutside(root: string, p?: string): boolean {
   if (!p) return false;
-  const target = canonicalizePath(path.resolve(root, p));
-  const realRoot = canonicalizePath(root);
-  const rel = path.relative(realRoot, target);
-  return rel.startsWith("..") || path.isAbsolute(rel);
+  return isCanonicalTargetOutside(root, normalizePiTarget(p, root).canonicalTarget);
 }
 
 /** True when the path is a Markdown file (planning files allowed in Read mode). */
@@ -361,12 +460,9 @@ export function isProtectedPath(p: string): boolean {
 }
 
 /**
- * The protected-path backstop for `edit`/`write` targets: the raw path is
- * matched lexically (so a textual `.git/…` is blocked even before it exists),
- * AND its canonical form — resolved against `root` with symlinks followed — is
- * matched too, so an in-project symlink pointing at `.git`/a dotfile can't
- * smuggle a write past the backstop (file tools aren't OS-sandboxed; this
- * check is their only guard).
+ * Check both spellings of an already-normalized write target without resolving
+ * the model's original path again. Authorization and eventual execution can
+ * therefore share one canonical snapshot even if a symlink changes meanwhile.
  *
  * The canonical form is judged *project-relative* when it lands inside the
  * project: a project that itself lives under a directory named e.g.
@@ -375,11 +471,19 @@ export function isProtectedPath(p: string): boolean {
  * segment. Targets resolving outside the project are judged by their full
  * canonical path.
  */
-export function isProtectedWrite(root: string, p: string): boolean {
-  if (isProtectedPath(p)) return true;
-  const target = canonicalizePath(path.resolve(root, p));
+export function isProtectedNormalizedWrite(root: string, normalized: NormalizedTarget): boolean {
+  const lexicalRoot = path.resolve(root);
+  const lexicalTarget = path.resolve(root, normalized.displayTarget);
+  const lexicalRel = path.relative(lexicalRoot, lexicalTarget);
+  const lexicalInside = lexicalRel === "" || (!lexicalRel.startsWith("..") && !path.isAbsolute(lexicalRel));
+  if (isProtectedPath(lexicalInside ? lexicalRel : lexicalTarget)) return true;
   const realRoot = canonicalizePath(root);
-  const rel = path.relative(realRoot, target);
+  const rel = path.relative(realRoot, normalized.canonicalTarget);
   const inProject = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-  return isProtectedPath(inProject ? rel : target);
+  return isProtectedPath(inProject ? rel : normalized.canonicalTarget);
+}
+
+/** Normalize once and apply the protected-write backstop. */
+export function isProtectedWrite(root: string, p: string): boolean {
+  return isProtectedNormalizedWrite(root, normalizePiTarget(p, root));
 }

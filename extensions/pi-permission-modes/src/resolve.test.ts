@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import os from "node:os";
 import test from "node:test";
-import { decide, decideBashCommand, expandHome, matchPattern, mostRestrictive, resolveSurface } from "./resolve.ts";
+import { decide, decideBashCommand, decideBashText, expandHome, matchPattern, mostRestrictive, resolveSurface } from "./resolve.ts";
 import type { ModeDef } from "./schema.ts";
 
 test("matchPattern: * spans path separators, ? is one char", () => {
@@ -23,13 +23,22 @@ test("matchPattern: regex metacharacters in the pattern are literal", () => {
   assert.ok(!matchPattern("a.b+c", "aXbbbc")); // '.' and '+' must be literal
 });
 
-test("matchPattern: ~ and $HOME expand on both sides", () => {
+test("matchPattern expands configured home aliases and can preserve literal targets", () => {
   const home = os.homedir();
   assert.ok(matchPattern("~/.ssh/*", `${home}/.ssh/id_rsa`));
   assert.ok(matchPattern("$HOME/.aws", `${home}/.aws`));
+  assert.equal(matchPattern("$HOME/file", "$HOME/file"), false);
+  assert.equal(matchPattern("$HOME/file", "$HOME/file", { expandTarget: true }), true);
   assert.equal(expandHome("~"), home);
   assert.equal(expandHome("$HOME/x"), `${home}/x`);
   assert.equal(expandHome("/abs/path"), "/abs/path");
+});
+
+test("direct file policy does not expand a literal $HOME target", () => {
+  const home = os.homedir();
+  const m = mode({ read: { "*": "allow", "$HOME/*": "deny" } });
+  assert.equal(decide(m, "read", "$HOME/file"), "allow");
+  assert.equal(decide(m, "read", `${home}/file`), "deny");
 });
 
 test("resolveSurface: string shorthand, and last-match-wins in a pattern-map", () => {
@@ -85,29 +94,52 @@ test("decide: fallback applies when nothing matches", () => {
 
 test("decideBashCommand: path gate binds bash args, not just the joined string", () => {
   const m = mode({ path: { "*": "allow", "*.env": "deny" }, bash: { "*": "allow" } });
-  assert.equal(decideBashCommand(m, "cat", [".env"]), "deny");
+  assert.equal(decideBashCommand(m, "cat", [".env"]).pathAction, "deny");
   // The heuristic fallback only matched the whole command line, so a trailing
   // arg used to hide the target; per-token matching closes that.
-  assert.equal(decideBashCommand(m, "cat", [".env", "other.txt"]), "deny");
-  assert.equal(decideBashCommand(m, "cat", ["config/prod.env"]), "deny");
-  assert.equal(decideBashCommand(m, "ls", ["src"]), "allow");
+  assert.equal(decideBashCommand(m, "cat", [".env", "other.txt"]).pathAction, "deny");
+  assert.equal(decideBashCommand(m, "cat", ["config/prod.env"]).pathAction, "deny");
+  assert.equal(decideBashCommand(m, "ls", ["src"]).pathAction, "allow");
+});
+
+test("decideBashCommand: assignment values participate only in path policy", () => {
+  const m = mode({
+    bash: { "*": "allow", "git status": "deny" },
+    path: { "*": "allow", "../secret*": "deny" },
+  });
+  const decision = decideBashCommand(m, "git", ["status"], ["../secret.txt"]);
+  assert.equal(decision.bashAction, "deny", "the effective command still drives Bash policy");
+  assert.equal(decision.pathAction, "deny", "the assignment value cannot evade path policy");
 });
 
 test("decideBashCommand: bash surface matches the joined name+args string", () => {
   const m = mode({ bash: { "*": "allow", "git push*": "ask", "sudo*": "deny" } });
-  assert.equal(decideBashCommand(m, "git", ["push", "origin", "main"]), "ask");
-  assert.equal(decideBashCommand(m, "git", ["status"]), "allow");
-  assert.equal(decideBashCommand(m, "sudo", ["rm", "-rf", "/"]), "deny");
+  assert.equal(decideBashCommand(m, "git", ["push", "origin", "main"]).bashAction, "ask");
+  assert.equal(decideBashCommand(m, "git", ["status"]).bashAction, "allow");
+  assert.equal(decideBashCommand(m, "sudo", ["rm", "-rf", "/"]).bashAction, "deny");
+});
+
+test("decideBashCommand: Bash and path provenance remain independent", () => {
+  const m = mode({ bash: { "*": "ask" }, path: { "*": "allow", "*.env": "ask" } });
+  assert.deepEqual(decideBashCommand(m, "cat", [".env"]), { bashAction: "ask", pathAction: "ask" });
 });
 
 test("decideBashCommand: project overlay path rules tighten bash (most-restrictive)", () => {
   const m = mode({ path: { "*": "allow" }, bash: { "*": "allow" } });
   m.projectOverlay = { path: { "*secrets*": "deny" } };
-  assert.equal(decideBashCommand(m, "cat", ["config/secrets/key.pem"]), "deny");
-  assert.equal(decideBashCommand(m, "cat", ["README.md"]), "allow");
+  assert.equal(decideBashCommand(m, "cat", ["config/secrets/key.pem"]).pathAction, "deny");
+  assert.equal(decideBashCommand(m, "cat", ["README.md"]).pathAction, "allow");
 });
 
 test("decideBashCommand: undefined when no layer matches (caller picks default)", () => {
   const m = mode({});
-  assert.equal(decideBashCommand(m, "ls", []), undefined);
+  assert.deepEqual(decideBashCommand(m, "ls", []), { bashAction: undefined, pathAction: undefined });
+});
+
+test("decideBashText: unmatched fallback asks without changing parsed sparse commands", () => {
+  const m = mode({});
+  assert.deepEqual(decideBashText(m, "unmatched command"), { bashAction: "ask", pathAction: undefined });
+
+  const pathAllowed = mode({ path: { "*": "allow" } });
+  assert.deepEqual(decideBashText(pathAllowed, "unmatched command"), { bashAction: undefined, pathAction: "allow" });
 });
