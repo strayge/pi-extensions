@@ -1,13 +1,17 @@
 {
-  "name": "pi-grep-output-limit",
+  "name": "pi-builtin-tool-limits",
   "version": "0.1.0",
-  "description": "Pi extension that limits grep results sent to the model to 10KB.",
+  "description": "Pi extension that applies fixed context limits to Pi's built-in tools.",
   "type": "module",
   "license": "MIT",
   "keywords": [
     "pi-package",
     "pi-extension",
+    "read",
+    "bash",
     "grep",
+    "find",
+    "ls",
     "context"
   ],
   "files": [
