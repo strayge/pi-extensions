@@ -54,6 +54,8 @@ import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
 
+const PI_ASK_STARTED_EVENT = "@eko24ive/pi-ask:started";
+
 // ---- Shared helpers ----
 
 /** Tool execute return value for a text response. */
@@ -519,6 +521,7 @@ export default function (pi: ExtensionAPI) {
   // (currentCtx would stay undefined → spawn always "No active session"). Gating
   // here makes a filtered session behave like an absent one (#142).
   let rpcHandle: RpcHandle | undefined;
+  let unsubscribeAskStarted: (() => void) | undefined;
 
   // ---- Subagent scheduler ----
   // Session-scoped: store is constructed inside session_start once sessionId
@@ -547,6 +550,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     manager.clearCompleted(true);
+    if (!unsubscribeAskStarted) {
+      unsubscribeAskStarted = pi.events.on(PI_ASK_STARTED_EVENT, () => {
+        fleet.closeViewer();
+      });
+    }
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -582,6 +590,8 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
     rpcHandle = undefined;
+    unsubscribeAskStarted?.();
+    unsubscribeAskStarted = undefined;
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.

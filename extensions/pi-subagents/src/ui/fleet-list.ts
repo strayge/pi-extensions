@@ -127,11 +127,20 @@ export class FleetList {
     this.update();
   }
 
+  /** Close the conversation overlay so a higher-priority modal can be seen. */
+  closeViewer(): boolean {
+    const close = this.viewerClose;
+    if (!close) return false;
+    this.viewerClose = undefined;
+    close();
+    return true;
+  }
+
   dispose(): void {
     if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
     this.inputUnsub?.();
     this.inputUnsub = undefined;
-    if (this.viewerClose) { this.viewerClose(); this.viewerClose = undefined; }
+    this.closeViewer();
     this.viewingAgentId = undefined;
     if (this.ui && this.widgetRegistered) this.ui.setWidget(FLEET_KEY, undefined);
     this.widgetRegistered = false;

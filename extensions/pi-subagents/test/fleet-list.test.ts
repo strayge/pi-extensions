@@ -429,6 +429,21 @@ describe("FleetList overlay lifecycle", () => {
     expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
   });
 
+  it("closes an active viewer when a higher-priority modal opens", async () => {
+    const h = harness([makeRecord()]);
+    expect(h.fleet.closeViewer()).toBe(false);
+
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER);
+
+    expect(h.overlayOpened()).toBe(true);
+    expect(h.fleet.closeViewer()).toBe(true);
+    expect(h.overlayClosed()).toBe(true);
+    expect(h.fleet.closeViewer()).toBe(false);
+    await Promise.resolve();
+  });
+
   it("keeps the cursor on the viewed agent after closing, even if the list reordered", async () => {
     const fakeSession = { subscribe: () => () => {}, messages: [] };
     const agents = [

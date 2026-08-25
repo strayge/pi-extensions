@@ -27,7 +27,9 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { FleetList } from "../src/ui/fleet-list.js";
 
+const ASK_STARTED_CHANNEL = "@eko24ive/pi-ask:started";
 const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
 
 function makePi() {
@@ -146,6 +148,18 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     expect(reply![1].data.id).toBeTruthy();
   });
 
+  it("closes the conversation viewer when pi-ask opens", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    const closeViewer = vi.spyOn(FleetList.prototype, "closeViewer");
+    subagentsExtension(pi);
+
+    expect(busHandlers.has(ASK_STARTED_CHANNEL)).toBe(false);
+    await lifecycle.get("session_start")({}, ctx());
+
+    busHandlers.get(ASK_STARTED_CHANNEL)?.({ version: 1, flowId: "ask-1" });
+    expect(closeViewer).toHaveBeenCalledOnce();
+  });
+
   it("is idempotent — a second session_start does not re-advertise or double-register", async () => {
     const { pi, lifecycle } = makePi();
     subagentsExtension(pi);
@@ -154,6 +168,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     await lifecycle.get("session_start")({}, ctx());
 
     expect(readyEmits(pi), "subagents:ready emitted exactly once across two session_starts").toHaveLength(1);
+    expect(onCallsFor(pi, ASK_STARTED_CHANNEL), "pi-ask listener registered exactly once").toHaveLength(1);
     for (const channel of RPC_CHANNELS) {
       expect(onCallsFor(pi, channel), `${channel} registered exactly once`).toHaveLength(1);
     }
