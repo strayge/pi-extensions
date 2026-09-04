@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { presetConfig } from "../src/config.ts";
 import { formatUsageReport, formatUsageStatusline } from "../src/format.ts";
-import { normalizeCodexBackendPayload } from "../src/providers/codex.ts";
+import {
+  enrichCodexResetCreditExpirations,
+  normalizeCodexBackendPayload,
+} from "../src/providers/codex.ts";
 import { normalizeOpenRouterKeyPayload } from "../src/providers/openrouter.ts";
 
 test("OpenRouter adapter normalizes documented per-key spend limits without claiming subscription quota", () => {
@@ -140,6 +143,118 @@ test("Codex adapter preserves explicit credit unavailability without rate-limit 
   assert.deepEqual(report.metrics, [{ id: "credits", label: "Credits", value: "none" }]);
   assert.match(formatUsageReport(report, "current"), /Credits:\s+none/);
   assert.equal(formatUsageStatusline(report), "codex no credits");
+});
+
+test("Codex reset-credit details normalize available expirations without retaining raw fields", () => {
+  const primary = normalizeCodexBackendPayload(
+    { rate_limit_reset_credits: { available_count: 6 } },
+    3_000,
+  );
+  const expiresAt = "2027-07-17T12:34:56.789Z";
+  const report = enrichCodexResetCreditExpirations(primary, {
+    available_count: 6,
+    credits: [
+      {
+        id: "credit-id",
+        status: "available",
+        expires_at: expiresAt,
+        title: "private-title",
+        description: "private-description",
+        profile: { name: "private-profile" },
+      },
+      { status: "available", expires_at: null },
+      { status: "available" },
+      { status: "available", expires_at: "not-a-date" },
+      { status: "available", expires_at: "2027-02-30T00:00:00Z" },
+      { status: "redeemed", expires_at: "2026-01-01T00:00:00Z" },
+      "malformed-row",
+    ],
+  });
+
+  assert.deepEqual(report.metrics[0]?.resetExpirations, [
+    { kind: "dated", expiresAt: Math.floor(Date.parse(expiresAt) / 1_000) },
+    { kind: "never" },
+    { kind: "unknown" },
+    { kind: "unknown" },
+    { kind: "unknown" },
+    { kind: "unknown" },
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(report),
+    /credit-id|private-title|private-description|private-profile/,
+  );
+});
+
+test("Codex reset-credit detail counts supersede summaries and cap or pad rows", () => {
+  const primary = normalizeCodexBackendPayload(
+    { rate_limit_reset_credits: { available_count: 3 } },
+    3_100,
+  );
+  const lower = enrichCodexResetCreditExpirations(primary, {
+    available_count: 1,
+    credits: [
+      { status: "available", expires_at: null },
+      { status: "available", expires_at: null },
+    ],
+  });
+  assert.equal(lower.metrics[0]?.value, 1);
+  assert.deepEqual(lower.metrics[0]?.resetExpirations, [{ kind: "never" }]);
+
+  const higher = enrichCodexResetCreditExpirations(primary, {
+    available_count: 4,
+    credits: [{ status: "available", expires_at: null }],
+  });
+  assert.equal(higher.metrics[0]?.value, 4);
+  assert.deepEqual(higher.metrics[0]?.resetExpirations, [
+    { kind: "never" },
+    { kind: "unknown" },
+    { kind: "unknown" },
+    { kind: "unknown" },
+  ]);
+});
+
+test("Codex reset-credit detail falls back to the summary count when its count is invalid", () => {
+  const primary = normalizeCodexBackendPayload(
+    { rate_limit_reset_credits: { available_count: 2 } },
+    3_200,
+  );
+  for (const available_count of [undefined, "invalid", -1, 1.5]) {
+    const report = enrichCodexResetCreditExpirations(primary, {
+      available_count,
+      credits: [{ status: "available", expires_at: null }],
+    });
+    assert.equal(report.metrics[0]?.value, 2);
+    assert.deepEqual(report.metrics[0]?.resetExpirations, [{ kind: "never" }, { kind: "unknown" }]);
+  }
+});
+
+test("Codex reset-credit detail ignores counts too large to normalize safely", () => {
+  const primary = normalizeCodexBackendPayload(
+    { rate_limit_reset_credits: { available_count: 2 } },
+    3_250,
+  );
+  const report = enrichCodexResetCreditExpirations(primary, {
+    available_count: Number.MAX_SAFE_INTEGER,
+    credits: [],
+  });
+
+  assert.equal(report, primary);
+  assert.equal(report.metrics[0]?.value, 2);
+  assert.equal(report.metrics[0]?.resetExpirations, undefined);
+});
+
+test("Codex reset-credit detail represents a newer zero count with an empty collection", () => {
+  const primary = normalizeCodexBackendPayload(
+    { rate_limit_reset_credits: { available_count: 2 } },
+    3_300,
+  );
+  const report = enrichCodexResetCreditExpirations(primary, {
+    available_count: 0,
+    credits: [{ status: "available", expires_at: null }],
+  });
+
+  assert.equal(report.metrics[0]?.value, 0);
+  assert.deepEqual(report.metrics[0]?.resetExpirations, []);
 });
 
 test("Codex adapter preserves windows, credits, and model-specific statusline buckets", () => {

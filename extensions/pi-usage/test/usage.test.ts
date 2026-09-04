@@ -119,6 +119,66 @@ test("/usage queries the current runtime account and offers its next actions", a
   assert.equal(statuses.get("usage"), "openrouter $75.00 left");
 });
 
+test("/usage caches enriched Codex reports and refreshes both requests together", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const urls: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    urls.push(url);
+    const refresh = urls.filter((candidate) => candidate.endsWith("/wham/usage")).length;
+    const body = url.endsWith("/wham/usage")
+      ? { rate_limit_reset_credits: { available_count: refresh === 1 ? 2 : 4 } }
+      : {
+          available_count: refresh === 1 ? 1 : 3,
+          credits: [{ status: "available", expires_at: null }],
+        };
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+
+  const choices = ["Close", "Close", "Refresh usage", "Close"];
+  const titles: string[] = [];
+  const mock = createMockPi();
+  usageExtension(mock.pi);
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  const { ctx } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model: codexModel,
+    select: async (title: string) => {
+      titles.push(title);
+      return choices.shift();
+    },
+    modelRegistry: {
+      getProviderAuth: async () => ({ auth: { apiKey: "codex-key" } }),
+      getAvailable: () => [codexModel],
+      getAll: () => [codexModel],
+      getProviderAuthStatus: () => ({ configured: true }),
+      getProviderDisplayName: (provider: string) => provider,
+    },
+  });
+
+  await command.handler("", ctx);
+  assert.equal(urls.length, 2);
+  assert.match(titles[0] ?? "", /Usage limit resets:\s+1 available/);
+
+  await command.handler("", ctx);
+  assert.equal(urls.length, 2);
+  assert.match(titles[1] ?? "", /Usage limit resets:\s+1 available/);
+
+  await command.handler("", ctx);
+  assert.deepEqual(urls, [
+    "https://chatgpt.com/backend-api/wham/usage",
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+    "https://chatgpt.com/backend-api/wham/usage",
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+  ]);
+  assert.match(titles[3] ?? "", /Usage limit resets:\s+3 available/);
+});
+
 test("command arguments are rejected instead of becoming a hidden interface", async () => {
   const mock = createMockPi();
   usageExtension(mock.pi);

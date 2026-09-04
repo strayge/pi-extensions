@@ -21,6 +21,13 @@ const report: UsageReport = {
   metrics: [{ id: "usage-total", label: "All-time usage", value: 1, unit: "usd" }],
 };
 
+function codexJwt(accountId: unknown): string {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "RS256" })}.${encode({
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+  })}.signature`;
+}
+
 test("credential fingerprints are process-salted, deterministic, and do not expose secrets", () => {
   const auth = {
     apiKey: "sk-secret",
@@ -163,6 +170,74 @@ test("runtime auth rejects proxy origins and forwards only adapter-approved head
   assert.deepEqual(modelKeyAuth?.headers, { Authorization: "Bearer current-model-key" });
 });
 
+test("Codex auth derives its account route from the active token and fingerprints it", async () => {
+  const adapter = SUPPORTED_ADAPTERS.find((candidate) => candidate.id === "openai-codex");
+  assert.ok(adapter);
+  const model = {
+    id: "gpt-5.3-codex",
+    name: "GPT-5.3 Codex",
+    provider: "openai-codex",
+    baseUrl: "https://chatgpt.com/backend-api",
+  };
+  const activeToken = codexJwt("workspace-active");
+  const providerToken = codexJwt("workspace-default");
+  const { ctx } = createMockContext({
+    model,
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({
+        ok: true,
+        headers: {
+          Authorization: `Bearer ${activeToken}`,
+          "ChatGPT-Account-Id": "must-not-be-forwarded",
+          "X-Model-Secret": "must-not-leak",
+        },
+      }),
+      getProviderAuth: async () => ({ auth: { apiKey: providerToken } }),
+      getAvailable: () => [model],
+      getAll: () => [model],
+    },
+  });
+  const salt = Buffer.alloc(32, 7);
+  const auth = await resolveUsageAuth(ctx, adapter, salt);
+  const expectedHeaders = {
+    Authorization: `Bearer ${activeToken}`,
+    "ChatGPT-Account-Id": "workspace-active",
+  };
+
+  assert.deepEqual(auth?.headers, expectedHeaders);
+  assert.equal(auth?.fingerprint, fingerprintResolvedAuth({ headers: expectedHeaders }, salt));
+  assert.notEqual(
+    auth?.fingerprint,
+    fingerprintResolvedAuth({ headers: { Authorization: `Bearer ${activeToken}` } }, salt),
+  );
+  assert.ok(auth?.secrets.includes("workspace-active"));
+  assert.ok(!auth?.secrets.includes("must-not-be-forwarded"));
+});
+
+test("Codex auth omits account routing for opaque tokens and unsafe claims", async () => {
+  const adapter = SUPPORTED_ADAPTERS.find((candidate) => candidate.id === "openai-codex");
+  assert.ok(adapter);
+  const model = {
+    id: "gpt-5.3-codex",
+    name: "GPT-5.3 Codex",
+    provider: "openai-codex",
+    baseUrl: "https://chatgpt.com/backend-api",
+  };
+  for (const token of ["opaque-token", codexJwt("workspace\r\nX-Injected: yes")]) {
+    const { ctx } = createMockContext({
+      model,
+      modelRegistry: {
+        getProviderAuth: async () => ({ auth: { apiKey: token } }),
+        getAvailable: () => [model],
+        getAll: () => [model],
+      },
+    });
+
+    const auth = await resolveUsageAuth(ctx, adapter, Buffer.alloc(32, 8));
+    assert.deepEqual(auth?.headers, { Authorization: `Bearer ${token}` });
+  }
+});
+
 test("provider cancellation preserves AbortError identity", async () => {
   const abort = Object.assign(new Error("cancelled"), { name: "AbortError" });
   const adapter = {
@@ -224,6 +299,247 @@ test("provider response reads are byte-bounded", async (t) => {
     () => queryProviderUsage(adapter, auth, new AbortController().signal, 1_000),
     (error: unknown) =>
       error instanceof Error && error.message.length < 1_000 && /returned 500/.test(error.message),
+  );
+});
+
+test("Codex queries reset-credit details only for a positive summary count", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const adapter = SUPPORTED_ADAPTERS.find((candidate) => candidate.id === "openai-codex");
+  assert.ok(adapter);
+  const urls: string[] = [];
+  const payloads = [
+    { credits: { has_credits: false } },
+    { rate_limit_reset_credits: { available_count: 0 } },
+  ];
+  globalThis.fetch = async (input) => {
+    urls.push(String(input));
+    return new Response(JSON.stringify(payloads.shift()), { status: 200 });
+  };
+  const auth = {
+    headers: { Authorization: "Bearer codex-secret" },
+    fingerprint: "fingerprint",
+    secrets: ["codex-secret"],
+    model: { baseUrl: "https://chatgpt.com/backend-api" } as never,
+  };
+
+  await queryProviderUsage(adapter, auth, new AbortController().signal, 1_000);
+  await queryProviderUsage(adapter, auth, new AbortController().signal, 1_000);
+
+  assert.deepEqual(urls, [
+    "https://chatgpt.com/backend-api/wham/usage",
+    "https://chatgpt.com/backend-api/wham/usage",
+  ]);
+});
+
+test("Codex fetches reset-credit details with routed auth and rejects redirects", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const adapter = SUPPORTED_ADAPTERS.find((candidate) => candidate.id === "openai-codex");
+  assert.ok(adapter);
+  const requests: Array<{
+    url: string;
+    authorization: string | undefined;
+    accountId: string | undefined;
+    redirect: RequestRedirect | undefined;
+  }> = [];
+  globalThis.fetch = async (input, init) => {
+    const headers = init?.headers as Record<string, string> | undefined;
+    requests.push({
+      url: String(input),
+      authorization: headers?.Authorization,
+      accountId: headers?.["ChatGPT-Account-Id"],
+      redirect: init?.redirect,
+    });
+    const body =
+      requests.length === 1
+        ? { rate_limit_reset_credits: { available_count: 2 } }
+        : {
+            available_count: 1,
+            credits: [{ status: "available", expires_at: "2027-07-17T00:00:00Z" }],
+          };
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+  const report = await queryProviderUsage(
+    adapter,
+    {
+      headers: {
+        Authorization: "Bearer codex-secret",
+        "ChatGPT-Account-Id": "workspace-active",
+      },
+      fingerprint: "fingerprint",
+      secrets: ["codex-secret", "workspace-active"],
+      model: { baseUrl: "https://chatgpt.com/backend-api" } as never,
+    },
+    new AbortController().signal,
+    1_000,
+  );
+
+  assert.deepEqual(requests, [
+    {
+      url: "https://chatgpt.com/backend-api/wham/usage",
+      authorization: "Bearer codex-secret",
+      accountId: "workspace-active",
+      redirect: "error",
+    },
+    {
+      url: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+      authorization: "Bearer codex-secret",
+      accountId: "workspace-active",
+      redirect: "error",
+    },
+  ]);
+  assert.equal(report.metrics[0]?.value, 1);
+  assert.deepEqual(report.metrics[0]?.resetExpirations, [
+    { kind: "dated", expiresAt: Date.parse("2027-07-17T00:00:00Z") / 1_000 },
+  ]);
+});
+
+test("Codex preserves the primary report when reset-credit details fail or time out", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const adapter = SUPPORTED_ADAPTERS.find((candidate) => candidate.id === "openai-codex");
+  assert.ok(adapter);
+  const auth = {
+    headers: { Authorization: "Bearer codex-secret" },
+    fingerprint: "fingerprint",
+    secrets: ["codex-secret"],
+    model: { baseUrl: "https://chatgpt.com/backend-api" } as never,
+  };
+
+  let requests = 0;
+  globalThis.fetch = async (_input, init) => {
+    requests += 1;
+    if (requests % 2 === 1) {
+      return new Response(JSON.stringify({ rate_limit_reset_credits: { available_count: 2 } }), {
+        status: 200,
+      });
+    }
+    if (requests === 2) return new Response("unavailable", { status: 503 });
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener(
+        "abort",
+        () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+        { once: true },
+      );
+    });
+  };
+
+  const failed = await queryProviderUsage(adapter, auth, new AbortController().signal, 1_000);
+  assert.equal(failed.metrics[0]?.value, 2);
+  assert.equal(failed.metrics[0]?.resetExpirations, undefined);
+
+  const timedOut = await queryProviderUsage(adapter, auth, new AbortController().signal, 25);
+  assert.equal(timedOut.metrics[0]?.value, 2);
+  assert.equal(timedOut.metrics[0]?.resetExpirations, undefined);
+});
+
+test("Codex reset-credit details use only the primary request deadline remainder", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const adapter = SUPPORTED_ADAPTERS.find((candidate) => candidate.id === "openai-codex");
+  assert.ok(adapter);
+
+  let now = 1_000;
+  t.mock.method(Date, "now", () => now);
+  const timeoutDelays: number[] = [];
+  let timeoutCount = 0;
+  t.mock.method(globalThis, "setTimeout", ((callback: () => void, delay?: number) => {
+    timeoutCount += 1;
+    timeoutDelays.push(delay ?? 0);
+    if (timeoutCount === 2) queueMicrotask(callback);
+    return timeoutCount as unknown as NodeJS.Timeout;
+  }) as typeof setTimeout);
+
+  let requests = 0;
+  globalThis.fetch = async (_input, init) => {
+    requests += 1;
+    if (requests === 1) {
+      now += 600;
+      return new Response(JSON.stringify({ rate_limit_reset_credits: { available_count: 2 } }), {
+        status: 200,
+      });
+    }
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener(
+        "abort",
+        () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+        { once: true },
+      );
+    });
+  };
+
+  const report = await queryProviderUsage(
+    adapter,
+    {
+      headers: { Authorization: "Bearer codex-secret" },
+      fingerprint: "fingerprint",
+      secrets: ["codex-secret"],
+      model: { baseUrl: "https://chatgpt.com/backend-api" } as never,
+    },
+    new AbortController().signal,
+    1_000,
+  );
+
+  assert.deepEqual(timeoutDelays, [1_000, 400]);
+  assert.equal(report.metrics[0]?.value, 2);
+  assert.equal(report.metrics[0]?.resetExpirations, undefined);
+});
+
+test("caller cancellation during Codex reset-credit detail retrieval aborts the query", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const adapter = SUPPORTED_ADAPTERS.find((candidate) => candidate.id === "openai-codex");
+  assert.ok(adapter);
+  let detailStarted: () => void = () => undefined;
+  const started = new Promise<void>((resolve) => {
+    detailStarted = resolve;
+  });
+  let requests = 0;
+  globalThis.fetch = async (_input, init) => {
+    requests += 1;
+    if (requests === 1) {
+      return new Response(JSON.stringify({ rate_limit_reset_credits: { available_count: 1 } }), {
+        status: 200,
+      });
+    }
+    detailStarted();
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener(
+        "abort",
+        () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+        { once: true },
+      );
+    });
+  };
+  const controller = new AbortController();
+  const pending = queryProviderUsage(
+    adapter,
+    {
+      headers: { Authorization: "Bearer codex-secret" },
+      fingerprint: "fingerprint",
+      secrets: ["codex-secret"],
+      model: { baseUrl: "https://chatgpt.com/backend-api" } as never,
+    },
+    controller.signal,
+    1_000,
+  );
+  await started;
+  controller.abort();
+
+  await assert.rejects(
+    () => pending,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 });
 

@@ -16,7 +16,7 @@ import { showDisplayMenu } from "../src/display-menu.ts";
 import { formatDuration } from "../src/duration.ts";
 import { formatUsageReport, formatUsageStatusline } from "../src/format.ts";
 import { isAtRisk, minutesToExhaustion, renderBar, windowElapsedFraction } from "../src/gauge.ts";
-import type { UsageBucket, UsageReport } from "../src/types.ts";
+import type { ResetCreditExpiration, UsageBucket, UsageReport } from "../src/types.ts";
 import { createCustomSelectorHarness } from "./support.ts";
 
 const NOW = 1_700_000_000_000;
@@ -53,6 +53,39 @@ function codexReport(buckets: UsageBucket[]): UsageReport {
     buckets,
     metrics: [],
   };
+}
+
+function localTime(year: number, month: number, day: number, hour = 12): number {
+  return new Date(year, month - 1, day, hour).getTime();
+}
+
+function resetCreditsReport(
+  value: number,
+  resetExpirations?: ResetCreditExpiration[],
+): UsageReport {
+  return {
+    ...codexReport([]),
+    metrics: [
+      {
+        id: "reset-credits",
+        label: "Usage limit resets",
+        value,
+        ...(resetExpirations === undefined ? {} : { resetExpirations }),
+      },
+    ],
+  };
+}
+
+function resetCreditsLine(
+  report: UsageReport,
+  now: number,
+  config = defaultDisplayConfig(),
+): string {
+  return (
+    formatUsageReport(report, "current", config, now)
+      .split("\n")
+      .find((line) => line.startsWith("Usage limit resets:")) ?? ""
+  );
 }
 
 test("durations drop the smaller unit once the larger one makes it noise", () => {
@@ -217,6 +250,112 @@ test("the report carries both clock forms and the projection", () => {
     codexBucket({ used: 95, remaining: 5, resetsAt: (NOW + 5 * MINUTE) / 1000 }),
   ]);
   assert.doesNotMatch(formatUsageReport(calm, "current", defaultDisplayConfig(), NOW), /empty in/);
+});
+
+test("reset-credit reports render a single dated expiration", () => {
+  const now = localTime(2026, 7, 5);
+  const expiration = localTime(2026, 7, 17) / 1000;
+
+  assert.equal(
+    resetCreditsLine(resetCreditsReport(1, [{ kind: "dated", expiresAt: expiration }]), now),
+    "Usage limit resets:          1 available · 1 expires 17 Jul (in 12d)",
+  );
+});
+
+test("reset-credit reports group and sort expirations before never and unknown", () => {
+  const now = localTime(2026, 7, 5);
+  const sooner = localTime(2026, 7, 10) / 1000;
+  const later = localTime(2026, 7, 17) / 1000;
+
+  assert.equal(
+    resetCreditsLine(
+      resetCreditsReport(6, [
+        { kind: "unknown" },
+        { kind: "dated", expiresAt: later },
+        { kind: "never" },
+        { kind: "dated", expiresAt: sooner },
+        { kind: "dated", expiresAt: later },
+        { kind: "unknown" },
+      ]),
+      now,
+    ),
+    "Usage limit resets:          6 available · 1 expires 10 Jul (in 5d), 2 expire 17 Jul (in 12d), 1 never, 2 unknown",
+  );
+});
+
+test("reset-credit dates include a year only outside the current local year", () => {
+  const now = localTime(2026, 7, 5);
+  const expiration = localTime(2027, 7, 5) / 1000;
+
+  assert.equal(
+    resetCreditsLine(resetCreditsReport(1, [{ kind: "dated", expiresAt: expiration }]), now),
+    "Usage limit resets:          1 available · 1 expires 5 Jul 2027 (in 365d)",
+  );
+});
+
+test("reset-credit relative durations follow the report spacing option", () => {
+  const now = localTime(2026, 7, 5);
+  const expiration = localTime(2026, 7, 6, 20) / 1000;
+  const compact = defaultDisplayConfig();
+  compact.spacedDuration = false;
+
+  assert.equal(
+    resetCreditsLine(resetCreditsReport(1, [{ kind: "dated", expiresAt: expiration }]), now),
+    "Usage limit resets:          1 available · 1 expires 6 Jul (in 1d 8h)",
+  );
+  assert.equal(
+    resetCreditsLine(
+      resetCreditsReport(1, [{ kind: "dated", expiresAt: expiration }]),
+      now,
+      compact,
+    ),
+    "Usage limit resets:          1 available · 1 expires 6 Jul (in 1d8h)",
+  );
+});
+
+test("reset-credit reports label past expirations defensively", () => {
+  const now = localTime(2026, 7, 5);
+  const expiration = localTime(2026, 7, 4) / 1000;
+
+  assert.equal(
+    resetCreditsLine(resetCreditsReport(1, [{ kind: "dated", expiresAt: expiration }]), now),
+    "Usage limit resets:          1 available · 1 expires 4 Jul (expired)",
+  );
+});
+
+test("reset-credit reports omit expiration suffixes without usable enrichment", () => {
+  const now = localTime(2026, 7, 5);
+  const expiration = localTime(2026, 7, 17) / 1000;
+
+  assert.equal(
+    resetCreditsLine(resetCreditsReport(2), now),
+    "Usage limit resets:          2 available",
+  );
+  assert.equal(
+    resetCreditsLine(resetCreditsReport(0, [{ kind: "dated", expiresAt: expiration }]), now),
+    "Usage limit resets:          0 available",
+  );
+});
+
+test("reset-credit expirations do not change the Codex statusline", () => {
+  const report = {
+    ...codexReport([codexBucket()]),
+    metrics: resetCreditsReport(1, [{ kind: "dated", expiresAt: localTime(2026, 7, 17) / 1000 }])
+      .metrics,
+  };
+  const withoutMetadata = {
+    ...report,
+    metrics: resetCreditsReport(1).metrics,
+  };
+
+  assert.equal(
+    formatUsageStatusline(report, undefined, defaultDisplayConfig(), NOW),
+    formatUsageStatusline(withoutMetadata, undefined, defaultDisplayConfig(), NOW),
+  );
+  assert.equal(
+    formatUsageStatusline(report, undefined, defaultDisplayConfig(), NOW),
+    "codex [███┃░░░░] 41% 3h 12m",
+  );
 });
 
 test("switching every field off hides the entry rather than claiming a failure", () => {

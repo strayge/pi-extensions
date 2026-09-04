@@ -22,7 +22,18 @@ not flags.
 
 Consumer ChatGPT subscription limits, read from the Codex usage endpoint using
 pi's resolved runtime authorization: duration-based windows, resets, credits,
-earned usage-limit resets, and additional model buckets.
+earned usage-limit resets, and additional model buckets. When expiration detail
+is available, `/usage` groups reset credits by expiration:
+
+```text
+Usage limit resets:          2 available · 1 expires 17 Jul (in 12d), 1 never
+```
+
+Expiration detail comes from the read-only `/wham/rate-limit-reset-credits`
+endpoint and appears only in `/usage`; it does not widen or otherwise change the
+statusline. That secondary request is best effort, so if it fails or times out,
+the summary count remains visible as `N available` without an expiration
+suffix. The extension reports reset credits but does not redeem them.
 
 Statusline: `codex [███┃░░░░] 41% 3h 12m`, or `codex spark [█░░░░░░░] 10%`. The
 bucket matching the current Codex model is preferred when one is available. See
@@ -189,10 +200,11 @@ before every query, and a salted fingerprint of that credential keys the cache,
 so a report can never be served across accounts: a credential change is a cache
 miss, not a stale reading.
 
-Reports are cached for five minutes per provider and credential. Returning to an
-account within that window reuses its own recent reading rather than re-querying.
-A failed query backs off for 30 seconds so a broken endpoint is not retried on
-every turn.
+Reports are cached for five minutes per provider and credential. The enriched
+reset-credit count and expiration detail are part of that same snapshot, not a
+separate cache. Returning to an account within that window reuses its own recent
+reading rather than re-querying. A failed query backs off for 30 seconds so a
+broken endpoint is not retried on every turn.
 
 Queries that outlive their model — because you switched models while one was in
 flight — are discarded rather than published.

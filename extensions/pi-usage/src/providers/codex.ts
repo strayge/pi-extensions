@@ -1,5 +1,14 @@
 import { sanitizeDisplayText } from "../core.ts";
-import type { CodexBackendPayload, UsageBucket, UsageMetric, UsageReport } from "../types.ts";
+import type {
+  CodexBackendPayload,
+  CodexResetCreditsPayload,
+  ResetCreditExpiration,
+  UsageBucket,
+  UsageMetric,
+  UsageReport,
+} from "../types.ts";
+
+const MAX_NORMALIZED_RESET_CREDITS = 4_096;
 
 export function normalizeCodexBackendPayload(
   payload: CodexBackendPayload,
@@ -74,6 +83,61 @@ export function normalizeCodexBackendPayload(
   };
 }
 
+export function enrichCodexResetCreditExpirations(
+  report: UsageReport,
+  payload: CodexResetCreditsPayload,
+): UsageReport {
+  const metricIndex = report.metrics.findIndex((metric) => metric.id === "reset-credits");
+  if (metricIndex < 0) return report;
+
+  const metric = report.metrics[metricIndex];
+  const summaryCount = asValidNonnegativeInteger(metric?.value);
+  if (!metric || summaryCount === undefined) return report;
+
+  const count = asValidNonnegativeInteger(payload.available_count) ?? summaryCount;
+  // A 64 KiB response cannot carry this many minimally shaped credit rows, so
+  // larger counts are not usable as detail enrichment.
+  if (count > MAX_NORMALIZED_RESET_CREDITS) return report;
+
+  const resetExpirations: ResetCreditExpiration[] = [];
+  const rows = Array.isArray(payload.credits) ? payload.credits : [];
+  for (const raw of rows) {
+    if (resetExpirations.length >= count) break;
+    const row = asObject(raw);
+    if (row?.status !== "available") continue;
+    resetExpirations.push(normalizeResetCreditExpiration(row.expires_at));
+  }
+  while (resetExpirations.length < count) resetExpirations.push({ kind: "unknown" });
+
+  const metrics = [...report.metrics];
+  metrics[metricIndex] = { ...metric, value: count, resetExpirations };
+  return { ...report, metrics };
+}
+
+function normalizeResetCreditExpiration(value: unknown): ResetCreditExpiration {
+  if (value === null) return { kind: "never" };
+  if (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(value) &&
+    hasValidCalendarDate(value)
+  ) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return { kind: "dated", expiresAt: Math.floor(parsed / 1000) };
+  }
+  return { kind: "unknown" };
+}
+
+function hasValidCalendarDate(value: string): boolean {
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  if (month < 1 || month > 12 || day < 1) return false;
+
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = month === 2 ? (leapYear ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
+  return day <= daysInMonth;
+}
+
 function normalizeRateLimitGroup(
   buckets: UsageBucket[],
   groupId: string,
@@ -143,6 +207,12 @@ function asNonnegativeInteger(value: unknown): number | undefined {
   const parsed = asNumber(value);
   if (parsed === undefined || !Number.isSafeInteger(parsed)) return undefined;
   return Math.max(0, parsed);
+}
+
+function asValidNonnegativeInteger(value: unknown): number | undefined {
+  const parsed = asNumber(value);
+  if (parsed === undefined || !Number.isSafeInteger(parsed) || parsed < 0) return undefined;
+  return parsed;
 }
 
 function clampPercent(value: number): number {

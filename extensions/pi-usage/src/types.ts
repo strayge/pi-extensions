@@ -27,11 +27,17 @@ export interface UsageBucket {
   resetsAt?: number;
 }
 
+export type ResetCreditExpiration =
+  | { kind: "dated"; expiresAt: number }
+  | { kind: "never" }
+  | { kind: "unknown" };
+
 export interface UsageMetric {
   id: string;
   label: string;
   value: number | string;
   unit?: UsageUnit;
+  resetExpirations?: ResetCreditExpiration[];
 }
 
 export interface UsageReport {
@@ -121,4 +127,9 @@ export type CodexBackendPayload = {
   additional_rate_limits?: unknown;
   credits?: unknown;
   rate_limit_reset_credits?: unknown;
+};
+
+export type CodexResetCreditsPayload = {
+  available_count?: unknown;
+  credits?: unknown;
 };

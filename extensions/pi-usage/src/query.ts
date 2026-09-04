@@ -1,10 +1,15 @@
 import { randomBytes } from "node:crypto";
+import { validateHeaderValue } from "node:http";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { errorMessage, fingerprintResolvedAuth, redactUsageError } from "./core.ts";
-import { normalizeCodexBackendPayload } from "./providers/codex.ts";
+import { abortError, errorMessage, fingerprintResolvedAuth, redactUsageError } from "./core.ts";
+import {
+  enrichCodexResetCreditExpirations,
+  normalizeCodexBackendPayload,
+} from "./providers/codex.ts";
 import { normalizeOpenRouterKeyPayload } from "./providers/openrouter.ts";
 import type {
   CodexBackendPayload,
+  CodexResetCreditsPayload,
   OpenRouterKeyPayload,
   PiModel,
   ResolvedUsageAuth,
@@ -13,6 +18,9 @@ import type {
 } from "./types.ts";
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const CODEX_ACCOUNT_CLAIM = "https://api.openai.com/auth";
+const CODEX_ACCOUNT_HEADER = "ChatGPT-Account-Id";
 const OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key";
 const MAX_SUCCESS_BODY_BYTES = 64 * 1024;
 const MAX_ERROR_BODY_BYTES = 4 * 1024;
@@ -28,6 +36,7 @@ export const SUPPORTED_ADAPTERS: readonly UsageProviderAdapter[] = [
       label: "ChatGPT subscription limits",
     },
     async query(auth, signal, timeoutMs) {
+      const deadline = Date.now() + timeoutMs;
       const payload = await fetchProviderJson(
         CODEX_USAGE_URL,
         auth,
@@ -35,7 +44,26 @@ export const SUPPORTED_ADAPTERS: readonly UsageProviderAdapter[] = [
         timeoutMs,
         "Codex usage endpoint",
       );
-      return normalizeCodexBackendPayload(payload as CodexBackendPayload, Date.now());
+      const report = normalizeCodexBackendPayload(payload as CodexBackendPayload, Date.now());
+      if (signal.aborted) throw abortError();
+      const resetCredits = report.metrics.find((metric) => metric.id === "reset-credits");
+      if (typeof resetCredits?.value !== "number" || resetCredits.value <= 0) return report;
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) return report;
+      try {
+        const details = await fetchProviderJson(
+          CODEX_RESET_CREDITS_URL,
+          auth,
+          signal,
+          remainingMs,
+          "Codex reset-credit endpoint",
+        );
+        return enrichCodexResetCreditExpirations(report, details as CodexResetCreditsPayload);
+      } catch (error) {
+        if (signal.aborted) throw isAbortError(error) ? error : abortError();
+        return report;
+      }
     },
   },
   {
@@ -106,10 +134,16 @@ export async function resolveUsageAuth(
   if (!auth) return undefined;
   const authorization = authorizationFrom(auth);
   if (!authorization) return undefined;
-  const headers = { Authorization: authorization };
-  const secrets = [auth.apiKey, headerValue(auth.headers, "Authorization"), authorization].filter(
-    (value): value is string => Boolean(value),
-  );
+  const headers: Record<string, string> = { Authorization: authorization };
+  const accountId =
+    adapter.id === "openai-codex" ? codexAccountIdFromAuthorization(authorization) : undefined;
+  if (accountId) headers[CODEX_ACCOUNT_HEADER] = accountId;
+  const secrets = [
+    auth.apiKey,
+    headerValue(auth.headers, "Authorization"),
+    authorization,
+    accountId,
+  ].filter((value): value is string => Boolean(value));
   return {
     apiKey: auth.apiKey,
     headers,
@@ -168,7 +202,11 @@ async function fetchProviderJson(
   try {
     const headers = { ...auth.headers };
     if (!hasHeader(headers, "User-Agent")) headers["User-Agent"] = "pi-usage";
-    const response = await fetch(url, { headers, signal: controller.signal });
+    const response = await fetch(url, {
+      headers,
+      redirect: "error",
+      signal: controller.signal,
+    });
     if (controller.signal.aborted)
       throw Object.assign(new Error("Usage query aborted."), { name: "AbortError" });
     const text = await readBoundedResponse(
@@ -271,6 +309,46 @@ function authorizationFrom(auth: RequestAuth): string | undefined {
     headerValue(auth.headers, "Authorization") ??
     (auth.apiKey ? `Bearer ${auth.apiKey}` : undefined)
   );
+}
+
+function codexAccountIdFromAuthorization(authorization: string): string | undefined {
+  const token = /^Bearer +(\S+)$/iu.exec(authorization)?.[1];
+  if (!token) return undefined;
+  const parts = token.split(".");
+  if (parts.length !== 3) return undefined;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString("utf8")) as {
+      [CODEX_ACCOUNT_CLAIM]?: { chatgpt_account_id?: unknown };
+    };
+    return validHeaderValue(payload?.[CODEX_ACCOUNT_CLAIM]?.chatgpt_account_id);
+  } catch {
+    return undefined;
+  }
+}
+
+function validHeaderValue(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.trim() !== value ||
+    hasControlCharacter(value)
+  ) {
+    return undefined;
+  }
+  try {
+    validateHeaderValue(CODEX_ACCOUNT_HEADER, value);
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) return true;
+  }
+  return false;
 }
 
 function hasOfficialOrigin(model: PiModel, providerId: string): boolean {

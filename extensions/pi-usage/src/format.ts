@@ -24,6 +24,20 @@ import type {
 
 const VALUE_COLUMN = 29;
 const REPORT_SEPARATOR = " · ";
+const MONTH_LABELS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
 
 export function formatUsageReport(
   report: UsageReport,
@@ -140,13 +154,59 @@ function formatCodexReport(
   }
   for (const metric of report.metrics) {
     if (metric.id === "reset-credits") {
-      lines.push(`${"Usage limit resets:".padEnd(VALUE_COLUMN)}${metric.value} available`);
+      lines.push(
+        `${"Usage limit resets:".padEnd(VALUE_COLUMN)}${formatResetCredits(metric, config, now)}`,
+      );
     } else if (metric.id === "credits") {
       lines.push(
         `${"Credits:".padEnd(VALUE_COLUMN)}${formatMetricValue(metric.value, metric.unit)}`,
       );
     }
   }
+}
+
+function formatResetCredits(metric: UsageMetric, config: UsageDisplayConfig, now: number): string {
+  const available = `${metric.value} available`;
+  if (metric.value === 0 || metric.resetExpirations === undefined) return available;
+
+  const dated = new Map<number, number>();
+  let never = 0;
+  let unknown = 0;
+  for (const expiration of metric.resetExpirations) {
+    if (expiration.kind === "dated") {
+      dated.set(expiration.expiresAt, (dated.get(expiration.expiresAt) ?? 0) + 1);
+    } else if (expiration.kind === "never") {
+      never += 1;
+    } else {
+      unknown += 1;
+    }
+  }
+
+  const groups = [...dated.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([expiresAt, count]) => {
+      const date = formatExpirationDate(expiresAt, now);
+      const remainingMinutes = (expiresAt * 1000 - now) / MINUTE_MS;
+      const relative =
+        remainingMinutes > 0
+          ? `in ${formatDuration(remainingMinutes, config.spacedDuration)}`
+          : "expired";
+      return `${count} ${count === 1 ? "expires" : "expire"} ${date} (${relative})`;
+    });
+  if (never > 0) groups.push(`${never} never`);
+  if (unknown > 0) groups.push(`${unknown} unknown`);
+
+  return groups.length > 0 ? `${available}${REPORT_SEPARATOR}${groups.join(", ")}` : available;
+}
+
+const MINUTE_MS = 60_000;
+
+function formatExpirationDate(expiresAt: number, now: number): string {
+  const expiration = new Date(expiresAt * 1000);
+  const current = new Date(now);
+  const year = expiration.getFullYear();
+  const suffix = year === current.getFullYear() ? "" : ` ${year}`;
+  return `${expiration.getDate()} ${MONTH_LABELS[expiration.getMonth()]}${suffix}`;
 }
 
 function formatOpenRouterReport(
