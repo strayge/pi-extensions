@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { validateHeaderValue } from "node:http";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { abortError, errorMessage, fingerprintResolvedAuth, redactUsageError } from "./core.ts";
@@ -9,6 +9,8 @@ import {
 import { normalizeOpenRouterKeyPayload } from "./providers/openrouter.ts";
 import type {
   CodexBackendPayload,
+  CodexResetCreditRedemption,
+  CodexResetCreditRedemptionCode,
   CodexResetCreditsPayload,
   OpenRouterKeyPayload,
   PiModel,
@@ -19,6 +21,13 @@ import type {
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const CODEX_REDEEM_RESET_CREDIT_URL = `${CODEX_RESET_CREDITS_URL}/consume`;
+const CODEX_REDEMPTION_CODES = new Set<CodexResetCreditRedemptionCode>([
+  "reset",
+  "nothing_to_reset",
+  "no_credit",
+  "already_redeemed",
+]);
 const CODEX_ACCOUNT_CLAIM = "https://api.openai.com/auth";
 const CODEX_ACCOUNT_HEADER = "ChatGPT-Account-Id";
 const OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key";
@@ -144,10 +153,14 @@ export async function resolveUsageAuth(
     authorization,
     accountId,
   ].filter((value): value is string => Boolean(value));
+  const fingerprint = fingerprintResolvedAuth({ headers }, salt);
   return {
     apiKey: auth.apiKey,
     headers,
-    fingerprint: fingerprintResolvedAuth({ headers }, salt),
+    fingerprint,
+    accountKey: accountId
+      ? createHash("sha256").update(`pi-usage-reset:${accountId}`).digest("hex")
+      : undefined,
     secrets,
     model,
   };
@@ -161,6 +174,47 @@ export async function queryProviderUsage(
 ): Promise<UsageReport> {
   try {
     return await adapter.query(auth, signal, timeoutMs);
+  } catch (error) {
+    if (isStaleExtensionContextError(error) || isAbortError(error)) throw error;
+    throw new Error(redactUsageError(errorMessage(error), auth.secrets));
+  }
+}
+
+export async function redeemCodexResetCredit(
+  auth: ResolvedUsageAuth,
+  redeemRequestId: string,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<CodexResetCreditRedemption> {
+  if (auth.model.provider !== "openai-codex" || !hasOfficialOrigin(auth.model, "openai-codex")) {
+    throw new Error("A reset can only be used with official OpenAI Codex authorization.");
+  }
+  if (!redeemRequestId) throw new Error("A reset redemption requires an idempotency key.");
+
+  try {
+    const payload = await fetchProviderJson(
+      CODEX_REDEEM_RESET_CREDIT_URL,
+      auth,
+      signal,
+      timeoutMs,
+      "Codex reset redemption endpoint",
+      { redeem_request_id: redeemRequestId },
+    );
+    const code = payload.code;
+    const windowsReset = payload.windows_reset ?? 0;
+    if (
+      typeof code !== "string" ||
+      !CODEX_REDEMPTION_CODES.has(code as CodexResetCreditRedemptionCode)
+    ) {
+      throw new Error("Codex reset redemption returned an unknown outcome.");
+    }
+    if (!Number.isSafeInteger(windowsReset) || (windowsReset as number) < 0) {
+      throw new Error("Codex reset redemption returned an invalid window count.");
+    }
+    return {
+      code: code as CodexResetCreditRedemptionCode,
+      windowsReset: windowsReset as number,
+    };
   } catch (error) {
     if (isStaleExtensionContextError(error) || isAbortError(error)) throw error;
     throw new Error(redactUsageError(errorMessage(error), auth.secrets));
@@ -189,6 +243,7 @@ async function fetchProviderJson(
   signal: AbortSignal,
   timeoutMs: number,
   description: string,
+  jsonBody?: Record<string, string>,
 ): Promise<Record<string, unknown>> {
   const controller = new AbortController();
   let timedOut = false;
@@ -202,7 +257,9 @@ async function fetchProviderJson(
   try {
     const headers = { ...auth.headers };
     if (!hasHeader(headers, "User-Agent")) headers["User-Agent"] = "pi-usage";
+    if (jsonBody) headers["Content-Type"] = "application/json";
     const response = await fetch(url, {
+      ...(jsonBody ? { body: JSON.stringify(jsonBody), method: "POST" } : {}),
       headers,
       redirect: "error",
       signal: controller.signal,

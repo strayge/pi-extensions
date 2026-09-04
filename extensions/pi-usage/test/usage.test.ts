@@ -29,6 +29,13 @@ const codexModel = {
   baseUrl: "https://chatgpt.com/backend-api",
 };
 
+function codexJwt(accountId: string, signature: string): string {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "RS256" })}.${encode({
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+  })}.${signature}`;
+}
+
 async function settle(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -140,6 +147,7 @@ test("/usage caches enriched Codex reports and refreshes both requests together"
 
   const choices = ["Close", "Close", "Refresh usage", "Close"];
   const titles: string[] = [];
+  const menuOptions: string[][] = [];
   const mock = createMockPi();
   usageExtension(mock.pi);
   const command = mock.commands.get("usage");
@@ -148,8 +156,9 @@ test("/usage caches enriched Codex reports and refreshes both requests together"
     hasUI: true,
     mode: "rpc",
     model: codexModel,
-    select: async (title: string) => {
+    select: async (title: string, options: string[]) => {
       titles.push(title);
+      menuOptions.push(options);
       return choices.shift();
     },
     modelRegistry: {
@@ -164,6 +173,7 @@ test("/usage caches enriched Codex reports and refreshes both requests together"
   await command.handler("", ctx);
   assert.equal(urls.length, 2);
   assert.match(titles[0] ?? "", /Usage limit resets:\s+1 available/);
+  assert.ok(!menuOptions[0]?.includes("Use one reset…"));
 
   await command.handler("", ctx);
   assert.equal(urls.length, 2);
@@ -177,6 +187,280 @@ test("/usage caches enriched Codex reports and refreshes both requests together"
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
   ]);
   assert.match(titles[3] ?? "", /Usage limit resets:\s+3 available/);
+});
+
+test("/usage confirms and redeems one backend-selected reset before refreshing", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
+  let redeemed = false;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    requests.push({ url, init });
+    if (url.endsWith("/consume")) {
+      redeemed = true;
+      return new Response(JSON.stringify({ code: "reset", windows_reset: 2 }), { status: 200 });
+    }
+    if (url.endsWith("/wham/usage")) {
+      return new Response(
+        JSON.stringify({ rate_limit_reset_credits: { available_count: redeemed ? 0 : 1 } }),
+        { status: 200 },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        available_count: 1,
+        credits: [{ status: "available", expires_at: null }],
+      }),
+      { status: 200 },
+    );
+  };
+
+  const choices = ["Use one reset…", "Close"];
+  const selections: string[][] = [];
+  const confirmations: Array<{ title: string; message: string }> = [];
+  const mock = createMockPi();
+  usageExtension(mock.pi);
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  const { ctx, notifications } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model: codexModel,
+    select: async (_title: string, options: string[]) => {
+      selections.push(options);
+      return choices.shift();
+    },
+    confirm: async (title: string, message: string) => {
+      confirmations.push({ title, message });
+      return true;
+    },
+    modelRegistry: {
+      getProviderAuth: async () => ({
+        auth: { apiKey: codexJwt("workspace-active", "test-signature") },
+      }),
+      getAvailable: () => [codexModel],
+      getAll: () => [codexModel],
+      getProviderAuthStatus: () => ({ configured: true }),
+      getProviderDisplayName: (provider: string) => provider,
+    },
+  });
+
+  await command.handler("", ctx);
+
+  assert.deepEqual(selections[0], ["Refresh usage", "Use one reset…", "Display options…", "Close"]);
+  assert.deepEqual(selections[1], ["Refresh usage", "Display options…", "Close"]);
+  assert.match(confirmations[0]?.title ?? "", /Use one saved reset/);
+  assert.match(confirmations[0]?.message ?? "", /cannot be undone/);
+  const consumeRequest = requests.find((request) => request.url.endsWith("/consume"));
+  assert.equal(consumeRequest?.init?.method, "POST");
+  const body = JSON.parse(String(consumeRequest?.init?.body)) as Record<string, unknown>;
+  assert.match(String(body.redeem_request_id), /^[0-9a-f-]{36}$/u);
+  assert.equal("credit_id" in body, false);
+  assert.match(notifications.at(-1)?.message ?? "", /2 usage windows were reset/);
+});
+
+test("a second /usage flow cancels the first before it can redeem", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let postRequests = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/consume")) {
+      postRequests += 1;
+      return new Response(JSON.stringify({ code: "reset" }), { status: 200 });
+    }
+    const body = url.endsWith("/wham/usage")
+      ? { rate_limit_reset_credits: { available_count: 1 } }
+      : {
+          available_count: 1,
+          credits: [{ status: "available", expires_at: null }],
+        };
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+
+  const choices = ["Use one reset…", "Close"];
+  let confirmStarted = () => undefined;
+  const confirmationStarted = new Promise<void>((resolve) => {
+    confirmStarted = resolve;
+  });
+  const mock = createMockPi();
+  usageExtension(mock.pi);
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  const { ctx } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model: codexModel,
+    select: async () => choices.shift(),
+    confirm: async (_title: string, _message: string, options: { signal?: AbortSignal }) => {
+      confirmStarted();
+      return new Promise<boolean>((resolve) => {
+        if (options.signal?.aborted) resolve(false);
+        else options.signal?.addEventListener("abort", () => resolve(false), { once: true });
+      });
+    },
+    modelRegistry: {
+      getProviderAuth: async () => ({
+        auth: { apiKey: codexJwt("workspace-active", "test-signature") },
+      }),
+      getAvailable: () => [codexModel],
+      getAll: () => [codexModel],
+      getProviderAuthStatus: () => ({ configured: true }),
+      getProviderDisplayName: (provider: string) => provider,
+    },
+  });
+
+  const first = command.handler("", ctx);
+  await confirmationStarted;
+  const second = command.handler("", ctx);
+  await Promise.all([first, second]);
+
+  assert.equal(postRequests, 0);
+});
+
+test("/usage reuses an idempotency key when a reset outcome is unknown", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const redemptionBodies: string[] = [];
+  const redemptionAuthorizations: string[] = [];
+  let redemptionAttempts = 0;
+  let usageRequests = 0;
+  let activeToken = codexJwt("workspace-active", "first-signature");
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/consume")) {
+      redemptionAttempts += 1;
+      redemptionBodies.push(String(init?.body));
+      redemptionAuthorizations.push(
+        String((init?.headers as Record<string, string> | undefined)?.Authorization),
+      );
+      if (redemptionAttempts === 1) {
+        activeToken = codexJwt("workspace-active", "refreshed-signature");
+        throw new Error("connection lost");
+      }
+      return new Response(JSON.stringify({ code: "already_redeemed" }), { status: 200 });
+    }
+    if (url.endsWith("/wham/usage")) {
+      usageRequests += 1;
+      if (usageRequests === 2) return new Response("refresh failed", { status: 503 });
+      return new Response(
+        JSON.stringify({
+          rate_limit_reset_credits: { available_count: redemptionAttempts >= 2 ? 0 : 1 },
+        }),
+        { status: 200 },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        available_count: 1,
+        credits: [{ status: "available", expires_at: null }],
+      }),
+      { status: 200 },
+    );
+  };
+
+  const choices = ["Use one reset…", "Refresh usage", "Retry using reset…", "Close"];
+  const selections: string[][] = [];
+  const mock = createMockPi();
+  usageExtension(mock.pi);
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  const { ctx, notifications } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model: codexModel,
+    select: async (_title: string, options: string[]) => {
+      selections.push(options);
+      return choices.shift();
+    },
+    confirm: async () => true,
+    modelRegistry: {
+      getProviderAuth: async () => ({ auth: { apiKey: activeToken } }),
+      getAvailable: () => [codexModel],
+      getAll: () => [codexModel],
+      getProviderAuthStatus: () => ({ configured: true }),
+      getProviderDisplayName: (provider: string) => provider,
+    },
+  });
+
+  await command.handler("", ctx);
+
+  assert.ok(selections[1]?.includes("Retry using reset…"));
+  assert.ok(selections[2]?.includes("Retry using reset…"));
+  assert.equal(redemptionBodies.length, 2);
+  assert.equal(redemptionBodies[0], redemptionBodies[1]);
+  assert.notEqual(redemptionAuthorizations[0], redemptionAuthorizations[1]);
+  assert.match(notifications[0]?.message ?? "", /outcome is unknown/);
+  assert.match(notifications[1]?.message ?? "", /already completed/);
+});
+
+test("/usage discards stale cached credits before a failed post-redemption refresh", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let usageRequests = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/consume")) {
+      return new Response(JSON.stringify({ code: "reset", windows_reset: 1 }), { status: 200 });
+    }
+    if (url.endsWith("/wham/usage")) {
+      usageRequests += 1;
+      if (usageRequests > 1) return new Response("refresh failed", { status: 503 });
+      return new Response(JSON.stringify({ rate_limit_reset_credits: { available_count: 1 } }), {
+        status: 200,
+      });
+    }
+    return new Response(
+      JSON.stringify({
+        available_count: 1,
+        credits: [{ status: "available", expires_at: null }],
+      }),
+      { status: 200 },
+    );
+  };
+
+  const choices = ["Use one reset…", "Close", "Close"];
+  const selections: string[][] = [];
+  const mock = createMockPi();
+  usageExtension(mock.pi);
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  const { ctx, statuses } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model: codexModel,
+    select: async (_title: string, options: string[]) => {
+      selections.push(options);
+      return choices.shift();
+    },
+    confirm: async () => true,
+    modelRegistry: {
+      getProviderAuth: async () => ({
+        auth: { apiKey: codexJwt("workspace-active", "test-signature") },
+      }),
+      getAvailable: () => [codexModel],
+      getAll: () => [codexModel],
+      getProviderAuthStatus: () => ({ configured: true }),
+      getProviderDisplayName: (provider: string) => provider,
+    },
+  });
+
+  await command.handler("", ctx);
+  await command.handler("", ctx);
+
+  assert.equal(usageRequests, 2);
+  assert.ok(!selections[1]?.includes("Use one reset…"));
+  assert.ok(!selections[2]?.includes("Use one reset…"));
+  assert.equal(statuses.get("usage"), "usage error");
 });
 
 test("command arguments are rejected instead of becoming a hidden interface", async () => {

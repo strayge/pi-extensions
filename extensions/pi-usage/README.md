@@ -11,7 +11,7 @@ limits, without pretending those limits mean the same thing.
 
 | Command | Effect |
 | --- | --- |
-| `/usage` | Show usage for the current account, with refresh and display actions |
+| `/usage` | Show usage for the current account, with refresh, saved-reset, and display actions |
 
 The command takes no arguments — refresh and display options are menu actions,
 not flags.
@@ -33,7 +33,21 @@ Expiration detail comes from the read-only `/wham/rate-limit-reset-credits`
 endpoint and appears only in `/usage`; it does not widen or otherwise change the
 statusline. That secondary request is best effort, so if it fails or times out,
 the summary count remains visible as `N available` without an expiration
-suffix. The extension reports reset credits but does not redeem them.
+suffix.
+
+When at least one reset is available and the active Codex token identifies its
+account, `/usage` offers **Use one reset…**. The action always asks for
+confirmation, then lets Codex choose and consume the next available reset
+through `/wham/rate-limit-reset-credits/consume`. Every attempt uses an
+idempotency key. An uncertain request is recorded in
+`usage-redemptions.json` before it is sent and retried with the same key—even
+after token refresh or extension reload—so retries continue the same logical
+redemption instead of starting another. Invalid, unreadable, or locked state
+disables the action rather than silently losing that protection.
+
+The report is fetched again after a definitive response instead of guessing
+which limits changed. The backend remains authoritative and may report that
+there is no eligible window to reset without consuming a credit.
 
 Statusline: `codex [███┃░░░░] 41% 3h 12m`, or `codex spark [█░░░░░░░] 10%`. The
 bucket matching the current Codex model is preferred when one is available. See

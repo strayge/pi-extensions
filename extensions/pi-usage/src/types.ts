@@ -56,6 +56,8 @@ export interface ResolvedUsageAuth {
   apiKey?: string;
   headers: Record<string, string>;
   fingerprint: string;
+  /** Stable across processes when Codex exposes an account-routing claim. */
+  accountKey?: string;
   secrets: string[];
   model: PiModel;
 }
@@ -133,3 +135,14 @@ export type CodexResetCreditsPayload = {
   available_count?: unknown;
   credits?: unknown;
 };
+
+export type CodexResetCreditRedemptionCode =
+  | "reset"
+  | "nothing_to_reset"
+  | "no_credit"
+  | "already_redeemed";
+
+export interface CodexResetCreditRedemption {
+  code: CodexResetCreditRedemptionCode;
+  windowsReset: number;
+}

@@ -7,7 +7,12 @@ import {
   sanitizeDisplayText,
   UsageCache,
 } from "../src/core.ts";
-import { queryProviderUsage, resolveUsageAuth, SUPPORTED_ADAPTERS } from "../src/query.ts";
+import {
+  queryProviderUsage,
+  redeemCodexResetCredit,
+  resolveUsageAuth,
+  SUPPORTED_ADAPTERS,
+} from "../src/query.ts";
 import type { UsageReport } from "../src/types.ts";
 import { createMockContext } from "./support.ts";
 
@@ -206,6 +211,7 @@ test("Codex auth derives its account route from the active token and fingerprint
 
   assert.deepEqual(auth?.headers, expectedHeaders);
   assert.equal(auth?.fingerprint, fingerprintResolvedAuth({ headers: expectedHeaders }, salt));
+  assert.match(auth?.accountKey ?? "", /^[0-9a-f]{64}$/u);
   assert.notEqual(
     auth?.fingerprint,
     fingerprintResolvedAuth({ headers: { Authorization: `Bearer ${activeToken}` } }, salt),
@@ -235,6 +241,7 @@ test("Codex auth omits account routing for opaque tokens and unsafe claims", asy
 
     const auth = await resolveUsageAuth(ctx, adapter, Buffer.alloc(32, 8));
     assert.deepEqual(auth?.headers, { Authorization: `Bearer ${token}` });
+    assert.equal(auth?.accountKey, undefined);
   }
 });
 
@@ -397,6 +404,59 @@ test("Codex fetches reset-credit details with routed auth and rejects redirects"
   assert.deepEqual(report.metrics[0]?.resetExpirations, [
     { kind: "dated", expiresAt: Date.parse("2027-07-17T00:00:00Z") / 1_000 },
   ]);
+});
+
+test("Codex reset redemption posts one idempotent request with routed auth", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let request:
+    | {
+        url: string;
+        init: RequestInit | undefined;
+      }
+    | undefined;
+  globalThis.fetch = async (input, init) => {
+    request = { url: String(input), init };
+    return new Response(JSON.stringify({ code: "reset", windows_reset: 2 }), { status: 200 });
+  };
+  const outcome = await redeemCodexResetCredit(
+    {
+      headers: {
+        Authorization: "Bearer codex-secret",
+        "ChatGPT-Account-Id": "workspace-active",
+      },
+      fingerprint: "fingerprint",
+      secrets: ["codex-secret", "workspace-active"],
+      model: {
+        id: "gpt-5.3-codex",
+        name: "GPT-5.3 Codex",
+        provider: "openai-codex",
+        baseUrl: "https://chatgpt.com/backend-api",
+      } as never,
+    },
+    "redeem-request-123",
+    new AbortController().signal,
+    1_000,
+  );
+
+  assert.deepEqual(outcome, { code: "reset", windowsReset: 2 });
+  assert.equal(
+    request?.url,
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+  );
+  assert.equal(request?.init?.method, "POST");
+  assert.equal(request?.init?.redirect, "error");
+  assert.deepEqual(request?.init?.headers, {
+    Authorization: "Bearer codex-secret",
+    "ChatGPT-Account-Id": "workspace-active",
+    "User-Agent": "pi-usage",
+    "Content-Type": "application/json",
+  });
+  assert.deepEqual(JSON.parse(String(request?.init?.body)), {
+    redeem_request_id: "redeem-request-123",
+  });
 });
 
 test("Codex preserves the primary report when reset-credit details fail or time out", async (t) => {

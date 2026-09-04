@@ -8,6 +8,7 @@
  * accounts. A query that finishes after the model has moved on is discarded.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   BorderedLoader,
   type ExtensionAPI,
@@ -28,12 +29,15 @@ import {
   adapterForProvider,
   isStaleExtensionContextError,
   queryProviderUsage,
+  redeemCodexResetCredit,
   resolveUsageAuth,
 } from "./query.ts";
+import { PendingRedemptionStore, REDEMPTION_STATE_FILE_NAME } from "./redemption-store.ts";
 import { sampleUsageReport } from "./sample.ts";
 import { applyUsageSlotOptions, usageSlotDefaults, usageSlotFields } from "./statusline-schema.ts";
 import { publishStatuslineItem, registerStatuslineSlot } from "./statusline-slot.ts";
 import type {
+  CodexResetCreditRedemption,
   PiModel,
   ProviderUsageState,
   UsageDisplayConfig,
@@ -49,10 +53,16 @@ const MAX_REMEMBERED_FAILURES = 8;
 const STATUS_KEY = "usage";
 
 const REFRESH = "Refresh usage";
+const USE_RESET = "Use one reset…";
+const RETRY_RESET = "Retry using reset…";
 const DISPLAY = "Display options…";
 const CLOSE = "Close";
 
-type QueryOutcome = { state: ProviderUsageState; fingerprint?: string };
+type QueryOutcome = {
+  state: ProviderUsageState;
+  fingerprint?: string;
+  accountKey?: string;
+};
 
 type LoaderResult<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
@@ -63,6 +73,7 @@ export default function usageExtension(pi: ExtensionAPI) {
   const publishSlot = publishStatuslineItem(pi, { id: STATUS_KEY });
   const cache = new UsageCache(CACHE_TTL_MS);
   const failures = new Map<string, { until: number; message: string }>();
+  const pendingRedemptions = new PendingRedemptionStore();
 
   // Re-read at session start, so an edit to usage.json lands on the next
   // session without a restart.
@@ -207,6 +218,9 @@ export default function usageExtension(pi: ExtensionAPI) {
     return undefined;
   };
 
+  const redemptionIdFor = (accountKey: string): string =>
+    pendingRedemptions.getOrCreate(accountKey, randomUUID());
+
   const state = (
     adapter: UsageProviderAdapter,
     status: "auth-unavailable" | "query-failed",
@@ -281,6 +295,7 @@ export default function usageExtension(pi: ExtensionAPI) {
         report,
       },
       fingerprint: auth?.fingerprint,
+      accountKey: auth?.accountKey,
     });
 
     if (!force) {
@@ -289,7 +304,11 @@ export default function usageExtension(pi: ExtensionAPI) {
 
       const failed = recentFailure(`${adapter.id}:${auth.fingerprint}`);
       if (failed) {
-        return { state: state(adapter, "query-failed", failed), fingerprint: auth.fingerprint };
+        return {
+          state: state(adapter, "query-failed", failed),
+          fingerprint: auth.fingerprint,
+          accountKey: auth.accountKey,
+        };
       }
     }
 
@@ -303,7 +322,11 @@ export default function usageExtension(pi: ExtensionAPI) {
       if (isStaleExtensionContextError(error) || isAbortError(error)) throw error;
       const message = errorMessage(error);
       rememberFailure(`${adapter.id}:${auth.fingerprint}`, message);
-      return { state: state(adapter, "query-failed", message), fingerprint: auth.fingerprint };
+      return {
+        state: state(adapter, "query-failed", message),
+        fingerprint: auth.fingerprint,
+        accountKey: auth.accountKey,
+      };
     }
   };
 
@@ -433,6 +456,7 @@ export default function usageExtension(pi: ExtensionAPI) {
     // The command owns the account question while it is open; a background
     // refresh landing mid-menu would redraw under the user.
     cancelRefresh();
+    menuController?.abort();
     const controller = new AbortController();
     menuController = controller;
 
@@ -457,15 +481,144 @@ export default function usageExtension(pi: ExtensionAPI) {
           }
         }
 
+        const availableResets = availableResetCredits(outcome);
+        const expectedFingerprint = outcome.fingerprint;
+        const expectedAccountKey = outcome.accountKey;
+        const pendingRedemption =
+          expectedAccountKey && pendingRedemptions.available
+            ? pendingRedemptions.get(expectedAccountKey)
+            : undefined;
+        const resetAction = pendingRedemption
+          ? RETRY_RESET
+          : availableResets > 0 && expectedAccountKey && pendingRedemptions.available
+            ? USE_RESET
+            : undefined;
         const action = await ctx.ui.select(
           formatProviderState(outcome.state, display),
-          [REFRESH, DISPLAY, CLOSE],
+          [REFRESH, ...(resetAction ? [resetAction] : []), DISPLAY, CLOSE],
           { signal: controller.signal },
         );
         if (action === REFRESH) {
           force = true;
           outcome = undefined;
           continue;
+        }
+        if (resetAction && action === resetAction && expectedFingerprint && expectedAccountKey) {
+          const retrying = resetAction === RETRY_RESET;
+          const confirmed = await ctx.ui.confirm(
+            retrying ? "Retry using a saved reset?" : "Use one saved reset?",
+            retrying
+              ? "The previous outcome is unknown. Retry the same idempotent request without risking a second reset?"
+              : `Codex will choose and consume one of ${availableResets} saved resets for the current account. This cannot be undone.`,
+            { signal: controller.signal },
+          );
+          if (!confirmed || controller.signal.aborted) continue;
+
+          let requestId: string;
+          try {
+            // Reserve before asynchronous auth preflight. Concurrent sessions
+            // that confirmed from the same snapshot then share one logical
+            // redemption even if one reaches the backend first.
+            requestId = redemptionIdFor(expectedAccountKey);
+          } catch (error) {
+            ctx.ui.notify(`Could not use a reset: ${errorMessage(error)}`, "warning");
+            continue;
+          }
+
+          let startedAccountKey: string | undefined;
+          try {
+            const result = await runWithLoader(
+              ctx,
+              retrying ? "Retrying reset…" : "Using reset…",
+              controller.signal,
+              async (signal) => {
+                const startedAt = Date.now();
+                const currentModel = ctx.model;
+                const adapter = adapterForProvider(currentModel?.provider);
+                if (
+                  adapter?.id !== "openai-codex" ||
+                  modelIdentity(currentModel) !== modelIdentity(model)
+                ) {
+                  return { kind: "account-changed" as const };
+                }
+                const auth = await awaitWithDeadline(
+                  resolveUsageAuth(ctx, adapter),
+                  signal,
+                  DEFAULT_TIMEOUT_MS,
+                  "resolving OpenAI Codex runtime auth",
+                );
+                if (!auth) return { kind: "auth-unavailable" as const };
+                if (
+                  auth.accountKey !== expectedAccountKey ||
+                  modelIdentity(ctx.model) !== modelIdentity(model)
+                ) {
+                  return { kind: "account-changed" as const };
+                }
+
+                const remainingMs = Math.max(1, DEFAULT_TIMEOUT_MS - (Date.now() - startedAt));
+                startedAccountKey = expectedAccountKey;
+                const response = await redeemCodexResetCredit(auth, requestId, signal, remainingMs);
+                return {
+                  kind: "response" as const,
+                  accountKey: expectedAccountKey,
+                  requestId,
+                  response,
+                };
+              },
+            );
+            if (!result) {
+              if (controller.signal.aborted) return;
+              if (startedAccountKey) {
+                ctx.ui.notify(
+                  "Reset outcome is unknown. Retry from this menu to reuse the same safe request.",
+                  "warning",
+                );
+              }
+              continue;
+            }
+            if (result.kind === "account-changed") {
+              ctx.ui.notify(
+                "The active Codex model or account changed. Usage will be refreshed before a reset can be used.",
+                "warning",
+              );
+              force = true;
+              outcome = undefined;
+              continue;
+            }
+            if (result.kind === "auth-unavailable") {
+              ctx.ui.notify("OpenAI Codex authorization is no longer available.", "warning");
+              force = true;
+              outcome = undefined;
+              continue;
+            }
+
+            try {
+              pendingRedemptions.delete(result.accountKey, result.requestId);
+            } catch (error) {
+              ctx.ui.notify(
+                `Reset completed, but ${REDEMPTION_STATE_FILE_NAME} could not be updated: ${errorMessage(error)}`,
+                "warning",
+              );
+            }
+            cache.clearProvider("openai-codex");
+            failures.delete(`openai-codex:${expectedFingerprint}`);
+            latest = undefined;
+            statuslineSlot.refresh();
+            safeSetStatus(ctx, "checking", model);
+            notifyRedemptionOutcome(ctx, result.response);
+            force = true;
+            outcome = undefined;
+            continue;
+          } catch (error) {
+            if (controller.signal.aborted) return;
+            ctx.ui.notify(
+              startedAccountKey
+                ? `Reset outcome is unknown: ${errorMessage(error)} Retry to reuse the same safe request.`
+                : `Could not use a reset: ${errorMessage(error)}`,
+              "warning",
+            );
+            continue;
+          }
         }
         if (action !== DISPLAY) return;
         await showDisplayMenu(ctx, {
@@ -479,11 +632,13 @@ export default function usageExtension(pi: ExtensionAPI) {
       }
     } finally {
       controller.abort();
-      if (menuController === controller) menuController = undefined;
+      const stillOwnsMenu = menuController === controller;
+      if (stillOwnsMenu) menuController = undefined;
       // The menu already published what it found, so only the cadence needs
-      // re-arming — querying again here would repeat what just landed.
+      // re-arming — querying again here would repeat what just landed. A menu
+      // superseded by another invocation no longer owns that cadence.
       const model = ctx.model;
-      if (sessionActive && model && adapterForProvider(model.provider)) {
+      if (stillOwnsMenu && sessionActive && model && adapterForProvider(model.provider)) {
         scheduleRefresh(ctx, model);
       }
     }
@@ -518,6 +673,12 @@ export default function usageExtension(pi: ExtensionAPI) {
       ctx.ui.notify(`${CONFIG_FILE_NAME}: ${warning}`, "warning");
     }
     displayWarnings = [];
+    if (pendingRedemptions.loadError) {
+      ctx.ui.notify(
+        `${REDEMPTION_STATE_FILE_NAME}: ${pendingRedemptions.loadError}; reset redemption is disabled`,
+        "warning",
+      );
+    }
     startRefresh(ctx, ctx.model, false);
   });
   pi.on("session_tree", (_event, ctx) => {
@@ -538,6 +699,44 @@ export default function usageExtension(pi: ExtensionAPI) {
     failures.clear();
     safeSetStatus(ctx, undefined);
   });
+}
+
+function availableResetCredits(outcome: QueryOutcome): number {
+  if (
+    outcome.state.status !== "ready" ||
+    outcome.state.providerId !== "openai-codex" ||
+    !outcome.fingerprint
+  ) {
+    return 0;
+  }
+  const value = outcome.state.report.metrics.find((metric) => metric.id === "reset-credits")?.value;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function notifyRedemptionOutcome(
+  ctx: ExtensionCommandContext,
+  outcome: CodexResetCreditRedemption,
+): void {
+  if (outcome.code === "reset") {
+    const windows =
+      outcome.windowsReset > 0
+        ? ` ${outcome.windowsReset} usage ${outcome.windowsReset === 1 ? "window was" : "windows were"} reset.`
+        : "";
+    ctx.ui.notify(`Used one saved reset.${windows}`, "info");
+    return;
+  }
+  if (outcome.code === "already_redeemed") {
+    ctx.ui.notify("That redemption had already completed. Usage will be refreshed.", "info");
+    return;
+  }
+  if (outcome.code === "nothing_to_reset") {
+    ctx.ui.notify(
+      "No eligible usage window can be reset right now; no reset was consumed.",
+      "warning",
+    );
+    return;
+  }
+  ctx.ui.notify("No saved reset is available for this account.", "warning");
 }
 
 function providerDisplayName(ctx: ExtensionContext, providerId: string): string {
