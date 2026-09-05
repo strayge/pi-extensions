@@ -417,8 +417,14 @@ describe("FleetList rendering", () => {
   it("renders main + agent rows with markers, type, description and right-aligned stats", () => {
     const h = harness([makeRecord({ description: "Sleep then report 1" })]);
     const lines = h.render(120);
-    // hint + blank + main + one agent
+    // hint + main + one agent, no blank rows: pi adds no spacing around a
+    // belowEditor widget, so every row here is one the component chose to emit.
+    expect(lines).toHaveLength(3);
+    expect(lines.some(l => l.trim() === "")).toBe(false);
     expect(lines[0]).toContain("← for agents");
+    // The indent is the roster's marker — the hint sits outside it.
+    expect(lines[0].startsWith("  ")).toBe(false);
+    expect(lines.slice(1).every(l => l.startsWith("  "))).toBe(true);
     expect(lines.find(l => l.includes("main"))).toContain("●"); // main selected by default
     const agentLine = lines.find(l => l.includes("Sleep then report 1"))!;
     expect(agentLine).toContain("○");
