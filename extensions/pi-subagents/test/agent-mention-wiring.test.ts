@@ -1016,7 +1016,7 @@ describe("resuming an evicted agent by name", () => {
     const record = manager.getRecord(id);
     record.sessionFile = sessionPath();
     writeFileSync(record.sessionFile, "");
-    record.completedAt = Date.now() - 11 * 60_000;
+    record.completedAt = Date.now() - 61 * 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
     return manager;
   }
