@@ -159,9 +159,9 @@ export function formatSessionTokens(
   return `${tokenStr} (${annot.join(" · ")})`;
 }
 
-/** Format turn count with optional max limit: "↻5≤30" or "↻5". */
+/** Format turn progress with an optional limit: "turns: 5/30" or "turns: 5". */
 export function formatTurns(turnCount: number, maxTurns?: number | null): string {
-  return maxTurns != null ? `↻${turnCount}≤${maxTurns}` : `↻${turnCount}`;
+  return maxTurns != null ? `turns: ${turnCount}/${maxTurns}` : `turns: ${turnCount}`;
 }
 
 /** Format milliseconds as human-readable duration. */
@@ -195,6 +195,7 @@ export function getPromptModeLabel(type: SubagentType): string | undefined {
  */
 export function buildInvocationTags(
   invocation: AgentInvocation | undefined,
+  options: { includeMaxTurns?: boolean } = {},
 ): { modelName?: string; modelId?: string; tags: string[] } {
   const tags: string[] = [];
   if (!invocation) return { tags };
@@ -206,7 +207,11 @@ export function buildInvocationTags(
   if (invocation.isolation === "worktree") tags.push("worktree");
   if (invocation.inheritContext) tags.push("inherit context");
   if (invocation.runInBackground) tags.push("background");
-  if (invocation.maxTurns != null) tags.push(`max turns: ${invocation.maxTurns}`);
+  // Omissible where the caller shows turn progress separately — otherwise the
+  // same limit renders twice (`max turns: 30` beside `turns: 5/30`).
+  if (options.includeMaxTurns !== false && invocation.maxTurns != null) {
+    tags.push(`max turns: ${invocation.maxTurns}`);
+  }
   return {
     modelName: asked(invocation.modelName, invocation.requestedModel),
     modelId: asked(invocation.modelId, invocation.requestedModel),

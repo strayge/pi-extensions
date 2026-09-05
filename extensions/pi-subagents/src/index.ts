@@ -686,7 +686,7 @@ export default function (pi: ExtensionAPI) {
     //
     // The turn limit is resolved rather than read off `options`, which a mention
     // spawn deliberately omits so the agent's own config can decide: a tracker
-    // built with `undefined` renders `↻3` where the Agent tool renders `↻3≤20`.
+    // built with `undefined` renders `turns: 3` where the Agent tool renders `turns: 3/20`.
     // Like the tool's own, it is a prediction — editing the agent file mid-run
     // leaves the displayed ceiling stale.
     const { state, callbacks } = createActivityTracker(resolveEffectiveMaxTurns(dispatch.type, options?.maxTurns));
@@ -1689,7 +1689,7 @@ Terse command-style prompts produce shallow, generic work.
         return new Text(text, 0, 0);
       }
 
-      // Helper: build "haiku · thinking: high · ↻5≤30 · 3 tool uses · 33.8k tokens" stats string
+      // Helper: build "haiku · thinking: high · turns: 5/30 · 3 tool uses · 33.8k tokens" stats string
       const stats = (d: AgentDetails) => {
         const parts: string[] = [];
         if (d.modelName) parts.push(d.modelName);
@@ -1896,7 +1896,7 @@ Terse command-style prompts produce shallow, generic work.
       };
       // Tool-result render shows the mode label too; viewer's header already does.
       const modeLabel = getPromptModeLabel(subagentType);
-      const { tags: invocationTags } = buildInvocationTags(agentInvocation);
+      const { tags: invocationTags } = buildInvocationTags(agentInvocation, { includeMaxTurns: false });
       const agentTags = modeLabel ? [modeLabel, ...invocationTags] : invocationTags;
       const detailBase = {
         displayName,
@@ -2401,7 +2401,7 @@ Terse command-style prompts produce shallow, generic work.
           description: `Workflow ${task.workflowName ?? task.id}`,
           status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
           toolUses: task.totalToolCalls,
-          // A workflow has agents, not turns; rendering "↻0" would be noise.
+          // A workflow has agents, not turns; rendering "turns: 0" would be noise.
           turnCount: 0,
           totalTokens: task.totalTokens,
           durationMs: elapsedMs(task, Date.now()),

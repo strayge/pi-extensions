@@ -463,7 +463,7 @@ describe("mentioning an agent that has never run", () => {
   it("shows the turn limit it will actually be held to (#181)", async () => {
     // The spawn passes no maxTurns on purpose (see the test above), so the
     // tracker has to resolve the same limit runAgent will enforce — otherwise
-    // the row reads `↻1` where the Agent tool would read `↻1≤9`.
+    // the row reads `turns: 1` where the Agent tool would read `turns: 1/9`.
     const prevMax = getDefaultMaxTurns();
     try {
       const { lifecycle } = bootDirect({ defaultMaxTurns: 9 });
@@ -484,7 +484,7 @@ describe("mentioning an agent that has never run", () => {
 
       const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
       const lines = factory({ terminal: { columns: 200 }, requestRender: vi.fn() }, theme).render().join("\n");
-      expect(lines).toContain("≤9");
+      expect(lines).toContain("turns: 1/9");
     } finally {
       setDefaultMaxTurns(prevMax);
     }
