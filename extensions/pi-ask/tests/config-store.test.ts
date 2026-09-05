@@ -7,7 +7,9 @@ import { DEFAULT_ASK_CONFIG } from "../src/config/defaults.ts";
 import type { AskConfig } from "../src/config/schema.ts";
 import {
 	AskConfigStore,
+	getAskConfigPath,
 	getAskConfigStore,
+	getLegacyAskConfigPaths,
 	resetAskConfigStore,
 } from "../src/config/store.ts";
 
@@ -39,7 +41,7 @@ test("resetAskConfigStore reloads the global store from disk", async () => {
 	const root = await import("node:fs/promises").then(({ mkdtemp }) =>
 		mkdtemp(join(tmpdir(), "pi-ask-config-reset-"))
 	);
-	const path = join(root, "extensions", "eko24ive-pi-ask.json");
+	const path = join(root, "eko24ive-pi-ask.json");
 	await mkdir(dirname(path), { recursive: true });
 	await writeFile(
 		path,
@@ -191,12 +193,31 @@ test("config store loads migrated config without rewriting", async () => {
 	await rm(dirname(path), { force: true, recursive: true });
 });
 
-test("config store reads legacy root config without copying it", async () => {
+test("default config path lives at the agent root with extensions fallback", async () => {
+	const root = await import("node:fs/promises").then(({ mkdtemp }) =>
+		mkdtemp(join(tmpdir(), "pi-ask-config-paths-"))
+	);
+	process.env.PI_CODING_AGENT_DIR = root;
+	resetAskConfigStore();
+	try {
+		assert.equal(getAskConfigPath(), join(root, "eko24ive-pi-ask.json"));
+		assert.deepEqual(getLegacyAskConfigPaths(), [
+			join(root, "extensions", "eko24ive-pi-ask.json"),
+		]);
+	} finally {
+		delete process.env.PI_CODING_AGENT_DIR;
+		resetAskConfigStore();
+	}
+	await rm(root, { force: true, recursive: true });
+});
+
+test("config store reads legacy extensions config without copying it", async () => {
 	const root = await import("node:fs/promises").then(({ mkdtemp }) =>
 		mkdtemp(join(tmpdir(), "pi-ask-config-legacy-"))
 	);
-	const path = join(root, "extensions", "eko24ive-pi-ask.json");
-	const legacyPath = join(root, "eko24ive-pi-ask.json");
+	const path = join(root, "eko24ive-pi-ask.json");
+	const legacyPath = join(root, "extensions", "eko24ive-pi-ask.json");
+	await mkdir(dirname(legacyPath), { recursive: true });
 	await writeFile(
 		legacyPath,
 		JSON.stringify({
@@ -226,13 +247,13 @@ test("config store reads legacy root config without copying it", async () => {
 	await rm(root, { force: true, recursive: true });
 });
 
-test("config store leaves legacy root config when extensions config exists", async () => {
+test("config store leaves legacy extensions config when root config exists", async () => {
 	const root = await import("node:fs/promises").then(({ mkdtemp }) =>
 		mkdtemp(join(tmpdir(), "pi-ask-config-conflict-"))
 	);
-	const path = join(root, "extensions", "eko24ive-pi-ask.json");
-	const legacyPath = join(root, "eko24ive-pi-ask.json");
-	await mkdir(dirname(path), { recursive: true });
+	const path = join(root, "eko24ive-pi-ask.json");
+	const legacyPath = join(root, "extensions", "eko24ive-pi-ask.json");
+	await mkdir(dirname(legacyPath), { recursive: true });
 	await writeFile(
 		path,
 		JSON.stringify({

@@ -53,7 +53,7 @@ This package also bundles the `ask-user` skill profile from `skills/ask-user/SKI
 
 ## Configuration
 
-Config lives at `~/.pi/agent/extensions/eko24ive-pi-ask.json` and is created with defaults on first use. Edit it directly, ask pi to edit it, or toggle behaviour/notification settings in `/ask-settings` (or `?` in-flow). pi-ask treats the config file as user-owned: load-time migrations and invalid files are handled in memory without rewriting it, and read-only configs fail gracefully with a manual-edit message.
+Config lives at `~/.pi/agent/eko24ive-pi-ask.json` and is created with defaults on first use. A pre-fork config at `~/.pi/agent/extensions/eko24ive-pi-ask.json` is still read as a fallback. Edit it directly, ask pi to edit it, or toggle behaviour/notification settings in `/ask-settings` (or `?` in-flow). pi-ask treats the config file as user-owned: load-time migrations and invalid files are handled in memory without rewriting it, and read-only configs fail gracefully with a manual-edit message.
 
 Keymaps are context-aware (`global`, `main`, `editor`, `noteEditor`, `settingsModal`); each action accepts a key string or an array of aliases, following pi-tui key ids with common aliases normalized (`escape` → `esc`, `control+c` → `ctrl+c`, …). Fixed bindings that cannot be remapped:
 
