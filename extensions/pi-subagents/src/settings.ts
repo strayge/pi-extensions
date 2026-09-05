@@ -282,11 +282,11 @@ export interface SubagentsSettings {
    * Whether the widget's running rows name the model driving each agent and the
    * thinking level it is running at.
    *
-   * Off by default, unlike the tool result and the conversation viewer, which
-   * show the pair unconditionally: those have a line to themselves, while the
-   * widget row already carries the description, turns, tool uses, tokens and
-   * elapsed time, and every character it gains is one the description loses on a
-   * narrow terminal.
+   * On by default, like the tool result and the conversation viewer, which
+   * show the pair unconditionally. Turn it off when the row feels too dense:
+   * the widget row already carries the description, turns, tool uses, tokens
+   * and elapsed time, and every character it gains is one the description
+   * loses on a narrow terminal.
    */
   showModel?: boolean;
   /**

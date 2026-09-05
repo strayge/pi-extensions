@@ -469,11 +469,12 @@ export class AgentWidget {
       if (this.showModel()) {
         // Leading, and paired: a thinking level means nothing without the model
         // it applies to. The tag is taken from buildInvocationTags rather than
-        // rebuilt so the "(asked X)" annotation survives.
+        // rebuilt so the "(asked X)" annotation survives — with the `thinking: `
+        // prefix dropped, since beside the model the level reads unambiguously.
         const { modelName, tags } = buildInvocationTags(a.invocation);
         if (modelName) parts.push(modelName);
         const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
-        if (thinkingTag) parts.push(thinkingTag);
+        if (thinkingTag) parts.push(thinkingTag.slice("thinking: ".length));
       }
       if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
       if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);

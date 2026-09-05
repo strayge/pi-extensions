@@ -423,7 +423,7 @@ export default function (pi: ExtensionAPI) {
   function isShowCostEnabled(): boolean { return showCost; }
   function setShowCost(b: boolean): void { showCost = b; widget.update(); fleet.update(); }
   /** Name the model and thinking level on the widget's running rows. */
-  let showModel = false;
+  let showModel = true;
   function isShowModelEnabled(): boolean { return showModel; }
   function setShowModel(b: boolean): void { showModel = b; widget.update(); }
   /**
