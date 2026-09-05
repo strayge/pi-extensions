@@ -44,7 +44,7 @@ vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
 // Must import AFTER vi.mock declaration (vitest hoists vi.mock but the
 // dynamic import of the test subject must happen after)
 const { visibleWidth } = await import("@earendil-works/pi-tui");
-const { ConversationViewer, RESULT_MAX_CHARS } = await import("../src/ui/conversation-viewer.js");
+const { ConversationViewer } = await import("../src/ui/conversation-viewer.js");
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -411,7 +411,7 @@ describe("ConversationViewer", () => {
     // The reason `all` is not the default: a tool result is arbitrary bytes, and
     // a Markdown pass rewrites several constructs that occur constantly in real
     // command output. Each line here is a rewrite reproduced against pi-tui.
-    it("leaves tool results byte-exact under the default mode", () => {
+    it("leaves tool results byte-exact within the line cap", () => {
       const raw = [
         "#!/bin/sh",
         "# section",
@@ -424,7 +424,9 @@ describe("ConversationViewer", () => {
       ].join("\n");
       const out = strip(viewerFor(result(raw)).render(80).join("\n"));
 
-      for (const line of raw.split("\n")) expect(out).toContain(line);
+      for (const line of raw.split("\n").slice(0, 7)) expect(out).toContain(line);
+      expect(out).toContain("… 1 more line");
+      expect(out).not.toContain("next");
     });
 
     it("renders tool-result Markdown under `all`", () => {
@@ -498,52 +500,49 @@ describe("ConversationViewer", () => {
       expect(footer).toContain("Esc close");
     });
 
-    it("caps a tool result at RESULT_MAX_CHARS, not 500, and says what it dropped", () => {
-      const lines = Array.from({ length: 3000 }, (_, i) => `line ${i}`);
+    it("caps a tool result at seven lines and says what it dropped", () => {
+      const lines = Array.from({ length: 300 }, (_, i) => `line ${i}`);
       const out = strip(viewerFor(result(lines.join("\n")), undefined, undefined, 4000).render(80).join("\n"));
 
-      expect(out).toContain("line 100");                       // far past the old 500-char cut
-      expect(out).not.toContain("line 2999");                  // but still bounded
-      expect(out).toMatch(/\.\.\. \(truncated, [\d.]+[kM]? more characters\)/);
+      expect(out).toContain("line 6");
+      expect(out).not.toContain("line 7");
+      expect(out).toMatch(/… 293 more lines/);
     });
 
-    it("puts the truncation notice outside the code fence it cut into", () => {
-      const text = `\`\`\`js\n${"const a = 1;\n".repeat(2000)}\`\`\``;
+    it("keeps the truncation notice outside the code fence it cut into", () => {
+      const text = `\`\`\`js\n${"const a = 1;\n".repeat(20)}\`\`\``;
       const viewer = viewerFor(result(text), "all", undefined, 4000);
       const content = ((viewer as any).buildContentLines(76) as string[]).map(strip);
-      const note = content.find(l => l.includes("... (truncated"));
+      const note = content.find(l => l.includes("more lines"));
 
-      // Appended into the content it lands inside the unterminated fence, where
-      // it picks up the code-block indent and reads as a line of the tool's source.
-      expect(note).toMatch(/^\.\.\. \(truncated, [\d.]+[kM]? more characters\)$/);
+      // The notice is its own chrome line below the cut, never appended into
+      // the content where an unterminated fence would render it as source.
+      expect(note).toMatch(/^… \d+ more lines$/);
     });
 
-    it("reports the exact omitted character count", () => {
-      // UTF-16 code units, so the astral character here counts as two.
-      const text = `${"x".repeat(RESULT_MAX_CHARS)}😀x`;
+    it("reports the exact omitted line count", () => {
+      const text = Array.from({ length: 10 }, (_, i) => `row ${i}`).join("\n");
       const viewer = viewerFor(result(text));
       const content = ((viewer as any).buildContentLines(76) as string[]).map(strip);
 
-      expect(content).toContain("... (truncated, 3 more characters)");
+      expect(content).toContain("… 3 more lines");
     });
 
-    it("abbreviates a large omitted count so the notice fits a narrow frame", () => {
-      // The notice goes through truncateToWidth at innerW (width - 4). An exact
-      // count runs to seven digits on a multi-megabyte result and pushes the
-      // notice past 46, where the unit is cut off and only a number survives.
-      const text = `${"x".repeat(RESULT_MAX_CHARS)}${"y".repeat(1_100_000)}`;
-      const note = viewerFor(result(text)).render(50).map(strip).find(l => l.includes("truncated,"));
+    it("keeps the notice short enough for a narrow frame", () => {
+      const text = Array.from({ length: 2000 }, (_, i) => `row ${i}`).join("\n");
+      const note = strip(viewerFor(result(text)).render(50).join("\n")).split("\n")
+        .find(l => l.includes("more lines"));
 
-      expect(note).toContain("1.1M more characters)");
+      expect(note).toContain("… 1993 more lines");
     });
 
-    it("rounds into the M bracket rather than reporting 1000k", () => {
-      // 999,999 / 1000 rounds to 1000.0 — the bracket has to be picked against
-      // the rounded value, not the raw one.
-      const text = `${"x".repeat(RESULT_MAX_CHARS)}${"y".repeat(999_999)}`;
-      const note = strip(viewerFor(result(text)).render(80).join("\n")).split("\n").find(l => l.includes("truncated,"));
+    it("uses the singular for a single held-back line", () => {
+      const text = Array.from({ length: 8 }, (_, i) => `row ${i}`).join("\n");
+      const note = strip(viewerFor(result(text)).render(80).join("\n")).split("\n")
+        .find(l => l.includes("more line"));
 
-      expect(note).toContain("1M more characters");
+      expect(note).toContain("… 1 more line");
+      expect(note).not.toContain("lines");
     });
 
     it("falls back to literal wrapping once for an unsafe streaming prefix", () => {
@@ -577,17 +576,17 @@ describe("ConversationViewer", () => {
 
     it("tracks a tool result that keeps growing past the cap", () => {
       // The live case: the capped prefix never changes, so the parse is reused,
-      // but the character count being held back has to keep moving.
-      const msg = { role: "toolResult", toolUseId: "t", content: [{ type: "text", text: `${"row\n".repeat(4500)}` }] };
+      // but the held-back line count has to keep moving.
+      const msg = { role: "toolResult", toolUseId: "t", content: [{ type: "text", text: `${"row\n".repeat(50)}` }] };
       const viewer = viewerFor([msg]);
       const elided = () => {
         const m = strip(((viewer as any).buildContentLines(76) as string[]).join("\n"))
-          .match(/truncated, ([\d.]+)([kM]?) more/);
-        return Number(m?.[1]) * (m?.[2] === "M" ? 1e6 : m?.[2] === "k" ? 1e3 : 1);
+          .match(/… (\d+) more lines/);
+        return Number(m?.[1]);
       };
 
       const before = elided();
-      msg.content[0].text += "row\n".repeat(1000);
+      msg.content[0].text += "row\n".repeat(20);
       const after = elided();
 
       expect(before).toBeGreaterThan(0);
@@ -596,22 +595,20 @@ describe("ConversationViewer", () => {
     });
 
     it("leaves a result under the cap untouched", () => {
-      // Deliberately between the old 500-char cap and the new one, so the test
-      // discriminates the cap's value and not merely its existence.
-      const text = `head\n${"filler line\n".repeat(200)}tail`;
+      const text = `head\n${"filler line\n".repeat(4)}tail`;
       const out = strip(viewerFor(result(text), undefined, undefined, 600).render(80).join("\n"));
 
-      expect(text.length).toBeLessThan(RESULT_MAX_CHARS);
       expect(out).toContain("head");
       expect(out).toContain("tail");
-      expect(out).not.toContain("truncated");
+      expect(out).not.toContain("more lines");
     });
 
     it("caps bash output with the same rule as a tool result", () => {
-      const messages = [{ role: "bashExecution", command: "yes", output: "y\n".repeat(20000) }];
+      const messages = [{ role: "bashExecution", command: "yes", output: `${"y\n".repeat(20)}tail` }];
       const out = strip(viewerFor(messages).render(80).join("\n"));
 
-      expect(out).toMatch(/\.\.\. \(truncated, [\d.]+[kM]? more characters\)/);
+      expect(out).toMatch(/… 14 more lines/);
+      expect(out).not.toContain("tail");
     });
 
     it("keeps tool results dim even when rendering them as Markdown", () => {
@@ -947,5 +944,64 @@ describe("ConversationViewer", () => {
       expect(strip(out)).toContain("safe text");
       expect(out).not.toContain("\x1b[2A");
     });
+  });
+    describe("call titles and attached results", () => {
+      const strip = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
+      function viewerFor(messages: any[], rows = 200) {
+        return new ConversationViewer(
+          mockTui(rows, 80), mockSession(messages), mockRecord({ status: "completed" }), undefined,
+          ansiTheme(), vi.fn(),
+        );
+      }
+      const call = (id: string, name: string, args: Record<string, unknown>) =>
+        ({ type: "toolCall", id, name, arguments: args });
+      const attached = (id: string, text: string) =>
+        ({ role: "toolResult", toolCallId: id, content: [{ type: "text", text }] });
+
+      it("titles a call with its identifying argument", () => {
+        const out = strip(viewerFor([
+          { role: "assistant", content: [call("c1", "bash", { command: "git ls-files" })] },
+          attached("c1", "ok"),
+        ]).render(80).join("\n"));
+
+        expect(out).toContain("bash git ls-files");
+        expect(out).not.toContain("[Tool: bash]");
+      });
+
+      it("renders each result under the call that produced it", () => {
+        const out = strip(viewerFor([
+          { role: "assistant", content: [
+            call("c1", "read", { path: "/a.py" }),
+            call("c2", "read", { path: "/b.py" }),
+          ] },
+          attached("c2", "b-contents"),
+          attached("c1", "a-contents"),
+        ]).render(120).join("\n"));
+
+        // Swapped arrival order: each result still follows its own call.
+        expect(out.indexOf("a-contents")).toBeGreaterThan(out.indexOf("/a.py"));
+        expect(out.indexOf("a-contents")).toBeLessThan(out.indexOf("/b.py"));
+        expect(out.indexOf("b-contents")).toBeGreaterThan(out.indexOf("/b.py"));
+        expect(out).not.toContain("[Result]");
+      });
+
+      it("still renders results with no matching call as orphans", () => {
+        const out = strip(viewerFor([
+          { role: "assistant", content: [call("c1", "bash", { command: "echo hi" })] },
+          attached("c1", "hi"),
+          attached("nope", "orphan"),
+        ]).render(80).join("\n"));
+
+        expect(out).toContain("[Result]");
+        expect(out).toContain("orphan");
+      });
+
+      it("quotes user text with a > marker", () => {
+        const out = strip(viewerFor([
+          { role: "user", content: "hello there" },
+        ]).render(80).join("\n"));
+
+        expect(out).toContain("> hello there");
+      });
   });
 });

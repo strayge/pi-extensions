@@ -22,19 +22,6 @@ const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 70;
 
-/**
- * Cap on a single tool result or bash output before the viewer elides the rest.
- *
- * The cap is not cosmetic — it bounds render cost. `buildContentLines()` runs on
- * every render *and* on every scroll key (`handleInput` calls it to compute
- * `maxScroll`), so an uncapped 200 KB result costs ~6 ms per keystroke to parse
- * as Markdown, against ~0.5 ms once capped and effectively nothing on a cache
- * hit (best of 5, width 76). 16 KB is roughly a screenful at every terminal size
- * and still ~30x the 500 characters this replaces, which was small enough to cut
- * most real results mid-sentence.
- */
-export const RESULT_MAX_CHARS = 16_000;
-
 /** Cycle order for the viewer's `m` key. */
 const MARKDOWN_MODES: readonly ViewerMarkdownMode[] = ["off", "assistant", "all"];
 
@@ -105,37 +92,107 @@ function fallbackMarkdownTheme(th: Theme): MarkdownTheme {
 }
 
 /**
- * Cap `text` at `RESULT_MAX_CHARS`, reporting the elision separately rather than
- * appending it.
+ * Lines shown per tool result before the rest is summarized away.
  *
- * Separately because the notice is the viewer's chrome, not the tool's output.
- * Appended into the string it becomes content: a cut landing inside a fenced
- * code block — likely, on exactly the large `ctx_execute` results this is for —
- * renders the notice as a line of source inside the fence.
+ * A line cap rather than a character cap: the notice below counts whole
+ * lines, which is what a reader orients by, and slicing lines keeps the
+ * held-back count moving while a growing result's cached parse is reused.
  */
-function capResult(text: string): { text: string; elided: number } {
-  if (text.length <= RESULT_MAX_CHARS) return { text, elided: 0 };
+const TOOL_OUTPUT_LINES = 7;
+
+/**
+ * Slice `text` to the display cap, reporting the held-back line count
+ * separately rather than appending it.
+ *
+ * Separately because the notice is the viewer's chrome, not the tool's
+ * output. Appended into the string it becomes content: a cut landing inside
+ * a fenced code block renders the notice as a line of the tool's source.
+ */
+function capLines(text: string): { text: string; hidden: number } {
+  const source = text.split("\n");
+  if (source.length <= TOOL_OUTPUT_LINES) return { text, hidden: 0 };
   return {
-    text: text.slice(0, RESULT_MAX_CHARS),
-    elided: text.length - RESULT_MAX_CHARS,
+    text: source.slice(0, TOOL_OUTPUT_LINES).join("\n"),
+    hidden: source.length - TOOL_OUTPUT_LINES,
   };
 }
 
-/**
- * `999` · `1.5k` · `8.4M` — a magnitude cue, not an exact count, past 1000.
- *
- * The bracket is chosen against the *rounded* value, so 999,999 reads `1M`
- * rather than the `1000.0k` a naive `< 1e6` test produces.
- */
-function humanCount(n: number): string {
-  if (n < 1_000) return `${n}`;
-  const thousands = n < 999_950;
-  const value = thousands ? n / 1_000 : n / 1_000_000;
-  return `${value.toFixed(1).replace(/\.0$/, "")}${thousands ? "k" : "M"}`;
+function truncationNote(hidden: number): string {
+  return `… ${hidden} more line${hidden === 1 ? "" : "s"}`;
 }
 
-function truncationNote(elided: number): string {
-  return `... (truncated, ${humanCount(elided)} more character${elided === 1 ? "" : "s"})`;
+/** Cap on a single tool-call argument summary before it is ellipsized. */
+const MAX_ARG_CHARS = 200;
+
+/** Tool-call ↔ result linkage: current `toolCallId`, legacy `toolUseId`. */
+function messageToolId(msg: any): string | undefined {
+  const id = msg?.toolCallId ?? msg?.toolUseId ?? msg?.id;
+  return typeof id === "string" ? id : undefined;
+}
+
+function collapse(value: string): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length > MAX_ARG_CHARS ? `${text.slice(0, MAX_ARG_CHARS)}…` : text;
+}
+
+/**
+ * One-line argument summary for a tool call.
+ *
+ * Leads with the argument that identifies what the call actually did — the
+ * command for `bash`, the path for file tools — because that is the part a
+ * reader scans for. Unknown tools fall back to compact `key=value` pairs so a
+ * custom or extension tool still shows something useful.
+ */
+function summarizeToolArgs(name: string, args: Record<string, unknown> | undefined): string {
+  if (!args) return "";
+  const str = (key: string): string | undefined => {
+    const value = args[key];
+    return typeof value === "string" && value.trim() ? value : undefined;
+  };
+
+  switch (name) {
+    case "bash": {
+      const command = str("command");
+      if (command) return collapse(command);
+      break;
+    }
+    case "read":
+    case "write":
+    case "ls": {
+      const path = str("path");
+      if (path) return collapse(path);
+      break;
+    }
+    case "edit": {
+      const path = str("path");
+      if (path) return collapse(path);
+      break;
+    }
+    case "grep": {
+      const pattern = str("pattern");
+      const where = str("path") ?? str("glob");
+      if (pattern) return collapse(where ? `${pattern} · ${where}` : pattern);
+      break;
+    }
+    case "find": {
+      const pattern = str("pattern") ?? str("glob");
+      if (pattern) return collapse(pattern);
+      break;
+    }
+    default:
+      break;
+  }
+
+  // Unknown tool, or the expected field was absent/non-string.
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(args)) {
+    if (value === undefined || value === null) continue;
+    const rendered = typeof value === "string" ? value : JSON.stringify(value);
+    if (rendered === undefined) continue;
+    parts.push(`${key}=${rendered}`);
+    if (parts.length === 3) break;
+  }
+  return collapse(parts.join(" "));
 }
 
 export class ConversationViewer implements Component {
@@ -404,6 +461,24 @@ export class ConversationViewer implements Component {
     return dim ? lines.map(l => this.theme.fg("dim", l)) : lines;
   }
 
+  /**
+   * Render one tool result: capped lines, literal or Markdown per mode, with
+   * the held-back count as its own chrome line. Shared by attached results
+   * (under their call) and orphans (under a `[Result]` label).
+   */
+  private renderResultBlock(msg: any, width: number, mode: ViewerMarkdownMode, th: any): string[] {
+    // Sanitized before the cap: escape bytes must not inflate the line
+    // budget, and a cut landing mid-sequence would leave a partial one.
+    const source = extractText(msg.content);
+    const { text, hidden } = capLines(sanitizeTranscriptText(source).trim());
+    if (!text) return [];
+    const out = mode === "all"
+      ? this.markdownLines(msg, text, width, true)
+      : this.rawLines(text, width, true);
+    if (hidden > 0) out.push(truncateToWidth(th.fg("dim", truncationNote(hidden)), width));
+    return out;
+  }
+
   /** Render `text` as Markdown, reusing this message's component instance. */
   private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
     let entry = this.markdownCache.get(msg);
@@ -521,6 +596,17 @@ export class ConversationViewer implements Component {
 
     const mode = this.markdownMode();
     let needsSeparator = false;
+    // Index standalone results by call id so each renders under the call that
+    // produced it. Attached results are skipped inline below; an id with no
+    // call, or a second result for one call, still renders as an orphan.
+    const resultsById = new Map<string, any>();
+    for (const msg of messages) {
+      if (msg?.role === "toolResult") {
+        const key = messageToolId(msg);
+        if (key && !resultsById.has(key)) resultsById.set(key, msg);
+      }
+    }
+    const attached = new Set<any>();
     for (const msg of messages) {
       if (msg.role === "user") {
         // Sanitized: message text reaches the terminal byte-for-byte otherwise,
@@ -532,15 +618,19 @@ export class ConversationViewer implements Component {
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("accent", "[User]"));
         for (const line of wrapTextWithAnsi(text.trim(), width)) {
-          lines.push(line);
+          lines.push(truncateToWidth(th.fg("userMessageText", `> ${line}`), width));
         }
       } else if (msg.role === "assistant") {
         const textParts: string[] = [];
-        const toolCalls: string[] = [];
+        const toolCalls: { name: string; args?: Record<string, unknown>; key?: string }[] = [];
         for (const c of msg.content) {
           if (c.type === "text" && c.text) textParts.push(c.text);
           else if (c.type === "toolCall") {
-            toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
+            toolCalls.push({
+              name: (c as any).name ?? (c as any).toolName ?? "unknown",
+              args: (c as any).arguments ?? (c as any).args ?? (c as any).input,
+              key: messageToolId(c),
+            });
           }
         }
         if (needsSeparator) lines.push(th.fg("dim", "───"));
@@ -551,20 +641,21 @@ export class ConversationViewer implements Component {
             ? this.rawLines(text, width, false)
             : this.markdownLines(msg, text, width, false)));
         }
-        for (const name of toolCalls) {
-          lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
+        for (const call of toolCalls) {
+          const summary = summarizeToolArgs(call.name, call.args);
+          const title = th.fg("toolTitle", th.bold(call.name));
+          lines.push(truncateToWidth(summary ? `${title} ${th.fg("dim", summary)}` : title, width));
+          const result = call.key ? resultsById.get(call.key) : undefined;
+          if (result && !attached.has(result)) {
+            attached.add(result);
+            lines.push(...this.renderResultBlock(result, width, mode, th));
+          }
         }
       } else if (msg.role === "toolResult") {
-        // Sanitized before the cap: escape bytes must not inflate the 16k
-        // budget, and a cut landing mid-sequence would leave a partial one.
-        const { text, elided } = capResult(sanitizeTranscriptText(extractText(msg.content)).trim());
-        if (!text) continue;
+        if (attached.has(msg)) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("dim", "[Result]"));
-        lines.push(...(mode === "all"
-          ? this.markdownLines(msg, text, width, true)
-          : this.rawLines(text, width, true)));
-        if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
+        lines.push(...this.renderResultBlock(msg, width, mode, th));
       } else if ((msg as any).role === "bashExecution") {
         const bash = msg as any;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
@@ -572,9 +663,9 @@ export class ConversationViewer implements Component {
         if (bash.output?.trim()) {
           // Same cap as a tool result, never Markdown: command output is the one
           // thing here that is definitionally not authored as Markdown.
-          const { text, elided } = capResult(sanitizeTranscriptText(bash.output).trim());
+          const { text, hidden } = capLines(sanitizeTranscriptText(bash.output).trim());
           lines.push(...this.rawLines(text, width, true));
-          if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
+          if (hidden > 0) lines.push(truncateToWidth(th.fg("dim", truncationNote(hidden)), width));
         }
       } else {
         continue;

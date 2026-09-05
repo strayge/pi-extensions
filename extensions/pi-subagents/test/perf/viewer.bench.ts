@@ -12,7 +12,7 @@
  *
  * Both markdown modes are measured. `assistant` is the default and sends
  * assistant text through pi's Markdown parser; `off` is the raw wrap path. The
- * pair is the cost of #259, and the cap it introduced (RESULT_MAX_CHARS) is what
+ * pair is the cost of markdown rendering, and the seven-line tool-result cap is what
  * keeps a single large tool result from dominating the whole frame.
  *
  * Cold vs warm is the other axis worth knowing: the Markdown cache is a WeakMap
