@@ -317,11 +317,28 @@ describe("FleetList navigation", () => {
     expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
   });
 
-  it("Esc deactivates", () => {
-    const h = harness([makeRecord()]);
+  it("Enter on 'main' hides the whole list until ↓ brings it back", () => {
+    const h = harness([makeRecord({ description: "one" })]);
+    expect(h.render()).not.toEqual([]); // listed while agents run
+    h.press(DOWN); // activate → main
+    expect(h.press(ENTER)).toEqual({ consume: true });
+    expect(h.render()).toEqual([]); // dismissed, not just deactivated
+    // Stays hidden across refreshes — spawns/finishes do not pop it back.
+    h.fleet.update();
+    expect(h.render()).toEqual([]);
+    // ↓ is the explicit way back: re-shows, in navigation mode.
+    expect(h.press(DOWN)).toEqual({ consume: true });
+    expect(h.render().some(l => l.includes("one"))).toBe(true);
+    expect(h.render().some(l => l.includes("enter view"))).toBe(true);
+  });
+
+  it("Esc hides the list until ↓ brings it back", () => {
+    const h = harness([makeRecord({ description: "one" })]);
     h.press(DOWN);
     expect(h.press(ESC)).toEqual({ consume: true });
-    expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
+    expect(h.render()).toEqual([]);
+    expect(h.press(DOWN)).toEqual({ consume: true });
+    expect(h.render().some(l => l.includes("one"))).toBe(true);
   });
 
   it("passes non-nav keys through and cancels navigation", () => {
@@ -524,12 +541,12 @@ describe("FleetList rendering", () => {
 });
 
 describe("FleetList overlay lifecycle", () => {
-  it("Enter on 'main' just deactivates (no overlay)", () => {
+  it("Enter on 'main' hides the list (no overlay)", () => {
     const h = harness([makeRecord()]);
     h.press(DOWN); // active, index 0 (main)
     h.press(ENTER);
     expect(h.overlayOpened()).toBe(false); // never opened an overlay
-    expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
+    expect(h.render()).toEqual([]); // dismissed, not just deactivated
   });
 
   it("closes an active viewer when a higher-priority modal opens", async () => {

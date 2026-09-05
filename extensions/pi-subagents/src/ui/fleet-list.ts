@@ -104,6 +104,11 @@ export class FleetList {
   private timer: ReturnType<typeof setInterval> | undefined;
 
   private enabled = true;
+  /**
+   * Set by Enter on `main`: the whole list stays hidden until the user
+   * brings it back with ↓/← — spawns and finishes do not pop it back.
+   */
+  private dismissed = false;
   /** Whether arrow keys currently navigate the list (vs. flow to the editor). */
   private active = false;
   /** 0 = `main`, 1..N = subagents. */
@@ -211,7 +216,7 @@ export class FleetList {
     // it is the thing the user opens to see what its children did. Read off the
     // roster for the same reason activation does: two counts of "is there
     // anything here" drifted apart once before.
-    const hasRows = this.enabled && this.roster().length > 1;
+    const hasRows = this.enabled && !this.dismissed && this.roster().length > 1;
 
     if (!hasRows) {
       if (this.widgetRegistered) {
@@ -340,6 +345,7 @@ export class FleetList {
       // workflow run still has somewhere to go, and requiring an agent would
       // render the row but refuse to move into it.
       if (isActivator && this.roster().length > 1 && this.ui.getEditorText() === "") {
+        this.dismissed = false; // ↓/← is the explicit way back from an Enter-on-main dismiss
         this.active = true;
         this.selectedIndex = 0;
         this.update();
@@ -361,7 +367,12 @@ export class FleetList {
       this.update();
       return { consume: true };
     }
-    if (matchesKey(data, "escape")) { this.deactivate(); return { consume: true }; }
+    if (matchesKey(data, "escape")) {
+      // Like Enter on `main`: hide the whole list until ↓/← brings it back.
+      this.dismissed = true;
+      this.deactivate();
+      return { consume: true };
+    }
     if (matchesKey(data, Key.enter)) { this.openSelected(); return { consume: true }; }
 
     // Any other key cancels navigation and flows to the editor.
@@ -391,7 +402,9 @@ export class FleetList {
   private openSelected(): void {
     const entry = this.roster()[this.selectedIndex];
     if (!entry || entry.kind === "main") {
-      // `main` = return to the prompt; the native transcript is already shown.
+      // `main` = return to the prompt; the native transcript is already shown,
+      // so the list itself hides until ↓/← brings it back.
+      this.dismissed = true;
       this.deactivate();
       return;
     }
