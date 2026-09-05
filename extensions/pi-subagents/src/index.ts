@@ -75,6 +75,8 @@ import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
 
+const PI_ASK_STARTED_EVENT = "@eko24ive/pi-ask:started";
+
 // ---- Shared helpers ----
 
 /** Tool execute return value for a text response. */
@@ -759,6 +761,7 @@ export default function (pi: ExtensionAPI) {
   // (currentCtx would stay undefined → spawn always "No active session"). Gating
   // here makes a filtered session behave like an absent one (#142).
   let rpcHandle: RpcHandle | undefined;
+  let unsubscribeAskStarted: (() => void) | undefined;
   /** Whether the `@handle` autocomplete wrapper has been stacked on pi's provider. */
   let mentionProviderRegistered = false;
 
@@ -793,6 +796,11 @@ export default function (pi: ExtensionAPI) {
       fleet.setUICtx(ctx.ui as any);
     }
     manager.clearCompleted(true);
+    if (!unsubscribeAskStarted) {
+      unsubscribeAskStarted = pi.events.on(PI_ASK_STARTED_EVENT, () => {
+        fleet.closeViewer();
+      });
+    }
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -1100,6 +1108,8 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubPing();
     rpcHandle?.unsubConsume();
     rpcHandle = undefined;
+    unsubscribeAskStarted?.();
+    unsubscribeAskStarted = undefined;
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.

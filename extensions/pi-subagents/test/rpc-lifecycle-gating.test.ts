@@ -27,6 +27,9 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { FleetList } from "../src/ui/fleet-list.js";
+
+const ASK_STARTED_CHANNEL = "@eko24ive/pi-ask:started";
 
 const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
 
@@ -154,6 +157,18 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     expect(reply, "spawn emitted a reply").toBeTruthy();
     expect(reply![1].success, `spawn succeeded, got: ${JSON.stringify(reply![1])}`).toBe(true);
     expect(reply![1].data.id).toBeTruthy();
+  });
+
+  it("closes the conversation viewer when pi-ask opens", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    const closeViewer = vi.spyOn(FleetList.prototype, "closeViewer");
+    subagentsExtension(pi);
+
+    expect(busHandlers.has(ASK_STARTED_CHANNEL)).toBe(false);
+    await lifecycle.get("session_start")({}, ctx());
+
+    busHandlers.get(ASK_STARTED_CHANNEL)?.({ version: 1, flowId: "ask-1" });
+    expect(closeViewer).toHaveBeenCalledOnce();
   });
 
   it("renders an RPC-spawned agent in the native widget while it is running", async () => {
