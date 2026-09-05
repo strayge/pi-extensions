@@ -66,6 +66,9 @@ const DEFAULT_MAX_CONCURRENT = 10;
  */
 const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
 
+/** Keep completed agents available for result retrieval and resume for one hour. */
+const COMPLETED_AGENT_RETENTION_MS = 60 * 60_000;
+
 /**
  * How many evicted agents stay addressable by name. Only a bound on memory —
  * a session that spawns hundreds of agents shouldn't retain every one — and
@@ -424,7 +427,7 @@ export class AgentManager {
     this.onCompact = onCompact;
     this.onUsage = onUsage;
     this.maxConcurrent = maxConcurrent;
-    // Cleanup completed agents after 10 minutes (but keep sessions for resume)
+    // Periodically remove completed agents after the retention window.
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
     this.cleanupInterval.unref();
   }
@@ -1468,7 +1471,7 @@ export class AgentManager {
   }
 
   private cleanup() {
-    const cutoff = Date.now() - 10 * 60_000;
+    const cutoff = Date.now() - COMPLETED_AGENT_RETENTION_MS;
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
@@ -1480,7 +1483,7 @@ export class AgentManager {
    * Remove all completed/stopped/errored records immediately.
    * Called on session start/switch so tasks from a prior session don't persist.
    * Pass skipUnconsumed=true to preserve records the LLM hasn't read yet
-   * (resultConsumed=false) — they will be evicted by the 10-minute cleanup timer instead.
+   * (resultConsumed=false) — they will be evicted by the one-hour cleanup timer instead.
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
