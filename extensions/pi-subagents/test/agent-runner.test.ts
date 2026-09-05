@@ -237,10 +237,38 @@ describe("agent-runner final output capture", () => {
     expect(session.bindExtensions).toHaveBeenCalledWith(
       expect.objectContaining({ onError: expect.any(Function) }),
     );
+    expect(session.bindExtensions.mock.calls[0][0]).not.toHaveProperty("uiContext");
 
     const bindOrder = session.bindExtensions.mock.invocationCallOrder[0];
     const promptOrder = session.prompt.mock.invocationCallOrder[0];
     expect(bindOrder).toBeLessThan(promptOrder);
+  });
+
+  it("bridges child extension dialogs to the parent UI", async () => {
+    const { session } = createSession("BOUND");
+    createAgentSession.mockResolvedValue({ session });
+    const select = vi.fn(async () => "Allow once");
+    const interactiveCtx = {
+      ...ctx,
+      hasUI: true,
+      mode: "tui",
+      ui: { select },
+    } as any;
+
+    await runAgent(interactiveCtx, "Explore", "Say BOUND", {
+      pi,
+      agentId: "1234567890",
+      description: "Find bound behavior",
+    });
+
+    const bindings = session.bindExtensions.mock.calls[0][0];
+    expect(bindings.mode).toBe("tui");
+    await expect(bindings.uiContext.select("Allow bash?", ["Allow once", "Deny"])).resolves.toBe("Allow once");
+    expect(select).toHaveBeenCalledWith(
+      "Subagent Explore — Find bound behavior: Allow bash?",
+      ["Allow once", "Deny"],
+      undefined,
+    );
   });
 
   it("passes effective cwd and agentDir to the loader and settings manager", async () => {

@@ -764,6 +764,7 @@ export class AgentManager {
     const promise = runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
+      description: record.description,
       model: options.model,
       maxTurns: options.maxTurns,
       isolated: options.isolated,
