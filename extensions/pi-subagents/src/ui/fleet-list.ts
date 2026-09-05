@@ -16,7 +16,7 @@ import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
+import { type AgentActivity, buildInvocationTags, formatCost, formatTurns, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -547,7 +547,19 @@ export class FleetList {
     const tokens = getLifetimeTotal(record.lifetimeUsage);
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
     const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
+    // Short model label + bare thinking level (`haiku 4.5 · high`) — the
+    // `thinking: ` prefix is dropped: next to the model the level reads
+    // unambiguously, and the row is tight. Lives on the right so `rightAlign`
+    // preserves it; the description on the left truncates first.
+    const { modelName, tags } = buildInvocationTags(record.invocation, { includeMaxTurns: false });
+    const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
+    const thinking = thinkingTag?.slice("thinking: ".length);
+    const config = [modelName, thinking].filter((part): part is string => Boolean(part));
+    // Turn progress comes from the live activity tracker, so it is absent for
+    // finished agents whose entry is already gone — the row just omits it.
+    const activity = this.agentActivity.get(record.id);
+    const turns = activity ? formatTurns(activity.turnCount, activity.maxTurns ?? record.invocation?.maxTurns) : undefined;
+    const stats = [...config, ...(turns ? [turns] : []), formatFleetElapsed(elapsedMs), formatFleetTokens(tokens), ...(cost ? [cost] : [])].join(" · ");
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }

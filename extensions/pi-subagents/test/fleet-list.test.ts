@@ -118,6 +118,7 @@ function harness(
   opts: {
     viewerMarkdown?: () => ViewerMarkdownMode;
     onViewerMarkdown?: (mode: ViewerMarkdownMode) => void;
+    activity?: Map<string, AgentActivity>;
   } = {},
 ): Harness {
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
@@ -147,7 +148,7 @@ function harness(
   };
 
   const manager = fakeManager(agents);
-  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown);
+  const fleet = new FleetList(manager, opts.activity ?? new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown);
   fleet.setUICtx(ui);
   let workflows: FleetWorkflow[] = [];
   const openedWorkflows: string[] = [];
@@ -433,6 +434,40 @@ describe("FleetList rendering", () => {
     expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
   });
 
+  it("prefixes stats with the model name and thinking level when known", () => {
+    const h = harness([makeRecord({
+      description: "Sleep then report 1",
+      invocation: { modelName: "haiku 4.5", thinking: "high" },
+    })]);
+    const agentLine = h.render(120).find(l => l.includes("Sleep then report 1"))!;
+    expect(plain(agentLine)).toMatch(/haiku 4\.5 · high · \d+s · ↓ 13\.1k tokens/);
+  });
+
+  it("omits model/thinking from stats when the invocation is unknown", () => {
+    const h = harness([makeRecord({ description: "Sleep then report 1" })]);
+    const agentLine = h.render(120).find(l => l.includes("Sleep then report 1"))!;
+    expect(plain(agentLine)).toMatch(/\d+s · ↓ 13\.1k tokens/);
+    expect(plain(agentLine)).not.toContain("thinking:");
+  });
+
+  it("shows turn progress when activity is tracked", () => {
+    const activity = new Map<string, AgentActivity>([
+      ["a1", { activeTools: new Map(), toolUses: 0, responseText: "", turnCount: 3, maxTurns: 30 }],
+    ]);
+    const h = harness(
+      [makeRecord({ description: "Sleep then report 1", invocation: { modelName: "haiku 4.5", thinking: "high" } })],
+      { activity },
+    );
+    const agentLine = h.render(120).find(l => l.includes("Sleep then report 1"))!;
+    expect(plain(agentLine)).toMatch(/haiku 4\.5 · high · turns: 3\/30 · \d+s · ↓ 13\.1k tokens/);
+  });
+
+  it("omits turns once the activity entry is gone (finished agents)", () => {
+    const h = harness([makeRecord({ description: "Sleep then report 1" })]);
+    const agentLine = h.render(120).find(l => l.includes("Sleep then report 1"))!;
+    expect(plain(agentLine)).not.toContain("turns:");
+  });
+
   it("orders agents earliest-launched first (top)", () => {
     const agents = [
       makeRecord({ id: "new", description: "newest", startedAt: 2000 }),
@@ -617,7 +652,7 @@ describe("FleetList cost display", () => {
     expect(row(true, 0)).not.toContain("$");
   });
 
-  it("reads the record, so the figures do not change when the agent finishes", () => {
+  it("reads the record, so the spend figures do not change when the agent finishes", () => {
     // Spend used to come from the live activity tracker while an agent ran and
     // from its record once the tracker was deleted. The two disagree: only the
     // record carries a nested child's spend (nested-tools folds it into every
@@ -625,12 +660,15 @@ describe("FleetList cost display", () => {
     // The stale shape on purpose: an activity entry carrying figures of its own
     // is what the old fallback preferred, so a row that still renders the
     // record's numbers proves the tracker is no longer consulted for spend.
+    // (Turn progress is the exception: it only exists on the tracker.)
     const tracked = new Map<string, AgentActivity>([["a1", {
       activeTools: new Map(), toolUses: 0, responseText: "", turnCount: 1,
       lifetimeUsage: { input: 1, output: 1, cacheWrite: 0, cost: 0.9 },
     } as unknown as AgentActivity]]);
 
-    expect(row(true, 0.0042, tracked)).toBe(row(true, 0.0042));
+    const withTracker = row(true, 0.0042, tracked);
+    expect(withTracker).toContain("↓ 13.1k tokens · ~$0.0042");
+    expect(withTracker).not.toContain("0.9");
   });
 });
 
