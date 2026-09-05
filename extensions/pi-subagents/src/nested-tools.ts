@@ -7,7 +7,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { waitForTerminalRecord } from "./abortable.js";
+import { abortable } from "./abortable.js";
 import {
   buildAgentRegistry,
   getAgentConfigIn,
@@ -16,7 +16,7 @@ import {
   resolveTypeIn,
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { resolveAgentInvocationConfig } from "./invocation-config.js";
+import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
@@ -34,6 +34,7 @@ import type {
   ThinkingLevel,
 } from "./types.js";
 import { addUsage } from "./usage.js";
+import { isWorktreeIsolationEnabled } from "./worktree.js";
 
 /**
  * Hard ceiling on nesting for every branch: main session = 0, its subagents = 1,
@@ -76,6 +77,8 @@ export interface NestedAgentManager {
     prompt: string,
     options: NestedSpawnOptions,
   ): string;
+  /** Resolves once the spawned agent is running; rejects on a startup failure. */
+  awaitStartup(id: string): Promise<void>;
   spawnAndWait(
     pi: ExtensionAPI,
     ctx: ExtensionContext,
@@ -87,7 +90,6 @@ export interface NestedAgentManager {
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
   resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
-  steer(id: string, message: string): Promise<boolean>;
 }
 
 export interface NestedToolContext {
@@ -168,11 +170,15 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
-      run_in_background: Type.Optional(Type.Boolean()),
+      run_in_background: Type.Optional(
+        Type.Boolean({
+          description: "Defaults to false for nested spawns — the call blocks and returns the child's result inline. Set true only for work you will collect later with get_subagent_result; a detached child is stopped when you finish.",
+        }),
+      ),
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
       isolated: Type.Optional(Type.Boolean()),
       inherit_context: Type.Optional(Type.Boolean()),
-      isolation: Type.Optional(Type.Literal("worktree")),
+      ...isolationParam(isWorktreeIsolationEnabled()),
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
@@ -216,7 +222,12 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       }
 
       const config = getAgentConfigIn(registry, resolvedType);
-      const invocation = resolveAgentInvocationConfig(config, params);
+      // Foreground regardless of `backgroundByDefault` — see the reasoning on
+      // ResolveOptions. An explicit `true` here still opts in.
+      const invocation = resolveAgentInvocationConfig(config, params, {
+        worktreeAllowed: isWorktreeIsolationEnabled(),
+        defaultRunInBackground: false,
+      });
       let model = ctx.model;
       if (invocation.modelInput) {
         const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
@@ -330,6 +341,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           // Synchronous, before the event loop yields — onSessionCreated fires
           // asynchronously inside runAgent, so the file is attached in time.
           attachTranscript(id);
+          // Worktree isolation starts the agent asynchronously; surface its
+          // failure as a tool error, like the synchronous throw used to.
+          await context.manager.awaitStartup(id);
           return textResult(`Nested agent started in background. Agent ID: ${id}`);
         }
 
@@ -361,10 +375,15 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       if (!ownsRecord(record, context.parentAgentId)) {
         return textResult(`Nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
-      // Cancellation stops only this wait; the nested child keeps running and
-      // stays unconsumed. Terminal state wins if the manager promise is orphaned.
+      // Wait for completion if requested. Cancellation (e.g. the parent's tool
+      // call is aborted) stops only this wait; the nested child keeps running and
+      // stays unconsumed. Queued records have no promise until the manager starts
+      // them, so poll — abortably — until they leave the queue, then await.
       if (params.wait && (record.status === "queued" || record.status === "running")) {
-        await waitForTerminalRecord(record, signal);
+        while (record.status === "queued") {
+          await abortable(new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
+        }
+        if (record.promise) await abortable(record.promise, signal);
       }
       return textResult(formatRecord(record, "fetched"), record.status === "error");
     },
@@ -383,15 +402,19 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       if (!ownsRecord(record, context.parentAgentId) || record.status !== "running") {
         return textResult(`Running nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
-      const queued = !record.session;
-      if (!await context.manager.steer(record.id, params.message)) {
-        return textResult(`Nested agent ${params.agent_id} cannot accept steering in its current state.`, true);
+      // Session not ready yet — queue the steer. The manager flushes pending
+      // steers when the session is created (same contract as the top-level tool).
+      if (!record.session) {
+        if (!record.pendingSteers) record.pendingSteers = [];
+        record.pendingSteers.push(params.message);
+        return textResult(`Steering message queued for nested agent ${params.agent_id}.`);
       }
-      return textResult(
-        queued
-          ? `Steering message queued for nested agent ${params.agent_id}.`
-          : `Steering message sent to nested agent ${params.agent_id}.`,
-      );
+      try {
+        await record.session.steer(params.message);
+      } catch (err) {
+        return textResult(`Failed to steer nested agent: ${err instanceof Error ? err.message : String(err)}`, true);
+      }
+      return textResult(`Steering message sent to nested agent ${params.agent_id}.`);
     },
   });
 

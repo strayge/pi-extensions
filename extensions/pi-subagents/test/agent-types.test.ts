@@ -71,8 +71,7 @@ describe("agent type registry", () => {
     it("case-insensitive lookup works for getAgentConfig", () => {
       const config = getAgentConfig("explore");
       expect(config?.name).toBe("Explore");
-      expect(config?.model).toBe("openai-codex/gpt-5.6-luna");
-      expect(config?.thinking).toBe("high");
+      expect(config?.model).toBe("anthropic/claude-haiku-4-5");
     });
 
     it("resolveType returns canonical key or undefined", () => {
@@ -97,10 +96,9 @@ describe("agent type registry", () => {
       expect(config.builtinToolNames).not.toContain("write");
     });
 
-    it("Explore has a high-reasoning model in config", () => {
+    it("Explore has haiku model in config", () => {
       const cfg = getAgentConfig("Explore");
-      expect(cfg?.model).toBe("openai-codex/gpt-5.6-luna");
-      expect(cfg?.thinking).toBe("high");
+      expect(cfg?.model).toBe("anthropic/claude-haiku-4-5");
     });
 
     it("default agents are marked isDefault", () => {

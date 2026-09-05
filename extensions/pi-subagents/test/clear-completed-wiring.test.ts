@@ -6,7 +6,7 @@
  * yet (resultConsumed=false) was wiped by clearCompleted() on session_start /
  * session_before_switch, so the next get_subagent_result returned "Agent not
  * found". The fix makes both handlers call clearCompleted(true), preserving
- * unread records (the one-hour timer evicts them later).
+ * unread records (the 10-minute timer evicts them later).
  *
  * These tests exercise the wiring, not the manager method in isolation: spawn a
  * real background agent, let it complete, fire the real session event, then read
@@ -33,6 +33,9 @@ function makePi() {
     registerMessageRenderer: vi.fn(),
     registerTool: vi.fn((t: any) => tools.set(t.name, t)),
     registerCommand: vi.fn(),
+    registerEntryRenderer: vi.fn(),
+    registerFlag: vi.fn(),
+    getFlag: vi.fn(),
     on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
     events: {
       emit: vi.fn(),

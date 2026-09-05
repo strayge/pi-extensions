@@ -19,8 +19,6 @@ function makeRecord(id: string, overrides: Partial<AgentRecord> = {}): AgentReco
     toolUses: 0,
     startedAt: 0,
     lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
-    compactionCount: 0,
-    resultDelivery: "steer",
     ...overrides,
   };
 }

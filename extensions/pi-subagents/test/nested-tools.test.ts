@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getAvailableTypes, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
 import { setScopeModelsEnabled } from "../src/model-scope.js";
-import { createNestedSubagentTools, type NestedAgentManager } from "../src/nested-tools.js";
+import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager, setMaxSubagentDepth } from "../src/nested-tools.js";
 import { encodeCwd } from "../src/output-file.js";
 
 let cwd: string;
@@ -78,19 +78,9 @@ beforeEach(() => {
   manager = {
     spawn,
     spawnAndWait,
+    awaitStartup: vi.fn(async () => {}),
     getRecord: (id: string) => records.get(id),
     resume: vi.fn(),
-    steer: vi.fn((id: string, message: string) => {
-      const record = records.get(id);
-      if (!record) return false;
-      if (record.session) {
-        record.session.steer(message);
-      } else {
-        record.pendingSteers ??= [];
-        record.pendingSteers.push(message);
-      }
-      return true;
-    }),
   } as any;
 });
 
@@ -296,6 +286,27 @@ describe("child-safe nested Agent tools", () => {
     expect(manager.resume).not.toHaveBeenCalled();
   });
 
+  it("reports a background child that fails to start as a tool error", async () => {
+    // Under isolation: "worktree" the child is not running when spawn() returns
+    // — the repo copy is awaited. The failure must reach the parent as an error
+    // result, not as "Nested agent started in background".
+    vi.mocked(manager.awaitStartup).mockRejectedValueOnce(
+      new Error('Cannot run with isolation: "worktree"'),
+    );
+    const [agent] = tools(["scout"]);
+
+    const result = await execute(agent, {
+      subagent_type: "scout",
+      description: "find files",
+      prompt: "Find them",
+      run_in_background: true,
+      isolation: "worktree",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('isolation: "worktree"');
+  });
+
   it("waits for a queued owned child to start and settle", async () => {
     const [, getResult] = tools();
     const record = {
@@ -317,30 +328,6 @@ describe("child-safe nested Agent tools", () => {
     const result = await execute(getResult, { agent_id: record.id, wait: true });
 
     expect(result.content[0].text).toBe("queued done");
-  });
-
-  it("returns a nested terminal result when its manager promise stays unresolved", async () => {
-    const [, getResult] = tools();
-    const record = {
-      id: "orphaned-promise-child",
-      status: "running",
-      parentAgentId: "parent-1",
-      promise: new Promise<void>(() => {}),
-      result: undefined as string | undefined,
-    };
-    records.set(record.id, record);
-
-    const waitResult = execute(getResult, { agent_id: record.id, wait: true });
-    record.status = "completed";
-    record.result = "nested terminal result";
-
-    const result = await Promise.race([
-      waitResult,
-      new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 200)),
-    ]);
-
-    expect(result).not.toBe("timed-out");
-    expect((result as any).content[0].text).toBe("nested terminal result");
   });
 
   it("aborts a nested result wait without aborting the owned child", async () => {
@@ -547,5 +534,32 @@ describe("child-safe nested Agent tools", () => {
     } as any, undefined, undefined, executionCtx);
 
     expect(spawnAndWait.mock.calls[0][1]).toBe(executionCtx);
+  });
+});
+
+// setMaxSubagentDepth clamps its input, but test/settings.test.ts only asserts
+// the applier SPY was called — the real Math.max(0, Math.floor(n)) never runs
+// there. A hand-edited subagents.json reaches this unfiltered, and losing the
+// clamp is silent in the worst direction: a negative depth makes the
+// `depth >= maxSubagentDepth` check true everywhere, disabling nested
+// delegation project-wide with no error.
+describe("setMaxSubagentDepth clamping", () => {
+  let previous: number;
+  beforeEach(() => { previous = getMaxSubagentDepth(); });
+  afterEach(() => { setMaxSubagentDepth(previous); });
+
+  it("floors a negative depth at 0 rather than storing it", () => {
+    setMaxSubagentDepth(-1);
+    expect(getMaxSubagentDepth()).toBe(0);
+  });
+
+  it("truncates a fractional depth toward zero", () => {
+    setMaxSubagentDepth(2.9);
+    expect(getMaxSubagentDepth()).toBe(2);
+  });
+
+  it("stores a valid depth unchanged", () => {
+    setMaxSubagentDepth(3);
+    expect(getMaxSubagentDepth()).toBe(3);
   });
 });

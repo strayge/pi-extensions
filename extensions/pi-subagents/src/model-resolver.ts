@@ -15,13 +15,21 @@ export interface ModelRegistry {
 }
 
 /**
- * Display label for a resolved model, e.g. "deepseek-v4-flash". Taken verbatim
- * from the registry so the label matches what the user picked and what the
- * statusline shows — no vendor-specific rewriting, since pi's registry spans
- * every provider and a rule tuned to one of them just makes the rest inconsistent.
+ * Both display forms of a model. The short one goes on tight rows (the widget,
+ * the Agent tool result), the canonical one where there is room to disambiguate
+ * two providers serving a similarly-named model (the conversation viewer).
+ *
+ * One function, because `index.ts` labels the model it resolved before the run
+ * and `agent-manager.ts` relabels it from the live session afterwards — the two
+ * must agree or the label would visibly change the moment the session starts.
  */
-export function shortModelName(model: { id?: string; name?: string } | undefined): string | undefined {
-  return model?.name ?? model?.id ?? undefined;
+export function describeModel(
+  model: { provider: string; id: string; name?: string },
+): { modelName: string; modelId: string } {
+  return {
+    modelName: (model.name ?? model.id).replace(/^Claude\s+/i, "").toLowerCase(),
+    modelId: `${model.provider}/${model.id}`,
+  };
 }
 
 /**

@@ -27,9 +27,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
-import { FleetList } from "../src/ui/fleet-list.js";
 
-const ASK_STARTED_CHANNEL = "@eko24ive/pi-ask:started";
 const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
 
 function makePi() {
@@ -40,6 +38,9 @@ function makePi() {
     registerMessageRenderer: vi.fn(),
     registerTool: vi.fn((t: any) => tools.set(t.name, t)),
     registerCommand: vi.fn(),
+    registerEntryRenderer: vi.fn(),
+    registerFlag: vi.fn(),
+    getFlag: vi.fn(),
     on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
     events: {
       emit: vi.fn(),
@@ -54,10 +55,17 @@ function makePi() {
   return { pi, tools, lifecycle, busHandlers };
 }
 
-function ctx() {
+function ctx(hasUI = false, setWidget = vi.fn()) {
   return {
-    hasUI: false,
-    ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
+    hasUI,
+    ui: {
+      setStatus: vi.fn(),
+      setWidget,
+      notify: vi.fn(),
+      onTerminalInput: vi.fn(() => vi.fn()),
+      getEditorText: vi.fn(() => ""),
+      custom: vi.fn(),
+    },
     cwd: process.cwd(),
     model: undefined,
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
@@ -148,16 +156,70 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     expect(reply![1].data.id).toBeTruthy();
   });
 
-  it("closes the conversation viewer when pi-ask opens", async () => {
+  it("renders an RPC-spawned agent in the native widget while it is running", async () => {
     const { pi, lifecycle, busHandlers } = makePi();
-    const closeViewer = vi.spyOn(FleetList.prototype, "closeViewer");
+    const activeCtx = ctx(true);
     subagentsExtension(pi);
 
-    expect(busHandlers.has(ASK_STARTED_CHANNEL)).toBe(false);
-    await lifecycle.get("session_start")({}, ctx());
+    await lifecycle.get("session_start")({}, activeCtx);
 
-    busHandlers.get(ASK_STARTED_CHANNEL)?.({ version: 1, flowId: "ask-1" });
-    expect(closeViewer).toHaveBeenCalledOnce();
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any); // keep agent running
+    try {
+      await busHandlers.get("subagents:rpc:spawn")!({
+        requestId: "req-widget",
+        type: "general-purpose",
+        prompt: "go",
+        options: { description: "visible RPC agent" },
+      });
+
+      await vi.waitFor(() => {
+        expect(activeCtx.ui.setWidget).toHaveBeenCalledWith(
+          "agents",
+          expect.any(Function),
+          { placement: "aboveEditor" },
+        );
+        expect(activeCtx.ui.setStatus).toHaveBeenCalledWith("subagents", "1 running agent");
+      });
+    } finally {
+      await lifecycle.get("session_shutdown")();
+    }
+  });
+
+  it("shows live tool activity for an RPC-spawned background agent", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    let widgetFactory: any;
+    const setWidget = vi.fn((key: string, content: any) => {
+      if (key === "agents" && content) widgetFactory = content;
+    });
+    const extensionCtx = ctx(true, setWidget);
+    let onToolActivity: ((activity: { type: "start" | "end"; toolName: string }) => void) | undefined;
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options: any) => {
+      onToolActivity = options.onToolActivity;
+      options.onSessionCreated?.({ subscribe: () => vi.fn() });
+      return new Promise(() => {}) as any;
+    });
+    subagentsExtension(pi);
+
+    await lifecycle.get("session_start")({}, extensionCtx);
+    // TaskExecute runs inside a root tool call, so the extension already has
+    // the UI context before pi-tasks sends its cross-extension spawn request.
+    await lifecycle.get("tool_execution_start")({}, extensionCtx);
+    await busHandlers.get("subagents:rpc:spawn")!({
+      requestId: "req-activity",
+      type: "general-purpose",
+      prompt: "go",
+      options: { description: "rpc activity test", isBackground: true },
+    });
+    await vi.waitFor(() => expect(onToolActivity).toBeTypeOf("function"));
+    onToolActivity!({ type: "start", toolName: "bash" });
+
+    expect(widgetFactory).toBeTypeOf("function");
+    const lines = widgetFactory(
+      { terminal: { columns: 120 }, requestRender: vi.fn() },
+      { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+    ).render().join("\n");
+    expect(lines).toContain("running command…");
+    expect(lines).not.toContain("thinking…");
   });
 
   it("is idempotent — a second session_start does not re-advertise or double-register", async () => {
@@ -168,7 +230,6 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     await lifecycle.get("session_start")({}, ctx());
 
     expect(readyEmits(pi), "subagents:ready emitted exactly once across two session_starts").toHaveLength(1);
-    expect(onCallsFor(pi, ASK_STARTED_CHANNEL), "pi-ask listener registered exactly once").toHaveLength(1);
     for (const channel of RPC_CHANNELS) {
       expect(onCallsFor(pi, channel), `${channel} registered exactly once`).toHaveLength(1);
     }

@@ -26,7 +26,7 @@ export type ModelScopeVerdict =
   | { kind: "ok" }
   /** Caller-supplied out-of-scope choice — refuse the spawn with this message. */
   | { kind: "error"; message: string }
-  /** Configured-default or parent-inherited — proceed, but tell the user. */
+  /** Frontmatter-pinned or parent-inherited — proceed, but tell the user. */
   | { kind: "warn"; message: string };
 
 /**
@@ -35,14 +35,14 @@ export type ModelScopeVerdict =
  * scopeModels guards against *runtime* LLM choices, not user-level config:
  *   - Caller-supplied out-of-scope → hard error (the orchestrator made an explicit
  *     out-of-scope choice; surface it so it picks differently).
- *   - Configured-default or parent-inherited out-of-scope → warn but proceed
- *     (the user configured this agent or chose the parent's model; trust it).
+ *   - Frontmatter-pinned or parent-inherited out-of-scope → warn but proceed (the
+ *     user authored/installed this agent or chose the parent's model; trust it).
  */
 export function checkModelScope(args: {
   model: { provider: string; id: string } | undefined;
   cwd: string;
   modelRegistry: ModelRegistryRef;
-  /** True when the model came from the tool call rather than agent config. */
+  /** True when the model came from the tool call rather than frontmatter. */
   callerSupplied: boolean;
   /** Display name used in the warning toast. */
   agentLabel: string;
