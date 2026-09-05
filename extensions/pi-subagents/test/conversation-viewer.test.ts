@@ -909,4 +909,43 @@ describe("ConversationViewer", () => {
       }
     });
   });
+
+  describe("transcript sanitization (display path)", () => {
+    // Tool output reaches the terminal byte-for-byte through the wrapping and
+    // Markdown paths, which preserve ANSI. Without sanitizing, a clear-screen,
+    // cursor-hide, title-set or bell sequence inside a result block executes
+    // in the user's terminal.
+    const strip = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
+    function viewerFor(messages: any[], rows = 200) {
+      return new ConversationViewer(
+        mockTui(rows, 80), mockSession(messages), mockRecord({ status: "completed" }), undefined,
+        ansiTheme(), vi.fn(),
+      );
+    }
+    it("no escape sequence from message text reaches rendered lines", () => {
+      const hostile = "done \x1b[2J cleared \x1b[?25l hidden \x1b]0;title\x07 set \x07 rang";
+      const viewer = viewerFor([
+        { role: "user", content: hostile },
+        { role: "assistant", content: [{ type: "text", text: hostile }] },
+        { role: "toolResult", toolUseId: "t1", content: [{ type: "text", text: hostile }] },
+        { role: "bashExecution", command: "cat bin", output: hostile },
+      ]);
+      const out = strip(viewer.render(120).join("\n"));
+      expect(out).toContain("done");
+      expect(out).toContain("cleared");
+      expect(out).not.toContain("\x1b[2J");
+      expect(out).not.toContain("\x1b[?25l");
+      expect(out).not.toContain("\x1b]0;");
+      expect(out).not.toContain("\x07");
+    });
+
+    it("theme styling applied after sanitizing still renders", () => {
+      const viewer = viewerFor([
+        { role: "user", content: "safe\x1b[2A text" },
+      ]);
+      const out = viewer.render(120).join("\n");
+      expect(strip(out)).toContain("safe text");
+      expect(out).not.toContain("\x1b[2A");
+    });
+  });
 });

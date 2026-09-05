@@ -13,6 +13,7 @@ import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
+import { sanitizeTranscriptText } from "./sanitize.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
@@ -522,9 +523,11 @@ export class ConversationViewer implements Component {
     let needsSeparator = false;
     for (const msg of messages) {
       if (msg.role === "user") {
-        const text = typeof msg.content === "string"
+        // Sanitized: message text reaches the terminal byte-for-byte otherwise,
+        // so a tool echoing user content could inject terminal instructions.
+        const text = sanitizeTranscriptText(typeof msg.content === "string"
           ? msg.content
-          : extractText(msg.content);
+          : extractText(msg.content));
         if (!text.trim()) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("accent", "[User]"));
@@ -543,7 +546,7 @@ export class ConversationViewer implements Component {
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.bold("[Assistant]"));
         if (textParts.length > 0) {
-          const text = textParts.join("\n").trim();
+          const text = sanitizeTranscriptText(textParts.join("\n")).trim();
           lines.push(...(mode === "off"
             ? this.rawLines(text, width, false)
             : this.markdownLines(msg, text, width, false)));
@@ -552,7 +555,9 @@ export class ConversationViewer implements Component {
           lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
         }
       } else if (msg.role === "toolResult") {
-        const { text, elided } = capResult(extractText(msg.content).trim());
+        // Sanitized before the cap: escape bytes must not inflate the 16k
+        // budget, and a cut landing mid-sequence would leave a partial one.
+        const { text, elided } = capResult(sanitizeTranscriptText(extractText(msg.content)).trim());
         if (!text) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("dim", "[Result]"));
@@ -567,7 +572,7 @@ export class ConversationViewer implements Component {
         if (bash.output?.trim()) {
           // Same cap as a tool result, never Markdown: command output is the one
           // thing here that is definitionally not authored as Markdown.
-          const { text, elided } = capResult(bash.output.trim());
+          const { text, elided } = capResult(sanitizeTranscriptText(bash.output).trim());
           lines.push(...this.rawLines(text, width, true));
           if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
         }
