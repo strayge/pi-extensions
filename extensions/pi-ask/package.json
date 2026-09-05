@@ -1,0 +1,58 @@
+{
+  "name": "pi-ask",
+  "version": "1.2.0",
+  "description": "Pi extension that adds an interactive ask_user clarification tool. Vendored from @eko24ive/pi-ask v1.2.0, see README.md for provenance.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "ask_user",
+    "clarification",
+    "terminal-ui"
+  ],
+  "files": [
+    "src/",
+    "skills/",
+    "docs/configuration.md",
+    "docs/contract.md",
+    "docs/remote-events.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "dev": "sh -c 'ROOT=\"$PWD\"; TARGET=\"${1:-.}\"; if [ \"$TARGET\" = \"--\" ]; then TARGET=\"${2:-.}\"; fi; cd \"$TARGET\" && pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e \"$ROOT/src/index.ts\" --skill \"$ROOT/skills/ask-user\"' --",
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "format": "biome check --write .",
+    "check": "biome check . && npm run typecheck && npm test"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.12",
+    "@earendil-works/pi-ai": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1",
+    "@types/node": "25.6.0",
+    "typebox": "1.3.7",
+    "typescript": "6.0.2",
+    "ultracite": "7.6.0"
+  }
+}
