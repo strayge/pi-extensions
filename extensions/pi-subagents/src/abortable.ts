@@ -9,6 +9,8 @@
  * after an abort is absorbed as a no-op (no unhandled rejection).
  */
 
+import type { AgentRecord } from "./types.js";
+
 /** Await a promise until it settles or the caller cancels, without aborting the underlying work. */
 export function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
@@ -40,4 +42,23 @@ export function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise
       },
     );
   });
+}
+
+/**
+ * Treat the record's terminal status as authoritative when a manager promise is
+ * orphaned after completion bookkeeping has already finished.
+ */
+export async function waitForTerminalRecord(
+  record: Pick<AgentRecord, "status" | "promise">,
+  signal?: AbortSignal,
+  pollMs = 50,
+): Promise<void> {
+  while (record.status === "queued" || record.status === "running") {
+    const delay = new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+    const completion = record.promise;
+    await abortable(
+      completion ? Promise.race([completion.then(() => undefined), delay]) : delay,
+      signal,
+    );
+  }
 }

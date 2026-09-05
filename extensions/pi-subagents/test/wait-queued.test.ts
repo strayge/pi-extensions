@@ -129,6 +129,34 @@ describe("get_subagent_result wait:true on a queued agent", () => {
     await lifecycle.get("session_shutdown")?.();
   }, 20_000);
 
+  it("returns terminal state even when the manager promise stays unresolved", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as any);
+    const { id } = await spawnBackground(tools);
+    const registry = (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    const record = registry.getRecord(id);
+
+    const waitResult = tools
+      .get("get_subagent_result")
+      .execute("tc-orphaned-promise", { agent_id: id, wait: true }, undefined, undefined, ctx());
+
+    record.status = "completed";
+    record.result = "RECOVERED-TERMINAL-RESULT";
+    record.completedAt = Date.now();
+
+    const result = await Promise.race([
+      waitResult,
+      new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 200)),
+    ]);
+
+    await lifecycle.get("session_shutdown")?.();
+
+    expect(result).not.toBe("timed-out");
+    expect(textOf(result)).toContain("RECOVERED-TERMINAL-RESULT");
+  });
+
   it("aborts a running result wait without aborting or consuming the child", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
