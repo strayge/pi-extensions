@@ -4,8 +4,9 @@ Provider usage for [pi](https://github.com/earendil-works/pi): how much of the
 current account's quota is left, in the statusline and behind one `/usage`
 command.
 
-Supports OpenAI Codex ChatGPT subscription windows and OpenRouter API-key spend
-limits, without pretending those limits mean the same thing.
+Supports OpenAI Codex ChatGPT subscription windows, OpenRouter API-key spend
+limits, and OpenCode Go usage windows, without pretending those limits mean the
+same thing.
 
 ## Commands
 
@@ -71,6 +72,19 @@ options below have nothing to show there and are skipped.
 
 The account-level `/credits` endpoint is not called; it needs a separate
 management key.
+
+### OpenCode Go (`opencode-go`)
+
+Usage windows are fetched from OpenCode Go's JSON usage endpoint using the same
+bearer token Pi resolves for the active OpenCode Go model:
+`https://opencode.ai/zen/go/v1/usage`. The response contains rolling, weekly,
+and monthly windows, each with a percentage used and reset time. The extension
+requires all three windows to be valid before publishing a snapshot.
+
+Statusline: `opencode-go [███░░░░░] 41% 4h`, with window names and additional
+windows shown when selected by the display configuration. No separate OpenCode
+configuration file or dashboard cookie is read; credentials remain scoped to
+Pi's runtime auth.
 
 ## Statusline
 
@@ -230,6 +244,7 @@ where the resolved-auth origin became inspectable.
 ## Limitations
 
 - Only providers with a stable usage source and pi-resolvable runtime auth are supported.
+- OpenCode Go's usage endpoint does not provide window-start timestamps, so pace markers and exhaustion projections are unavailable for those windows.
 - Reports are snapshots and may themselves lag on the provider's side.
 - OpenRouter does not expose proactive request-rate counters on successful inference responses.
 - A provider may not return a safe human-readable account identity; the provider and credential state stay visible without exposing secrets.

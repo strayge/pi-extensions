@@ -10,7 +10,8 @@
     "usage",
     "quota",
     "codex",
-    "openrouter"
+    "openrouter",
+    "opencode-go"
   ],
   "files": [
     "src",

@@ -6,6 +6,7 @@ import {
   enrichCodexResetCreditExpirations,
   normalizeCodexBackendPayload,
 } from "./providers/codex.ts";
+import { normalizeOpenCodeGoUsagePayload } from "./providers/opencode-go.ts";
 import { normalizeOpenRouterKeyPayload } from "./providers/openrouter.ts";
 import type {
   CodexBackendPayload,
@@ -31,6 +32,7 @@ const CODEX_REDEMPTION_CODES = new Set<CodexResetCreditRedemptionCode>([
 const CODEX_ACCOUNT_CLAIM = "https://api.openai.com/auth";
 const CODEX_ACCOUNT_HEADER = "ChatGPT-Account-Id";
 const OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key";
+const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const MAX_SUCCESS_BODY_BYTES = 64 * 1024;
 const MAX_ERROR_BODY_BYTES = 4 * 1024;
 
@@ -88,6 +90,21 @@ export const SUPPORTED_ADAPTERS: readonly UsageProviderAdapter[] = [
         "OpenRouter key endpoint",
       );
       return normalizeOpenRouterKeyPayload(payload as OpenRouterKeyPayload, Date.now());
+    },
+  },
+  {
+    id: "opencode-go",
+    displayName: "OpenCode Go",
+    semantics: { kind: "api-key", label: "OpenCode Go usage windows" },
+    async query(auth, signal, timeoutMs) {
+      const payload = await fetchProviderJson(
+        OPENCODE_GO_USAGE_URL,
+        auth,
+        signal,
+        timeoutMs,
+        "OpenCode Go usage endpoint",
+      );
+      return normalizeOpenCodeGoUsagePayload(payload, Date.now());
     },
   },
 ];
@@ -413,7 +430,12 @@ function hasOfficialOrigin(model: PiModel, providerId: string): boolean {
 }
 
 function hasOfficialUrlOrigin(value: string, providerId: string): boolean {
-  const expected = providerId === "openai-codex" ? "https://chatgpt.com" : "https://openrouter.ai";
+  const expected = {
+    "openai-codex": "https://chatgpt.com",
+    openrouter: "https://openrouter.ai",
+    "opencode-go": "https://opencode.ai",
+  }[providerId];
+  if (!expected) return false;
   try {
     return new URL(value).origin === expected;
   } catch {

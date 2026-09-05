@@ -28,6 +28,12 @@ const codexModel = {
   provider: "openai-codex",
   baseUrl: "https://chatgpt.com/backend-api",
 };
+const opencodeGoModel = {
+  id: "kimi-k2.5",
+  name: "Kimi K2.5",
+  provider: "opencode-go",
+  baseUrl: "https://opencode.ai/zen/go/v1",
+};
 
 function codexJwt(accountId: string, signature: string): string {
   const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -124,6 +130,59 @@ test("/usage queries the current runtime account and offers its next actions", a
   assert.match(selections[0]?.title ?? "", /test-key/);
   assert.deepEqual(selections[0]?.options, ["Refresh usage", "Display options…", "Close"]);
   assert.equal(statuses.get("usage"), "openrouter $75.00 left");
+});
+
+test("/usage fetches OpenCode Go usage with Pi's resolved bearer token", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let request: { url: string; authorization: string | undefined } | undefined;
+  globalThis.fetch = async (input, init) => {
+    request = {
+      url: String(input),
+      authorization: (init?.headers as Record<string, string> | undefined)?.Authorization,
+    };
+    return new Response(
+      JSON.stringify({
+        usage: {
+          rolling: { status: "ok", percent: 41, resetsAt: "2099-08-12T04:00:00Z" },
+          weekly: { status: "ok", percent: 39, resetsAt: "2099-08-14T00:00:00Z" },
+          monthly: { status: "ok", percent: 12, resetsAt: "2099-09-01T00:00:00Z" },
+        },
+      }),
+      { status: 200 },
+    );
+  };
+
+  const mock = createMockPi();
+  usageExtension(mock.pi);
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  const { ctx, statuses } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model: opencodeGoModel,
+    select: async () => "Close",
+    modelRegistry: {
+      getProviderAuth: async (provider: string) => {
+        assert.equal(provider, "opencode-go");
+        return { auth: { apiKey: "same-token-used-by-pi" } };
+      },
+      getAvailable: () => [opencodeGoModel],
+      getAll: () => [opencodeGoModel],
+      getProviderAuthStatus: () => ({ configured: true }),
+      getProviderDisplayName: (provider: string) => provider,
+    },
+  });
+
+  await command.handler("", ctx);
+
+  assert.deepEqual(request, {
+    url: "https://opencode.ai/zen/go/v1/usage",
+    authorization: "Bearer same-token-used-by-pi",
+  });
+  assert.match(statuses.get("usage") ?? "", /^opencode-go /);
 });
 
 test("/usage caches enriched Codex reports and refreshes both requests together", async (t) => {

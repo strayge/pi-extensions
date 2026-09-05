@@ -6,7 +6,84 @@ import {
   enrichCodexResetCreditExpirations,
   normalizeCodexBackendPayload,
 } from "../src/providers/codex.ts";
+import { normalizeOpenCodeGoUsagePayload } from "../src/providers/opencode-go.ts";
 import { normalizeOpenRouterKeyPayload } from "../src/providers/openrouter.ts";
+
+test("OpenCode Go adapter normalizes all usage windows and reset times", () => {
+  const capturedAt = Date.parse("2026-08-12T00:00:00Z");
+  const report = normalizeOpenCodeGoUsagePayload(
+    {
+      usage: {
+        rolling: { status: "ok", percent: 41, resetsAt: "2026-08-12T04:00:00Z" },
+        weekly: { status: "ok", percent: 39, resetsAt: "2026-08-14T00:00:00+00:00" },
+        monthly: { status: "ok", percent: 12.5, resetsAt: "2026-09-01T00:00:00Z" },
+      },
+    },
+    capturedAt,
+  );
+
+  assert.equal(report.providerId, "opencode-go");
+  assert.deepEqual(report.semantics, {
+    kind: "api-key",
+    label: "OpenCode Go usage windows",
+  });
+  assert.deepEqual(report.buckets[0], {
+    id: "rolling",
+    label: "Rolling",
+    used: 41,
+    remaining: 59,
+    limit: 100,
+    unit: "percent",
+    resetsAt: Date.parse("2026-08-12T04:00:00Z") / 1_000,
+  });
+  assert.match(
+    formatUsageReport(report, "current", presetConfig("full"), capturedAt),
+    /Rolling limit:/,
+  );
+  assert.match(
+    formatUsageStatusline(report, undefined, presetConfig("full"), capturedAt),
+    /^opencode-go rolling \[███░░░░░\] 41% 4h · weekly/,
+  );
+});
+
+test("OpenCode Go adapter rejects incomplete or invalid usage windows", () => {
+  assert.throws(
+    () =>
+      normalizeOpenCodeGoUsagePayload(
+        { usage: { rolling: { status: "ok", percent: 10, resetsAt: "2026-08-12T04:00:00Z" } } },
+        0,
+      ),
+    /weekly usage window is missing/,
+  );
+  assert.throws(
+    () =>
+      normalizeOpenCodeGoUsagePayload(
+        {
+          usage: {
+            rolling: { status: "ok", percent: 101, resetsAt: "2026-08-12T04:00:00Z" },
+            weekly: { status: "ok", percent: 20, resetsAt: "2026-08-14T00:00:00Z" },
+            monthly: { status: "ok", percent: 30, resetsAt: "2026-09-01T00:00:00Z" },
+          },
+        },
+        0,
+      ),
+    /rolling usage percent/,
+  );
+  assert.throws(
+    () =>
+      normalizeOpenCodeGoUsagePayload(
+        {
+          usage: {
+            rolling: { status: "ok", percent: 10, resetsAt: "2026-08-12" },
+            weekly: { status: "ok", percent: 20, resetsAt: "2026-08-14T00:00:00Z" },
+            monthly: { status: "ok", percent: 30, resetsAt: "2026-09-01T00:00:00Z" },
+          },
+        },
+        0,
+      ),
+    /rolling reset time/,
+  );
+});
 
 test("OpenRouter adapter normalizes documented per-key spend limits without claiming subscription quota", () => {
   const report = normalizeOpenRouterKeyPayload(
