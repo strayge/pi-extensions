@@ -131,7 +131,7 @@ function messageToolId(msg: any): string | undefined {
 }
 
 function collapse(value: string): string {
-  const text = value.replace(/\s+/g, " ").trim();
+  const text = sanitizeTranscriptText(value).replace(/\s+/g, " ").trim();
   return text.length > MAX_ARG_CHARS ? `${text.slice(0, MAX_ARG_CHARS)}…` : text;
 }
 
@@ -216,7 +216,7 @@ export class ConversationViewer implements Component {
    * keystroke — the component caches, but only across calls to the same object.
    * Weak so a compacted-away message doesn't pin its render.
    */
-  private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
+  private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; color?: "toolOutput" | "error"; failed?: boolean }>();
 
   constructor(
     private tui: TUI,
@@ -456,47 +456,51 @@ export class ConversationViewer implements Component {
   }
 
   /** Wrap `text` literally — the pre-Markdown path, and the fallback from it. */
-  private rawLines(text: string, width: number, dim: boolean): string[] {
+  private rawLines(text: string, width: number, color?: "toolOutput" | "error"): string[] {
     const lines = wrapTextWithAnsi(text, width);
-    return dim ? lines.map(l => this.theme.fg("dim", l)) : lines;
+    return color ? lines.map(l => this.theme.fg(color, l)) : lines;
   }
 
   /**
    * Render one tool result: capped lines, literal or Markdown per mode, with
    * the held-back count as its own chrome line. Shared by attached results
-   * (under their call) and orphans (under a `[Result]` label).
+   * (under their call), orphans, and literal bash output. Reserve the elbow's
+   * columns before wrapping so indentation never clips the result's content.
    */
-  private renderResultBlock(msg: any, width: number, mode: ViewerMarkdownMode, th: any): string[] {
+  private renderResultBlock(msg: any, width: number, mode: ViewerMarkdownMode): string[] {
     // Sanitized before the cap: escape bytes must not inflate the line
     // budget, and a cut landing mid-sequence would leave a partial one.
-    const source = extractText(msg.content);
+    const source = msg.role === "bashExecution" ? msg.output : extractText(msg.content);
     const { text, hidden } = capLines(sanitizeTranscriptText(source).trim());
     if (!text) return [];
+    const contentWidth = Math.max(1, width - 4);
+    const color = msg.isError === true ? "error" : "toolOutput";
     const out = mode === "all"
-      ? this.markdownLines(msg, text, width, true)
-      : this.rawLines(text, width, true);
-    if (hidden > 0) out.push(truncateToWidth(th.fg("dim", truncationNote(hidden)), width));
-    return out;
+      ? this.markdownLines(msg, text, contentWidth, color)
+      : this.rawLines(text, contentWidth, color);
+    const lines = out.map((line, index) =>
+      this.theme.fg(color, index === 0 ? "  ⎿ " : "    ") + line);
+    if (hidden > 0) lines.push(this.theme.fg("dim", `    ${truncationNote(hidden)}`));
+    return lines;
   }
 
   /** Render `text` as Markdown, reusing this message's component instance. */
-  private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
+  private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, color?: "toolOutput" | "error"): string[] {
     let entry = this.markdownCache.get(msg);
-    if (!entry) {
+    if (!entry || entry.color !== color) {
       entry = {
         md: new Markdown(
           text,
           0,
           0,
           this.markdownTheme,
-          // Keeps result prose visually receded, the way the raw path's
-          // per-line `fg("dim", …)` did. Fenced code is the exception and is
-          // left alone deliberately: pi's theme highlights it with its own
-          // colors, which this would otherwise flatten.
-          dim ? { color: (t: string) => this.theme.fg("dim", t) } : undefined,
+          // Match literal result colors without flattening syntax-highlighted
+          // code fences, which keep pi's own colors.
+          color ? { color: (t: string) => this.theme.fg(color, t) } : undefined,
           MARKDOWN_OPTIONS,
         ),
         text,
+        color,
       };
       this.markdownCache.set(msg, entry);
     } else if (entry.text !== text) {
@@ -508,7 +512,7 @@ export class ConversationViewer implements Component {
       entry.text = text;
       if (shouldRetry) entry.failed = false;
     }
-    if (entry.failed) return this.rawLines(text, width, dim);
+    if (entry.failed) return this.rawLines(text, width, color);
 
     try {
       return entry.md.render(width);
@@ -520,7 +524,7 @@ export class ConversationViewer implements Component {
       // fine — degrade to that instead, and remember, since the throw would
       // otherwise repeat on every render and every scroll key.
       entry.failed = true;
-      return this.rawLines(text, width, dim);
+      return this.rawLines(text, width, color);
     }
   }
 
@@ -595,7 +599,9 @@ export class ConversationViewer implements Component {
     }
 
     const mode = this.markdownMode();
-    let needsSeparator = false;
+    const pushBlank = () => {
+      if (lines.length > 0 && lines[lines.length - 1].trim() !== "") lines.push("");
+    };
     // Index standalone results by call id so each renders under the call that
     // produced it. Attached results are skipped inline below; an id with no
     // call, or a second result for one call, still renders as an orphan.
@@ -615,9 +621,8 @@ export class ConversationViewer implements Component {
           ? msg.content
           : extractText(msg.content));
         if (!text.trim()) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("accent", "[User]"));
-        for (const line of wrapTextWithAnsi(text.trim(), width)) {
+        pushBlank();
+        for (const line of wrapTextWithAnsi(text.trim(), Math.max(1, width - 2))) {
           lines.push(truncateToWidth(th.fg("userMessageText", `> ${line}`), width));
         }
       } else if (msg.role === "assistant") {
@@ -633,44 +638,40 @@ export class ConversationViewer implements Component {
             });
           }
         }
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.bold("[Assistant]"));
-        if (textParts.length > 0) {
-          const text = sanitizeTranscriptText(textParts.join("\n")).trim();
+        const text = sanitizeTranscriptText(textParts.join("\n")).trim();
+        if (text) {
+          pushBlank();
           lines.push(...(mode === "off"
-            ? this.rawLines(text, width, false)
-            : this.markdownLines(msg, text, width, false)));
+            ? this.rawLines(text, width)
+            : this.markdownLines(msg, text, width)));
         }
         for (const call of toolCalls) {
+          pushBlank();
           const summary = summarizeToolArgs(call.name, call.args);
-          const title = th.fg("toolTitle", th.bold(call.name));
+          const title = th.fg("toolTitle", th.bold(collapse(call.name) || "tool"));
           lines.push(truncateToWidth(summary ? `${title} ${th.fg("dim", summary)}` : title, width));
           const result = call.key ? resultsById.get(call.key) : undefined;
           if (result && !attached.has(result)) {
             attached.add(result);
-            lines.push(...this.renderResultBlock(result, width, mode, th));
+            lines.push(...this.renderResultBlock(result, width, mode));
           }
         }
       } else if (msg.role === "toolResult") {
         if (attached.has(msg)) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("dim", "[Result]"));
-        lines.push(...this.renderResultBlock(msg, width, mode, th));
+        const resultLines = this.renderResultBlock(msg, width, mode);
+        if (resultLines.length > 0) {
+          pushBlank();
+          lines.push(...resultLines);
+        }
       } else if ((msg as any).role === "bashExecution") {
         const bash = msg as any;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
+        pushBlank();
+        lines.push(truncateToWidth(th.fg("bashMode", `$ ${collapse(String(bash.command ?? ""))}`), width));
         if (bash.output?.trim()) {
-          // Same cap as a tool result, never Markdown: command output is the one
-          // thing here that is definitionally not authored as Markdown.
-          const { text, hidden } = capLines(sanitizeTranscriptText(bash.output).trim());
-          lines.push(...this.rawLines(text, width, true));
-          if (hidden > 0) lines.push(truncateToWidth(th.fg("dim", truncationNote(hidden)), width));
+          // Shell output stays literal even when tool-result Markdown is enabled.
+          lines.push(...this.renderResultBlock(bash, width, "off"));
         }
-      } else {
-        continue;
       }
-      needsSeparator = true;
     }
 
     // Streaming indicator for running agents

@@ -392,6 +392,75 @@ describe("ConversationViewer", () => {
     const assistant = (text: string) => [{ role: "assistant", content: [{ type: "text", text }] }];
     const result = (text: string) => [{ role: "toolResult", toolUseId: "t1", content: [{ type: "text", text }] }];
 
+    it.each(["off", "assistant", "all"] as const)("keeps the transcript compact in %s mode", (mode) => {
+      const viewer = viewerFor([
+        { role: "user", content: "**prompt**" },
+        { role: "assistant", content: [
+          { type: "text", text: "**answer**" },
+          { type: "toolCall", id: "c1", name: "read", arguments: { path: "/a" } },
+        ] },
+        { role: "toolResult", toolCallId: "c1", content: [{ type: "text", text: "**result**\nsecond" }] },
+        { role: "assistant", content: [{ type: "thinking", thinking: "hidden" }] },
+        { role: "toolResult", toolCallId: "orphan", content: [{ type: "text", text: "orphan" }] },
+      ], mode);
+      const content = ((viewer as any).buildContentLines(76) as string[]).map(l => strip(l).trimEnd());
+
+      expect(content).toEqual([
+        "> **prompt**", "",
+        mode === "off" ? "**answer**" : "answer", "",
+        "read /a",
+        mode === "all" ? "  ⎿ result" : "  ⎿ **result**",
+        "    second", "",
+        "  ⎿ orphan",
+      ]);
+    });
+
+    it("reserves user-prefix columns before wrapping", () => {
+      const text = "abcdefghijklmnopqrstuvwxyz";
+      const viewer = viewerFor([{ role: "user", content: text }]);
+      const content = ((viewer as any).buildContentLines(10) as string[]).map(strip);
+
+      expect(content).toEqual(["> abcdefgh", "> ijklmnop", "> qrstuvwx", "> yz"]);
+      expect(content.map(l => l.slice(2)).join("")).toBe(text);
+    });
+
+    it.each(["off", "assistant", "all"] as const)("wraps result continuations without clipping in %s mode", (mode) => {
+      const text = "abcdefghijklmnopqrstuvwxyz";
+      const viewer = viewerFor(result(text), mode);
+      const content = ((viewer as any).buildContentLines(14) as string[]).map(l => strip(l).trimEnd());
+
+      expect(content).toEqual(["  ⎿ abcdefghij", "    klmnopqrst", "    uvwxyz"]);
+      expect(content.map(l => l.slice(4)).join("")).toBe(text);
+      assertAllLinesFit(content, 14);
+    });
+
+    it.each(["off", "assistant", "all"] as const)("distinguishes failed results in %s mode", (mode) => {
+      const messages = [
+        ...result("success"),
+        { ...result("failed")[0], isError: true },
+      ];
+      const viewer = new ConversationViewer(
+        mockTui(), mockSession(messages), mockRecord({ status: "completed" }), undefined,
+        {
+          fg: (color: string, text: string) => `\x1b[${color === "error" ? 31 : color === "toolOutput" ? 32 : 90}m${text}\x1b[0m`,
+          bold: (text: string) => text,
+        } as any,
+        vi.fn(), undefined, undefined, undefined, false, () => mode,
+      );
+      const content = ((viewer as any).buildContentLines(76) as string[]).join("\n");
+
+      expect(content).toContain("\x1b[32msuccess");
+      expect(content).toContain("\x1b[31mfailed");
+      expect(content).toContain("\x1b[31m  ⎿ ");
+    });
+
+    it("keeps direct bash output literal and indented in all mode", () => {
+      const viewer = viewerFor([{ role: "bashExecution", command: "echo output", output: "**literal**\nnext" }], "all");
+      const content = ((viewer as any).buildContentLines(76) as string[]).map(l => strip(l).trimEnd());
+
+      expect(content).toEqual(["$ echo output", "  ⎿ **literal**", "    next"]);
+    });
+
     it("renders assistant Markdown by default instead of raw source markers", () => {
       const out = strip(viewerFor(assistant("# Heading\n\n- first\n- second\n\n**bold**")).render(80).join("\n"));
 
@@ -517,7 +586,7 @@ describe("ConversationViewer", () => {
 
       // The notice is its own chrome line below the cut, never appended into
       // the content where an unterminated fence would render it as source.
-      expect(note).toMatch(/^… \d+ more lines$/);
+      expect(note).toMatch(/^ {4}… \d+ more lines$/);
     });
 
     it("reports the exact omitted line count", () => {
@@ -525,7 +594,7 @@ describe("ConversationViewer", () => {
       const viewer = viewerFor(result(text));
       const content = ((viewer as any).buildContentLines(76) as string[]).map(strip);
 
-      expect(content).toContain("… 3 more lines");
+      expect(content).toContain("    … 3 more lines");
     });
 
     it("keeps the notice short enough for a narrow frame", () => {
@@ -611,7 +680,7 @@ describe("ConversationViewer", () => {
       expect(out).not.toContain("tail");
     });
 
-    it("keeps tool results dim even when rendering them as Markdown", () => {
+    it("keeps tool results styled even when rendering them as Markdown", () => {
       // Reads the content line directly: every bordered row carries the theme's
       // escape on its `│`, so asserting on rendered output would pass either way.
       const viewer = viewerFor(result("plain result text"), "all");
@@ -621,7 +690,7 @@ describe("ConversationViewer", () => {
       expect(line).toContain("\x1b[38;5;240m");
     });
 
-    it("keeps tool results dim on the literal path too", () => {
+    it("keeps tool results styled on the literal path too", () => {
       const viewer = viewerFor(result("plain result text"));
       const line = (viewer as any).buildContentLines(76)
         .find((l: string) => strip(l).includes("plain result text"));
@@ -655,9 +724,6 @@ describe("ConversationViewer", () => {
 
     it("renders Markdown to fit, so the overwidth clamp never has to cut it", () => {
       const text = `# ${"Heading ".repeat(20)}\n\n| a | b |\n|---|---|\n| ${"x".repeat(90)} | 2 |\n\n\`\`\`js\nconst x = ${"1".repeat(120)};\n\`\`\``;
-      // From 20 up: below that the `[Assistant]` role label is itself wider than
-      // the viewport, so the clamp legitimately fires on chrome rather than content.
-      // Narrower widths stay covered by the wrapTextWithAnsi safety net above.
       for (const w of [20, 40, 80, 120]) {
         const viewer = new ConversationViewer(
           mockTui(30, w), mockSession(assistant(text)), mockRecord(), undefined, ansiTheme(), vi.fn(),
@@ -936,6 +1002,26 @@ describe("ConversationViewer", () => {
       expect(out).not.toContain("\x07");
     });
 
+    it("sanitizes tool titles, argument summaries, and bash commands without changing the messages", () => {
+      const hostile = "safe\x1b]0;title\x07\x1b[2J";
+      const messages = [
+        { role: "assistant", content: [
+          { type: "toolCall", id: "c1", name: "read", arguments: { path: hostile } },
+          { type: "toolCall", id: "c2", name: hostile, arguments: {} },
+        ] },
+        { role: "bashExecution", command: hostile, output: "ok" },
+      ];
+      const original = structuredClone(messages);
+      const out = strip(viewerFor(messages).render(120).join("\n"));
+
+      expect(out).toContain("read safe");
+      expect(out).toContain("$ safe");
+      expect(out).not.toContain("\x1b]0;");
+      expect(out).not.toContain("\x1b[2J");
+      expect(out).not.toContain("\x07");
+      expect(messages).toEqual(original);
+    });
+
     it("theme styling applied after sanitizing still renders", () => {
       const viewer = viewerFor([
         { role: "user", content: "safe\x1b[2A text" },
@@ -992,8 +1078,8 @@ describe("ConversationViewer", () => {
           attached("nope", "orphan"),
         ]).render(80).join("\n"));
 
-        expect(out).toContain("[Result]");
-        expect(out).toContain("orphan");
+        expect(out).not.toContain("[Result]");
+        expect(out).toContain("  ⎿ orphan");
       });
 
       it("quotes user text with a > marker", () => {
