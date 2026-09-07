@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
+import type { UsageSnapshot } from "../src/types.ts";
 import usageExtension from "../src/usage.ts";
 import { createMockContext, createMockPi } from "./support.ts";
 
@@ -183,6 +184,13 @@ test("/usage fetches OpenCode Go usage with Pi's resolved bearer token", async (
     authorization: "Bearer same-token-used-by-pi",
   });
   assert.match(statuses.get("usage") ?? "", /^opencode-go /);
+  assert.equal(mock.entries.length, 1);
+  const snapshot = mock.entries[0]?.data as UsageSnapshot;
+  assert.equal(snapshot.report.providerId, "opencode-go");
+  assert.deepEqual(
+    snapshot.report.buckets.map((bucket) => bucket.id),
+    ["rolling", "weekly", "monthly"],
+  );
 });
 
 test("/usage caches enriched Codex reports and refreshes both requests together", async (t) => {
@@ -237,6 +245,7 @@ test("/usage caches enriched Codex reports and refreshes both requests together"
   await command.handler("", ctx);
   assert.equal(urls.length, 2);
   assert.match(titles[1] ?? "", /Usage limit resets:\s+1 available/);
+  assert.equal(mock.entries.length, 1);
 
   await command.handler("", ctx);
   assert.deepEqual(urls, [
@@ -246,6 +255,10 @@ test("/usage caches enriched Codex reports and refreshes both requests together"
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
   ]);
   assert.match(titles[3] ?? "", /Usage limit resets:\s+3 available/);
+  assert.equal(mock.entries.length, 2);
+  const snapshot = mock.entries[1]?.data as UsageSnapshot;
+  assert.equal(snapshot.report.metrics[0]?.value, 3);
+  assert.equal(snapshot.report.metrics[0]?.resetExpirations?.[0]?.kind, "never");
 });
 
 test("/usage confirms and redeems one backend-selected reset before refreshing", async (t) => {
@@ -319,6 +332,13 @@ test("/usage confirms and redeems one backend-selected reset before refreshing",
   assert.match(String(body.redeem_request_id), /^[0-9a-f-]{36}$/u);
   assert.equal("credit_id" in body, false);
   assert.match(notifications.at(-1)?.message ?? "", /2 usage windows were reset/);
+  assert.equal(mock.entries.length, 2);
+  const snapshots = mock.entries.map((entry) => entry.data as UsageSnapshot);
+  assert.deepEqual(
+    snapshots.map((snapshot) => snapshot.report.metrics[0]?.value),
+    [1, 0],
+  );
+  assert.equal(snapshots[0]?.identity.kind, "account");
 });
 
 test("a second /usage flow cancels the first before it can redeem", async (t) => {
@@ -719,6 +739,7 @@ test("automatic provider failures back off instead of retrying every turn", asyn
   mock.events.get("turn_start")?.[0]?.({}, ctx);
   await settle();
   assert.equal(fetches, 1);
+  assert.equal(mock.entries.length, 0);
 });
 
 test("a current command supersedes an older automatic query for the same provider", async (t) => {
@@ -775,6 +796,9 @@ test("a current command supersedes an older automatic query for the same provide
   resolveOldFetch(response("account-a", 75));
   await settle();
   assert.equal(statuses.get("usage"), "openrouter $40.00 left");
+  assert.equal(mock.entries.length, 1);
+  const snapshot = mock.entries[0]?.data as UsageSnapshot;
+  assert.equal(snapshot.report.accountLabel, "account-b");
 });
 
 test("session shutdown clears status through the shutdown context", async (t) => {
@@ -865,6 +889,10 @@ test("a slow command cannot overwrite status after the selected model changes", 
   resolveSlowFetch(await usageFetch("https://openrouter.ai/api/v1/key"));
   await commandPromise;
   assert.equal(statuses.get("usage"), "codex 80% 5h");
+  assert.deepEqual(
+    mock.entries.map((entry) => (entry.data as UsageSnapshot).report.providerId),
+    ["openrouter", "openai-codex"],
+  );
 });
 
 test("statusline follows runtime auth changes and clears for unsupported selected providers", async (t) => {

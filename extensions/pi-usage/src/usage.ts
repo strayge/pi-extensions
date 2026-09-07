@@ -34,6 +34,7 @@ import {
 } from "./query.ts";
 import { PendingRedemptionStore, REDEMPTION_STATE_FILE_NAME } from "./redemption-store.ts";
 import { sampleUsageReport } from "./sample.ts";
+import { createUsageSnapshot, SNAPSHOT_ENTRY_TYPE } from "./snapshot.ts";
 import { applyUsageSlotOptions, usageSlotDefaults, usageSlotFields } from "./statusline-schema.ts";
 import { publishStatuslineItem, registerStatuslineSlot } from "./statusline-slot.ts";
 import type {
@@ -92,6 +93,7 @@ export default function usageExtension(pi: ExtensionAPI) {
   reloadDisplayConfig();
 
   let sessionActive = false;
+  let snapshotWarningShown = false;
   /** What the status shows and which model it describes, so a refresh for that
    * same model can leave it standing instead of blinking through "checking". */
   let shown: { text: string | undefined; model: string | undefined } = {
@@ -312,12 +314,10 @@ export default function usageExtension(pi: ExtensionAPI) {
       }
     }
 
+    let report: UsageReport;
     try {
       const remainingMs = Math.max(1, DEFAULT_TIMEOUT_MS - (Date.now() - startedAt));
-      const report = await queryProviderUsage(adapter, auth, signal, remainingMs);
-      cache.set(adapter.id, auth.fingerprint, report);
-      failures.delete(`${adapter.id}:${auth.fingerprint}`);
-      return ready(report);
+      report = await queryProviderUsage(adapter, auth, signal, remainingMs);
     } catch (error) {
       if (isStaleExtensionContextError(error) || isAbortError(error)) throw error;
       const message = errorMessage(error);
@@ -328,6 +328,23 @@ export default function usageExtension(pi: ExtensionAPI) {
         accountKey: auth.accountKey,
       };
     }
+
+    signal.throwIfAborted();
+    cache.set(adapter.id, auth.fingerprint, report);
+    failures.delete(`${adapter.id}:${auth.fingerprint}`);
+    if (modelIdentity(ctx.model) === modelIdentity(model)) {
+      try {
+        pi.appendEntry(SNAPSHOT_ENTRY_TYPE, createUsageSnapshot(report, auth));
+      } catch (error) {
+        if (isStaleExtensionContextError(error)) throw error;
+        // History failure must not turn a valid provider reading into a query failure.
+        if (!snapshotWarningShown) {
+          snapshotWarningShown = true;
+          ctx.ui.notify("Could not save usage snapshot to the session.", "warning");
+        }
+      }
+    }
+    return ready(report);
   };
 
   const publishStatus = (ctx: ExtensionContext, outcome: QueryOutcome, model: PiModel) => {
@@ -665,6 +682,7 @@ export default function usageExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     sessionActive = true;
+    snapshotWarningShown = false;
     reloadDisplayConfig();
     // The file may have changed since the last session, and a statusline that
     // asked for our schema before this ran would be holding the older defaults.

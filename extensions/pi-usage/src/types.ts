@@ -52,6 +52,18 @@ export interface UsageReport {
   notes?: string[];
 }
 
+/** Observations remain distinct from the session's per-request token accounting. */
+export interface UsageSnapshot {
+  version: 1;
+  observationId: string;
+  identity: {
+    kind: "account" | "credential";
+    id: string;
+  };
+  modelId: string;
+  report: UsageReport;
+}
+
 export interface ResolvedUsageAuth {
   apiKey?: string;
   headers: Record<string, string>;

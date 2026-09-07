@@ -241,6 +241,53 @@ Credentials resolved for a custom or proxy `baseUrl` are never sent to a
 provider's official usage endpoint. This requires pi 0.81.0 or newer, which is
 where the resolved-auth origin became inspectable.
 
+## Session usage history
+
+Each fresh successful usage fetch appends a `custom` entry named
+`pi-usage:snapshot` to the current session through Pi's session API. Cache hits,
+failed queries, cancelled queries, and results that outlive their selected model
+do not produce snapshots. Recording does not add provider requests or change the
+five-minute refresh interval.
+
+Snapshot data contains:
+
+- `version: 1` and a unique `observationId` for recognizing copies inherited by
+  forks or clones;
+- `identity: { kind, id }`, where `id` is a 24-character hexadecimal hash prefix
+  (96 bits). `kind: "account"` uses the existing hashed Codex account ID when
+  available; otherwise `kind: "credential"` uses a stable, provider-scoped hash
+  of the resolved auth headers. Credential rotation changes fallback identity;
+- `modelId`, identifying the model selected for the observation, **not** a claim
+  that this model alone consumed the quota;
+- `report`, the complete normalized `UsageReport`: provider, capture timestamp,
+  source, semantics, all quota buckets, metrics, and any returned label or notes.
+  `capturedAt` is Unix milliseconds; bucket `resetsAt` and reset-credit
+  `expiresAt` values are Unix seconds.
+
+Raw credentials, auth headers, and token records are not copied into snapshots.
+The short hashes are pseudonymous identifiers, not anonymization. Custom entries
+are not sent to the model and do not consume context tokens. They follow normal
+session persistence: in-memory sessions are not saved, and Pi may defer a new
+session's first disk write until its first assistant message. Deleting the
+session also deletes its snapshots. A write failure warns once per session but
+leaves the fetched usage available.
+
+Each session records only its selected provider. A parent using Codex and a
+child using OpenRouter record their respective providers in their own files,
+provided `pi-usage` is loaded in both and both sessions are persisted. Isolated
+or extension-excluding children do not collect snapshots; nested subagents may
+use in-memory sessions. There is no forwarding to the parent or shared polling
+coordinator.
+
+For later analysis, combine session files by provider and identity, order by
+`report.capturedAt`, and deduplicate copied observations by `observationId`.
+Snapshots measure provider-account or API-key usage, **not per-session spend**:
+concurrent sessions observe overlapping quota, and percentages must not be
+summed. Existing assistant/tool usage records remain the token data source;
+parent/child aggregates and copied history need separate deduplication. This
+feature does not recover missing nested-agent token records or calculate a
+fixed token-to-quota conversion.
+
 ## Limitations
 
 - Only providers with a stable usage source and pi-resolvable runtime auth are supported.
