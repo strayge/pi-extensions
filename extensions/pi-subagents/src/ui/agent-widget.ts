@@ -5,7 +5,7 @@
  * Uses the callback form of setWidget for themed rendering.
  */
 
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
@@ -145,28 +145,45 @@ export function formatSessionTokens(
   percent: number | null,
   theme: Theme,
   compactions = 0,
+  compact = false,
 ): string {
-  const tokenStr = formatTokens(tokens);
+  const tokenStr = compact ? formatTokens(tokens).replace(/ token$/, " tok") : formatTokens(tokens);
   const annot: string[] = [];
   if (percent !== null) {
     const color = percent >= 85 ? "error" : percent >= 70 ? "warning" : "dim";
-    annot.push(theme.fg(color, `${Math.round(percent)}%`));
+    annot.push(theme.fg(color, `${Math.round(percent)}%${compact ? " ctx" : ""}`));
   }
   if (compactions > 0) {
     annot.push(theme.fg("dim", `⇊${compactions}`));
   }
+  if (compact) return [tokenStr, ...annot].join(" · ");
   if (annot.length === 0) return tokenStr;
   return `${tokenStr} (${annot.join(" · ")})`;
 }
 
 /** Format turn progress with an optional limit: "turns: 5/30" or "turns: 5". */
-export function formatTurns(turnCount: number, maxTurns?: number | null): string {
-  return maxTurns != null ? `turns: ${turnCount}/${maxTurns}` : `turns: ${turnCount}`;
+export function formatTurns(turnCount: number, maxTurns?: number | null, compact = false): string {
+  const progress = maxTurns != null ? `${turnCount}/${maxTurns}` : `${turnCount}`;
+  return compact ? `${progress} turn${turnCount === 1 ? "" : "s"}` : `turns: ${progress}`;
 }
 
 /** Format milliseconds as human-readable duration. */
 export function formatMs(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Keep long-running widget durations readable without spending width on fractional seconds. */
+function formatWidgetDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return formatMs(ms);
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+/** Sacrifice description width before statistics; clamp the whole row only as a last resort. */
+function formatWidgetLine(prefix: string, description: string, suffix: string, width: number): string {
+  const descriptionWidth = Math.max(0, width - visibleWidth(prefix) - visibleWidth(suffix) - 2);
+  const middle = descriptionWidth > 0 ? `  ${truncateToWidth(description, descriptionWidth, "…")}` : "";
+  return truncateToWidth(prefix + middle + suffix, width);
 }
 
 /** Format duration from start/completed timestamps. */
@@ -375,9 +392,8 @@ export class AgentWidget {
   }
 
   /** Render a finished agent line. */
-  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; lifetimeUsage?: LifetimeUsage }, theme: Theme): string {
-    const modeLabel = getPromptModeLabel(a.type);
-    const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
+  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; lifetimeUsage?: LifetimeUsage }, theme: Theme, width: number): string {
+    const duration = formatWidgetDuration((a.completedAt ?? Date.now()) - a.startedAt);
 
     let icon: string;
     let statusText: string;
@@ -402,8 +418,8 @@ export class AgentWidget {
 
     const parts: string[] = [];
     const activity = this.agentActivity.get(a.id);
-    if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
-    if (a.toolUses > 0) parts.push(`${a.toolUses} tool use${a.toolUses === 1 ? "" : "s"}`);
+    if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns, true));
+    if (a.toolUses > 0) parts.push(`${a.toolUses} call${a.toolUses === 1 ? "" : "s"}`);
     // From the record, not the activity tracker: that entry is deleted the
     // moment an agent finishes, and "what did it cost" is a question asked
     // about finished agents.
@@ -411,8 +427,12 @@ export class AgentWidget {
     if (costText) parts.push(costText);
     parts.push(duration);
 
-    const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-    return `${icon} ${renderAgentName(a.type, theme, { fallbackColor: "dim" })}${modeTag}  ${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
+    return formatWidgetLine(
+      `${icon} ${renderAgentName(a.type, theme, { fallbackColor: "dim" })}`,
+      theme.fg("dim", a.description),
+      ` ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`,
+      width,
+    );
   }
 
   /**
@@ -445,14 +465,12 @@ export class AgentWidget {
 
     const finishedLines: string[] = [];
     for (const a of finished) {
-      finishedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderFinishedLine(a, theme)));
+      finishedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderFinishedLine(a, theme, Math.max(0, w - 3))));
     }
 
     const runningLines: string[][] = []; // each entry is [header, activity]
     for (const a of running) {
-      const modeLabel = getPromptModeLabel(a.type);
-      const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-      const elapsed = formatMs(Date.now() - a.startedAt);
+      const elapsed = formatWidgetDuration(Date.now() - a.startedAt);
 
       const bg = this.agentActivity.get(a.id);
       const toolUses = bg?.toolUses ?? a.toolUses;
@@ -462,7 +480,7 @@ export class AgentWidget {
       // runs and the record once it stops made the figure jump at completion.
       const tokens = getLifetimeTotal(a.lifetimeUsage);
       const contextPercent = getSessionContextPercent(bg?.session);
-      const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
+      const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount, true) : "";
       const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
 
       const parts: string[] = [];
@@ -476,8 +494,8 @@ export class AgentWidget {
         const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
         if (thinkingTag) parts.push(thinkingTag.slice("thinking: ".length));
       }
-      if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
-      if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
+      if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns, true));
+      if (toolUses > 0) parts.push(`${toolUses} call${toolUses === 1 ? "" : "s"}`);
       if (tokenText) parts.push(tokenText);
       if (costText) parts.push(costText);
       parts.push(elapsed);
@@ -486,7 +504,12 @@ export class AgentWidget {
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
       runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+        formatWidgetLine(
+          theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}`,
+          theme.fg("muted", a.description),
+          ` ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`,
+          w,
+        ),
         truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
       ]);
     }

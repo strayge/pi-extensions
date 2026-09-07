@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { AgentInvocation, WidgetMode } from "../src/types.js";
 import {
@@ -15,6 +16,12 @@ describe("formatTurns", () => {
   it("renders current and maximum turns without ambiguous glyphs", () => {
     expect(formatTurns(16, 48)).toBe("turns: 16/48");
     expect(formatTurns(16)).toBe("turns: 16");
+  });
+
+  it("keeps compact progress readable with and without a limit", () => {
+    expect(formatTurns(16, 48, true)).toBe("16/48 turns");
+    expect(formatTurns(16, undefined, true)).toBe("16 turns");
+    expect(formatTurns(1, undefined, true)).toBe("1 turn");
   });
 });
 
@@ -58,6 +65,14 @@ describe("formatSessionTokens", () => {
     expect(formatSessionTokens(1234, 45, theme, 0)).toBe("1.2k token (<dim>45%</dim>)");
   });
 
+  it("keeps compact context and compaction annotations explicit and colored", () => {
+    expect(formatSessionTokens(1234, null, theme, 0, true)).toBe("1.2k tok");
+    expect(formatSessionTokens(1234, null, theme, 2, true)).toBe("1.2k tok · <dim>⇊2</dim>");
+    expect(formatSessionTokens(1234, 45, theme, 0, true)).toBe("1.2k tok · <dim>45% ctx</dim>");
+    expect(formatSessionTokens(1234, 70, theme, 2, true)).toBe("1.2k tok · <warning>70% ctx</warning> · <dim>⇊2</dim>");
+    expect(formatSessionTokens(1234, 88, theme, 4, true)).toBe("1.2k tok · <error>88% ctx</error> · <dim>⇊4</dim>");
+  });
+
   it("preserves the outer style after nested annotation styles reset", () => {
     const tokenText = formatSessionTokens(1234, 70, ansiTheme);
 
@@ -80,6 +95,8 @@ describe("renderRunningAgentStatus", () => {
 });
 
 describe("AgentWidget", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
 
   function makeActivity(): AgentActivity {
@@ -112,12 +129,18 @@ describe("AgentWidget", () => {
   }
 
   /** Render the widget for a manager and return the produced lines ("" if nothing rendered). */
-  function renderLines(manager: unknown, activityId: string, mode?: () => WidgetMode, showModel = false): string {
+  function renderLines(
+    manager: unknown,
+    activityId: string,
+    mode?: () => WidgetMode,
+    showModel = false,
+    options: { width?: number; theme?: typeof theme; activity?: AgentActivity; showCost?: boolean } = {},
+  ): string {
     const widget = new AgentWidget(
       manager as any,
-      new Map([[activityId, makeActivity()]]),
+      new Map([[activityId, options.activity ?? makeActivity()]]),
       mode,
-      () => false,
+      () => options.showCost ?? false,
       () => showModel,
     );
     let factory: any;
@@ -127,7 +150,7 @@ describe("AgentWidget", () => {
     });
     widget.update();
     if (!factory) return "";
-    return factory({ terminal: { columns: 120 }, requestRender: () => {} }, theme)
+    return factory({ terminal: { columns: options.width ?? 120 }, requestRender: () => {} }, options.theme ?? theme)
       .render()
       .join("\n");
   }
@@ -189,7 +212,7 @@ describe("AgentWidget", () => {
       .toContain("sonnet 4.6 · high");
   });
 
-  it("renders the row exactly as before when showModel is off", () => {
+  it("omits model and thinking when showModel is off", () => {
     const manager = { listAgents: () => [makeRecord("bg", { isBackground: true })] };
 
     const off = renderLines(manager, "bg", () => "background");
@@ -213,6 +236,81 @@ describe("AgentWidget", () => {
     expect(renderLines(manager, "bg", () => "background", true))
       .toContain("haiku 4.5 · high (asked max)");
   });
+
+  it("keeps the compact header and activity on their existing two rows", () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    const record = {
+      ...makeRecord("bg"),
+      description: "Integrate actual Pi and proxy",
+      startedAt: 208_000,
+      lifetimeUsage: { input: 120_000, output: 600, cacheWrite: 0 },
+      invocation: { modelName: "gpt-6 astra", thinking: "low" },
+    };
+    const activity: AgentActivity = {
+      ...makeActivity(), turnCount: 37, toolUses: 78,
+      session: { getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 }, contextUsage: { percent: 37 } }) },
+    };
+    const lines = renderLines({ listAgents: () => [record] }, "bg", undefined, true, { activity }).split("\n");
+
+    expect(lines).toHaveLength(3);
+    expect(lines[1]).toContain("Integrate actual Pi and proxy · gpt-6 astra · low · 37 turns · 78 calls · 120.6k tok · 37% ctx · 13m12s");
+    expect(lines[1]).not.toContain("(twin)");
+    expect(lines[2]).toContain("⎿  thinking…");
+  });
+
+  it.each(["running", "completed"])("shortens only the description when a %s row can retain its statistics", (status) => {
+    vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    const record = {
+      ...makeRecord("bg"), status,
+      description: "説明界".repeat(100), toolUses: 78,
+      startedAt: 208_000, completedAt: status === "completed" ? 1_000_000 : undefined,
+      lifetimeUsage: { input: 120_000, output: 600, cacheWrite: 0, cost: 0.05 },
+      compactionCount: 2,
+    };
+    const activity = { ...makeActivity(), turnCount: 37, maxTurns: 48, toolUses: 78 };
+    const styledTheme = {
+      fg: (_color: string, text: string) => `\x1b[36m${text}\x1b[39m`,
+      bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
+    };
+    const lines = renderLines({ listAgents: () => [record] }, "bg", undefined, true, {
+      width: 120, theme: styledTheme, activity, showCost: true,
+    }).split("\n");
+    const header = stripTerminalSequences(lines[1]);
+
+    expect(header).toContain("…");
+    expect(header).toContain("37/48 turns · 78 calls");
+    expect(header).toContain("~$0.05");
+    expect(header).toMatch(/13m12s$/);
+    expect(header).not.toContain("(twin)");
+    if (status === "running") {
+      expect(header).toContain("sonnet 4.6 · high");
+      expect(header).toContain("120.6k tok · ⇊2");
+    }
+    for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(120);
+  });
+
+  it("uses final clipping without adding rows when statistics alone cannot fit", () => {
+    const record = {
+      ...makeRecord("bg"), description: "description should disappear",
+      invocation: { modelName: "very-long-model-name".repeat(10), thinking: "high" },
+    };
+    for (const width of [1, 4, 10, 40, 80]) {
+      const lines = renderLines({ listAgents: () => [record] }, "bg", undefined, true, { width }).split("\n");
+      expect(lines).toHaveLength(3);
+      expect(lines[1]).not.toContain("description");
+      for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+    }
+  });
+
+  it.each([[1250, "1.3s"], [60_000, "1m00s"], [792_999, "13m12s"], [3_600_000, "60m00s"]] as const)(
+    "keeps elapsed time readable after %i milliseconds",
+    (elapsed, expected) => {
+      vi.spyOn(Date, "now").mockReturnValue(4_000_000);
+      const record = { ...makeRecord("bg"), startedAt: 4_000_000 - elapsed };
+      const lines = renderLines({ listAgents: () => [record] }, "bg").split("\n");
+      expect(lines[1].endsWith(expected)).toBe(true);
+    },
+  );
 
   // Queued agents stay a one-line count. A fan-out of ten would otherwise eat
   // the whole widget and push every finished agent out of it.
@@ -333,19 +431,19 @@ describe("AgentWidget cost display", () => {
 
   it("shows the cost beside the token count when enabled", () => {
     const line = render(true, 0.0042);
-    expect(line).toContain("1.2k token");
+    expect(line).toContain("1.2k tok");
     expect(line).toContain("~$0.0042");
   });
 
   it("shows no cost when disabled", () => {
     const line = render(false, 0.0042);
-    expect(line).toContain("1.2k token");
+    expect(line).toContain("1.2k tok");
     expect(line).not.toContain("$");
   });
 
   it("shows no cost for an unpriced model, even when enabled", () => {
     const line = render(true, 0);
-    expect(line).toContain("1.2k token");
+    expect(line).toContain("1.2k tok");
     expect(line).not.toContain("$");
   });
 
@@ -388,7 +486,7 @@ describe("AgentWidget cost display", () => {
     widget.update();
     const out = factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render().join("\n");
 
-    expect(out).toContain("1.2k token");
+    expect(out).toContain("1.2k tok");
     expect(out).toContain("~$0.0042");
   });
 
