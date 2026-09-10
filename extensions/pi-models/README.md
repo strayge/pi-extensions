@@ -9,3 +9,17 @@ For partial command input such as `/m` or `/mo`, `/models` is suggested before t
 Rows display `[provider] Model Name`, falling back to the model ID when no name is available.
 Use Up/Down and Enter to select, Ctrl+F to toggle a favorite, and Escape to close.
 Typing filters by provider, model ID, provider/model ID, or model name.
+
+## Installation
+
+```bash
+pi install npm:@strayge/pi-models
+```
+
+Requires Node.js >=22.19.0 and pi.
+
+For development, load this checkout directly:
+
+```bash
+pi -e ./src/index.ts
+```

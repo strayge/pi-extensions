@@ -39,7 +39,7 @@
  *   show-plan.ts    show_plan tool   plan-render.ts  its renderer
  *
  * Install (see README.md):
- *   pi install git:github.com/wynainfo/pi-permission-modes
+ *   pi install npm:@strayge/pi-permission-modes
  *   Linux also needs: bubblewrap, socat, ripgrep
  */
 
@@ -421,7 +421,7 @@ export default async function (pi: ExtensionAPI) {
           writeFileSync(
             dest,
             project
-              ? `${JSON.stringify({ $schema: "https://raw.githubusercontent.com/wynainfo/pi-permission-modes/main/schemas/permission-mode.schema.json", modes: {} }, null, 2)}\n`
+              ? `${JSON.stringify({ $schema: "https://raw.githubusercontent.com/strayge/pi-extensions/main/extensions/pi-permission-modes/schemas/permission-mode.schema.json", modes: {} }, null, 2)}\n`
               : readFileSync(stockDefaultsFile(), "utf-8"),
           );
           return ctx.ui.notify(`permission-mode: wrote ${dest} — edit it to customize your modes`, "info");

@@ -1,6 +1,18 @@
 {
-  "name": "pi-builtin-tool-limits",
-  "version": "0.1.0",
+  "name": "@strayge/pi-builtin-tool-limits",
+  "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/strayge/pi-extensions.git",
+    "directory": "extensions/pi-builtin-tool-limits"
+  },
+  "homepage": "https://github.com/strayge/pi-extensions/tree/main/extensions/pi-builtin-tool-limits#readme",
+  "bugs": {
+    "url": "https://github.com/strayge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Pi extension that applies fixed context limits to Pi's built-in tools.",
   "type": "module",
   "license": "MIT",

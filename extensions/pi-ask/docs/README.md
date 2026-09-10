@@ -7,7 +7,7 @@ This folder keeps only the documentation needed to understand and maintain the e
 - `configuration.md` — source of truth for configuring pi-ask keymaps, behaviour, and `/answer` extraction
 - `contract.md` — external behavior, tool payload/result details, and UX guarantees
 - `remote-events.md` — local inter-extension event contract, bridge examples, and smoke-test steps
-- `architecture.md` — module boundaries and invariants
+- [`architecture.md`](https://github.com/strayge/pi-extensions/blob/main/extensions/pi-ask/docs/architecture.md) — module boundaries and invariants
 - `../skills/ask-user/SKILL.md` — auto-bundled agent-side decision-gate guidance; enabled by default, but can be disabled via `pi config`; inspired by https://github.com/edlsh/pi-ask-user
 
 ## Reading order

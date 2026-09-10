@@ -1418,7 +1418,7 @@ test("/perm init -p scaffolds the project schema and project grants notify once"
     await h.perm("init -p");
     const file = path.join(h.root, ".pi", "permission-mode.json");
     const scaffold = JSON.parse(readFileSync(file, "utf-8"));
-    assert.equal(scaffold.$schema, "https://raw.githubusercontent.com/wynainfo/pi-permission-modes/main/schemas/permission-mode.schema.json");
+    assert.equal(scaffold.$schema, "https://raw.githubusercontent.com/strayge/pi-extensions/main/extensions/pi-permission-modes/schemas/permission-mode.schema.json");
     assert.deepEqual(scaffold.modes, {});
 
     writeFileSync(file, JSON.stringify({ modes: { default: { permission: { bash: { "git *": "allow" }, tool: "allow" } } } }));

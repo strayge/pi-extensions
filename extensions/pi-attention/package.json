@@ -1,8 +1,21 @@
 {
-  "name": "pi-attention",
-  "version": "0.1.0",
+  "name": "@strayge/pi-attention",
+  "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/strayge/pi-extensions.git",
+    "directory": "extensions/pi-attention"
+  },
+  "homepage": "https://github.com/strayge/pi-extensions/tree/main/extensions/pi-attention#readme",
+  "bugs": {
+    "url": "https://github.com/strayge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Pi extension that chimes when a turn finishes while the terminal is unfocused.",
   "type": "module",
+  "license": "MIT",
   "keywords": [
     "pi-package",
     "pi-extension",

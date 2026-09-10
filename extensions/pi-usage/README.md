@@ -8,6 +8,20 @@ Supports OpenAI Codex ChatGPT subscription windows, OpenRouter API-key spend
 limits, and OpenCode Go usage windows, without pretending those limits mean the
 same thing.
 
+## Installation
+
+```bash
+pi install npm:@strayge/pi-usage
+```
+
+Requires Node.js >=22.19.0 and pi.
+
+For development, load this checkout directly:
+
+```bash
+pi -e ./src/index.ts
+```
+
 ## Commands
 
 | Command | Effect |

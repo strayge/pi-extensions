@@ -16,6 +16,20 @@ extension changes nothing until you edit the layout.
 📊 42%  🔎 PR #12
 ```
 
+## Installation
+
+```bash
+pi install npm:@strayge/pi-statusline
+```
+
+Requires Node.js >=22.19.0 and pi.
+
+For development, load this checkout directly:
+
+```bash
+pi -e ./src/index.ts
+```
+
 ## Commands
 
 | Command | Effect |

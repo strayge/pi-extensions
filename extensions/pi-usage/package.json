@@ -1,6 +1,18 @@
 {
-  "name": "pi-usage",
-  "version": "0.1.0",
+  "name": "@strayge/pi-usage",
+  "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/strayge/pi-extensions.git",
+    "directory": "extensions/pi-usage"
+  },
+  "homepage": "https://github.com/strayge/pi-extensions/tree/main/extensions/pi-usage#readme",
+  "bugs": {
+    "url": "https://github.com/strayge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Pi extension that shows current-account usage for the active model provider.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +45,8 @@
     "test": "node --test --experimental-strip-types test/*.test.ts"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.6",

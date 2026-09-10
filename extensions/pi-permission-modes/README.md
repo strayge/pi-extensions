@@ -11,30 +11,23 @@ retune them or add your own in `permission-mode.json`.
 
 ---
 
-## Install
-
-From npm (recommended):
+## Installation
 
 ```bash
-pi install npm:pi-permission-modes
+pi install npm:@strayge/pi-permission-modes
 ```
 
-or straight from GitHub:
-
-```bash
-pi install git:github.com/wynainfo/pi-permission-modes
-```
+Requires Node.js >=22.19.0 and pi.
 
 `pi install` fetches the package and runs `npm install` for you, so
 `@anthropic-ai/sandbox-runtime` comes along automatically; the pi SDK is
 provided by the host. Useful variants:
 
-- `pi install npm:pi-permission-modes@2.1.1` — pin a version (`pi update` won't advance it)
-- `pi install -l npm:pi-permission-modes` — project-local install (`.pi/npm/`, shareable with your team)
+- `pi install npm:@strayge/pi-permission-modes@0.0.1` — pin a version (`pi update` won't advance it)
+- `pi install -l npm:@strayge/pi-permission-modes` — project-local install (`.pi/npm/`, shareable with your team)
 - `pi update --extensions` — pull the latest release later
 
-To try it without adding it to your config, run it directly from a
-clone:
+For development, load this checkout directly:
 
 ```bash
 pi -e ./src/index.ts
@@ -380,7 +373,7 @@ successfully rewrites that mode. This is a breaking configuration change.
 
 ```jsonc
 {
-  "$schema": "https://raw.githubusercontent.com/wynainfo/pi-permission-modes/main/schemas/permission-mode.schema.json",
+  "$schema": "https://raw.githubusercontent.com/strayge/pi-extensions/main/extensions/pi-permission-modes/schemas/permission-mode.schema.json",
   "defaultMode": "default",
   "cycleOrder": ["default", "plan", "build", "yolo"],
   "modes": {
@@ -467,9 +460,8 @@ Add a mode under `modes` in the global config and (optionally) list it in
 
 - Temporarily: launch pi with `--no-extensions` (disables all), or `--no-sandbox`
   to keep the modes but drop OS sandboxing.
-- Permanently: `pi remove npm:pi-permission-modes` (or
-  `git:github.com/wynainfo/pi-permission-modes`, matching how you installed
-  it) — or remove the entry from your pi settings.
+- Permanently: `pi remove npm:@strayge/pi-permission-modes` — or remove the
+  entry from your pi settings.
 
 ---
 

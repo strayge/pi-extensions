@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/wynainfo/pi-permission-modes/main/schemas/permission-mode.schema.json",
+  "$id": "https://raw.githubusercontent.com/strayge/pi-extensions/main/extensions/pi-permission-modes/schemas/permission-mode.schema.json",
   "title": "permission-mode configuration",
   "description": "Declarative permission modes for the pi coding agent. Global config has full authority. A trusted project config may add permission grants, allowWrite paths, and allowedDomains. Permission grants satisfy only matching ask decisions and cannot override denies. Project writable, askOnBlockedHost, denyRead, denyWrite, and deniedDomains remain tighten-only. Project files cannot change sandbox.enabled, defaultMode, cycleOrder, or add modes. An untrusted project config is entirely tighten-only and its remembered grants are ignored.",
   "type": "object",

@@ -27,7 +27,13 @@ no compatibility package.
 
 ## Install
 
-Add this package's entry point to Pi's `extensions` setting, or test it directly:
+```sh
+pi install npm:@strayge/pi-builtin-tool-limits
+```
+
+Requires Node.js >=22.19.0.
+
+For development, load this checkout directly:
 
 ```sh
 pi -e "$PWD/extensions/pi-builtin-tool-limits/src/index.ts"

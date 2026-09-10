@@ -1,11 +1,24 @@
 {
-  "name": "pi-ask",
-  "version": "1.2.0",
+  "name": "@strayge/pi-ask",
+  "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/strayge/pi-extensions.git",
+    "directory": "extensions/pi-ask"
+  },
+  "homepage": "https://github.com/strayge/pi-extensions/tree/main/extensions/pi-ask#readme",
+  "bugs": {
+    "url": "https://github.com/strayge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Pi extension that adds an interactive ask_user clarification tool. Vendored from @eko24ive/pi-ask v1.2.0, see README.md for provenance.",
   "license": "MIT",
   "type": "module",
   "keywords": [
     "pi-package",
+    "pi-extension",
     "pi",
     "pi-coding-agent",
     "ask_user",

@@ -484,7 +484,7 @@ describe("mentioning an agent that has never run", () => {
 
       const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
       const lines = factory({ terminal: { columns: 200 }, requestRender: vi.fn() }, theme).render().join("\n");
-      expect(lines).toContain("turns: 1/9");
+      expect(lines).toContain("1/9 turn");
     } finally {
       setDefaultMaxTurns(prevMax);
     }

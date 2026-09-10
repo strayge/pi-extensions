@@ -14,11 +14,19 @@ proxied child UI context with the `Symbol.for("pi-subagents:child-extension-ui")
 protocol, so a finishing subagent stays silent even though it inherits TUI mode
 to forward permission dialogs.
 
-## Install
+## Installation
 
 ```bash
-pi install ./extensions/pi-attention     # from a checkout
-pi -e ./extensions/pi-attention          # try it for one run, without installing
+pi install npm:@strayge/pi-attention
+```
+
+Requires Node.js >=22.19.0 and pi.
+
+For development from a repository checkout:
+
+```bash
+pi install ./extensions/pi-attention
+pi -e ./extensions/pi-attention
 ```
 
 ## Commands

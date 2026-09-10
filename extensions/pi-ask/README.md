@@ -9,6 +9,20 @@
 
 It lets an agent pause, ask structured questions in a terminal UI, and continue with normalized answers instead of guessing.
 
+## Installation
+
+```bash
+pi install npm:@strayge/pi-ask
+```
+
+Requires Node.js >=22.19.0 and pi.
+
+For development, load this checkout directly:
+
+```bash
+pi -e ./src/index.ts
+```
+
 ## Features
 
 - 🧭 Familiar ask-style interface: tabbed questions, single/multi select, and preview mode
