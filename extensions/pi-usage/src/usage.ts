@@ -25,6 +25,8 @@ import {
 import { awaitWithDeadline, errorMessage, sanitizeDisplayText, UsageCache } from "./core.ts";
 import { showDisplayMenu } from "./display-menu.ts";
 import { formatProviderState, formatUsageSegments, formatUsageStatusline } from "./format.ts";
+import { loadHistory } from "./history.ts";
+import { showUsageHistory } from "./history-menu.ts";
 import {
   adapterForProvider,
   isStaleExtensionContextError,
@@ -34,7 +36,11 @@ import {
 } from "./query.ts";
 import { PendingRedemptionStore, REDEMPTION_STATE_FILE_NAME } from "./redemption-store.ts";
 import { sampleUsageReport } from "./sample.ts";
-import { createUsageSnapshot, SNAPSHOT_ENTRY_TYPE } from "./snapshot.ts";
+import {
+  createUsageSnapshot,
+  deriveUsageSnapshotIdentity,
+  SNAPSHOT_ENTRY_TYPE,
+} from "./snapshot.ts";
 import { applyUsageSlotOptions, usageSlotDefaults, usageSlotFields } from "./statusline-schema.ts";
 import { publishStatuslineItem, registerStatuslineSlot } from "./statusline-slot.ts";
 import type {
@@ -44,6 +50,7 @@ import type {
   UsageDisplayConfig,
   UsageProviderAdapter,
   UsageReport,
+  UsageSnapshotIdentity,
 } from "./types.ts";
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -56,6 +63,7 @@ const STATUS_KEY = "usage";
 const REFRESH = "Refresh usage";
 const USE_RESET = "Use one reset…";
 const RETRY_RESET = "Retry using reset…";
+const HISTORY = "Statistics";
 const DISPLAY = "Display options…";
 const CLOSE = "Close";
 
@@ -63,11 +71,20 @@ type QueryOutcome = {
   state: ProviderUsageState;
   fingerprint?: string;
   accountKey?: string;
+  identity?: UsageSnapshotIdentity;
 };
 
 type LoaderResult<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
-export default function usageExtension(pi: ExtensionAPI) {
+type HistoryOperations = {
+  load: typeof loadHistory;
+  show: typeof showUsageHistory;
+};
+
+export default function usageExtension(
+  pi: ExtensionAPI,
+  history: HistoryOperations = { load: loadHistory, show: showUsageHistory },
+) {
   // Mirrors every status write onto the statusline slot bus. No placement hint
   // is sent: without one the slot lands wherever plain statuses land today, and
   // a user who wants it elsewhere names it in their statusline config.
@@ -288,6 +305,12 @@ export default function usageExtension(pi: ExtensionAPI) {
       };
     }
 
+    const identity = deriveUsageSnapshotIdentity(adapter.id, auth);
+    const resolvedAuth = {
+      fingerprint: auth.fingerprint,
+      accountKey: auth.accountKey,
+      identity,
+    };
     const ready = (report: Parameters<typeof formatUsageStatusline>[0]): QueryOutcome => ({
       state: {
         providerId: adapter.id,
@@ -296,8 +319,7 @@ export default function usageExtension(pi: ExtensionAPI) {
         status: "ready",
         report,
       },
-      fingerprint: auth?.fingerprint,
-      accountKey: auth?.accountKey,
+      ...resolvedAuth,
     });
 
     if (!force) {
@@ -308,8 +330,7 @@ export default function usageExtension(pi: ExtensionAPI) {
       if (failed) {
         return {
           state: state(adapter, "query-failed", failed),
-          fingerprint: auth.fingerprint,
-          accountKey: auth.accountKey,
+          ...resolvedAuth,
         };
       }
     }
@@ -324,8 +345,7 @@ export default function usageExtension(pi: ExtensionAPI) {
       rememberFailure(`${adapter.id}:${auth.fingerprint}`, message);
       return {
         state: state(adapter, "query-failed", message),
-        fingerprint: auth.fingerprint,
-        accountKey: auth.accountKey,
+        ...resolvedAuth,
       };
     }
 
@@ -512,7 +532,7 @@ export default function usageExtension(pi: ExtensionAPI) {
             : undefined;
         const action = await ctx.ui.select(
           formatProviderState(outcome.state, display),
-          [REFRESH, ...(resetAction ? [resetAction] : []), DISPLAY, CLOSE],
+          [HISTORY, REFRESH, ...(resetAction ? [resetAction] : []), DISPLAY, CLOSE],
           { signal: controller.signal },
         );
         if (action === REFRESH) {
@@ -636,6 +656,34 @@ export default function usageExtension(pi: ExtensionAPI) {
             );
             continue;
           }
+        }
+        if (action === HISTORY) {
+          try {
+            const loaded = await runWithLoader(
+              ctx,
+              "Loading usage history…",
+              controller.signal,
+              (signal) => history.load(ctx, { signal }),
+            );
+            if (!loaded) {
+              if (controller.signal.aborted) return;
+              continue;
+            }
+            const live =
+              outcome.state.status === "ready"
+                ? {
+                    providerId: outcome.state.providerId,
+                    providerName: outcome.state.providerName,
+                    identity: outcome.identity,
+                    report: outcome.state.report,
+                  }
+                : undefined;
+            await history.show(ctx, { history: loaded, live, signal: controller.signal });
+          } catch (error) {
+            if (controller.signal.aborted || isAbortError(error)) return;
+            ctx.ui.notify("Could not load usage history.", "warning");
+          }
+          continue;
         }
         if (action !== DISPLAY) return;
         await showDisplayMenu(ctx, {

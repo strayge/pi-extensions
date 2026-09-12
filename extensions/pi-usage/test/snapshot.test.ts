@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { initTheme, SessionManager } from "@earendil-works/pi-coding-agent";
-import { createUsageSnapshot, SNAPSHOT_ENTRY_TYPE } from "../src/snapshot.ts";
+import {
+  createUsageSnapshot,
+  deriveUsageSnapshotIdentity,
+  SNAPSHOT_ENTRY_TYPE,
+} from "../src/snapshot.ts";
 import type { PiModel, ResolvedUsageAuth, UsageReport, UsageSnapshot } from "../src/types.ts";
 import usageExtension from "../src/usage.ts";
 import { createMockContext, createMockPi } from "./support.ts";
@@ -67,35 +71,65 @@ test("snapshots preserve normalized observations without serializing runtime cre
   assert.notEqual(createUsageSnapshot(report, auth).observationId, snapshot.observationId);
 });
 
-test("credential identities survive cache salt changes but distinguish credentials and providers", () => {
-  const identity = createUsageSnapshot(report, auth).identity;
-  assert.deepEqual(
-    createUsageSnapshot(report, { ...auth, fingerprint: "another-process-fingerprint" }).identity,
-    identity,
-  );
-  assert.notDeepEqual(
-    createUsageSnapshot(report, {
-      ...auth,
-      headers: { Authorization: "Bearer another-token" },
-    }).identity,
-    identity,
-  );
-  assert.notDeepEqual(
-    createUsageSnapshot({ ...report, providerId: "opencode-go" }, auth).identity,
-    identity,
-  );
+test("credential identity extraction remains byte-compatible across cache salts and providers", () => {
+  const cases = [
+    {
+      providerId: "openai-codex",
+      resolvedAuth: auth,
+      expected: '{"kind":"credential","id":"ea974d27c659c501a486f010"}',
+    },
+    {
+      providerId: "openai-codex",
+      resolvedAuth: { ...auth, fingerprint: "another-process-fingerprint" },
+      expected: '{"kind":"credential","id":"ea974d27c659c501a486f010"}',
+    },
+    {
+      providerId: "openai-codex",
+      resolvedAuth: {
+        ...auth,
+        headers: { Authorization: "Bearer another-token" },
+      },
+      expected: '{"kind":"credential","id":"4ad378d7de897b83891657a3"}',
+    },
+    {
+      providerId: "opencode-go",
+      resolvedAuth: auth,
+      expected: '{"kind":"credential","id":"5a0ed97c7242ff32516952ca"}',
+    },
+  ] as const;
+
+  for (const { providerId, resolvedAuth, expected } of cases) {
+    const identity = deriveUsageSnapshotIdentity(providerId, resolvedAuth);
+    assert.equal(JSON.stringify(identity), expected);
+    assert.equal(
+      JSON.stringify(createUsageSnapshot({ ...report, providerId }, resolvedAuth).identity),
+      expected,
+    );
+  }
 });
 
-test("account identities use the short stable account key rather than a rotating credential", () => {
-  const accountKey = "abcdef0123456789".repeat(4);
-  const first = createUsageSnapshot(report, { ...auth, accountKey });
-  const refreshed = createUsageSnapshot(report, {
-    ...auth,
-    accountKey,
-    headers: { Authorization: "Bearer refreshed-token" },
-  });
-  assert.deepEqual(first.identity, { kind: "account", id: accountKey.slice(0, 24) });
-  assert.deepEqual(refreshed.identity, first.identity);
+test("account identity extraction remains byte-compatible across credential refreshes", () => {
+  const cases = [
+    {
+      accountKey: "abcdef0123456789".repeat(4),
+      expected: '{"kind":"account","id":"abcdef0123456789abcdef01"}',
+    },
+    {
+      accountKey: "9876543210fedcba".repeat(4),
+      expected: '{"kind":"account","id":"9876543210fedcba98765432"}',
+    },
+  ];
+
+  for (const { accountKey, expected } of cases) {
+    for (const headers of [auth.headers, { Authorization: "Bearer refreshed-token" }]) {
+      const resolvedAuth = { ...auth, accountKey, headers };
+      assert.equal(
+        JSON.stringify(deriveUsageSnapshotIdentity(report.providerId, resolvedAuth)),
+        expected,
+      );
+      assert.equal(JSON.stringify(createUsageSnapshot(report, resolvedAuth).identity), expected);
+    }
+  }
 });
 
 test("parent and child providers persist in their own JSONL without entering model context", async (t) => {

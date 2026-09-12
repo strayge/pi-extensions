@@ -554,7 +554,7 @@ function compactLimitLabel(label: string): string {
     .replace(/\s+/g, " ");
 }
 
-function formatWindowLabel(
+export function formatWindowLabel(
   minutes: number | undefined,
   fallback: "5h" | "weekly",
   compact: boolean,

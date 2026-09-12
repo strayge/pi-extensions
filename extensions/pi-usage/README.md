@@ -26,10 +26,10 @@ pi -e ./src/index.ts
 
 | Command | Effect |
 | --- | --- |
-| `/usage` | Show usage for the current account, with refresh, saved-reset, and display actions |
+| `/usage` | Show current usage, historical usage, refresh, saved-reset, and display actions |
 
-The command takes no arguments — refresh and display options are menu actions,
-not flags.
+The command takes no arguments — history, refresh, and display options are menu
+actions, not flags.
 
 ## What it reports
 
@@ -255,7 +255,90 @@ Credentials resolved for a custom or proxy `baseUrl` are never sent to a
 provider's official usage endpoint. This requires pi 0.81.0 or newer, which is
 where the resolved-auth origin became inspectable.
 
-## Session usage history
+## Historical usage
+
+Choose **Statistics** from `/usage` to inspect a compact inline, read-only
+historical panel. It opens on **Models** for the rolling **1d** range. Up/Down
+selects the Tabs and Range rows; Left/Right changes that row's choice.
+Ctrl+Up/Down scrolls the report, and Escape returns to `/usage`. Tab and
+Shift+Tab remain shortcuts for changing tabs, while 1–7 remain hidden range
+shortcuts. The range ends at one fixed time captured when history is
+loaded. The three tabs answer different questions:
+
+- **Models** groups token and recorded-cost totals by exact `provider/model`
+  route.
+- **Cache** shows the cache headlines and the complete per-model message-gap
+  table.
+- **Quotas** shows every visible provider in one report, with compact stacked
+  quota observations, observed consumption and resets, and eligible empirical
+  capacity estimates. Empty limits are omitted, and Codex history shows only the
+  main Codex quota group rather than model-specific groups. Every non-empty
+  identity is included; multiple identities use anonymous `Account 1`,
+  `Account 2`, and so on. Identity IDs and provider account labels are never
+  displayed.
+
+Models and Cache include activity from every provider. Quota
+movement and capacity are provider-specific: calls from one provider never
+contribute to another provider's estimate, and quota percentages are never
+summed across providers or identities. Invoking `/usage` still performs its
+normal live query/cache, status update, and fresh-success snapshot workflow.
+After that workflow, loading history and navigating its tabs or ranges makes no
+additional provider request, status write, or snapshot; the
+live `/usage` report is display-only current context.
+
+The cache headlines use these formulas:
+
+```text
+cached input share = cacheRead / (input + cacheRead + cacheWrite)
+calls reading cache = calls with cacheRead > 0 / all model calls
+```
+
+A zero denominator is shown as `—`. The message-gap table estimates meaningful
+reuse within each source conversation and exact provider/model route: compare
+adjacent calls, add the earlier call's input, cache-read, cache-write, and output
+tokens as its preceding context, and count a hit when the later call's
+cache-read is at least half that context. Results are split into `<1m`, `1–5m`,
+`5–10m`, `10–30m`, `30–60m`, and `1h+`, with both percentage and sample count.
+Missing or negative gaps and zero preceding contexts do not become samples.
+
+Persisted Pi session JSONL is the primary activity source, including active
+in-memory entries. Temporary `pi-subagents` `.output` transcripts are a
+best-available fallback for calls without a matching persisted call. Verified
+fork/clone copies are deduplicated within their session lineage, snapshots are
+deduplicated globally by `observationId`, and an unambiguous persisted subagent
+call suppresses its matching transcript copy. Ambiguous associations are kept
+rather than silently undercounted and can produce a concise warning.
+
+Quota observations stay separated by provider, identity kind/id, and bucket.
+When historical calls cannot be correlated conservatively to one identity,
+capacity is omitted instead of assigning them to whichever credential is
+current now. For an eligible bucket, the uniform extrapolation is:
+
+```text
+empirical 100% tokens = matching-provider tokens × 100 / observed consumed percent
+empirical 100% cost = matching-provider recorded cost × 100 / observed consumed percent
+```
+
+The cost estimate is omitted unless matching calls contain positive recorded
+cost. Both estimates are omitted when consumption is non-positive, call timing
+is unusable, identity correlation is ambiguous, the bucket has no meaningful
+100% limit, or snapshots do not adequately bracket provider activity. A nearby
+inner boundary may be used within 30 minutes with a warning; stale or missing
+boundaries can omit only the affected bucket. A sampling gap longer than a full
+quota window keeps an otherwise valid estimate but labels it a lower bound.
+These are empirical 100%-equivalents, not provider billing rules or guaranteed
+future capacity.
+
+Historical coverage is deliberately not claimed to be complete. Snapshot
+sampling is irregular and active-session-driven, so peaks, resets, and
+consumption can be missed. Account quota can include usage by clients outside
+Pi, while local calls do not retain their historical credential identity.
+Recorded cost may be zero because historical pricing is partial; the extension
+does not invent prices. Temporary subagent output can be disabled, removed, or
+not yet flushed, arbitrary custom session directories are not globally
+discoverable, and ephemeral compaction work is absent from `.output`.
+
+## Usage snapshots
 
 Each fresh successful usage fetch appends a `custom` entry named
 `pi-usage:snapshot` to the current session through Pi's session API. Cache hits,
@@ -297,10 +380,11 @@ For later analysis, combine session files by provider and identity, order by
 `report.capturedAt`, and deduplicate copied observations by `observationId`.
 Snapshots measure provider-account or API-key usage, **not per-session spend**:
 concurrent sessions observe overlapping quota, and percentages must not be
-summed. Existing assistant/tool usage records remain the token data source;
-parent/child aggregates and copied history need separate deduplication. This
-feature does not recover missing nested-agent token records or calculate a
-fixed token-to-quota conversion.
+summed. Persisted assistant, compaction, and branch-summary usage records remain
+the primary token data source; copied history needs separate deduplication.
+Temporary transcripts can recover some nested-agent calls, but not missing or
+unflushed artifacts, and the displayed conversion is empirical rather than
+fixed.
 
 ## Limitations
 

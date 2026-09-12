@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { fingerprintResolvedAuth } from "./core.ts";
-import type { ResolvedUsageAuth, UsageReport, UsageSnapshot } from "./types.ts";
+import type {
+  ResolvedUsageAuth,
+  UsageReport,
+  UsageSnapshot,
+  UsageSnapshotIdentity,
+} from "./types.ts";
 
 export const SNAPSHOT_ENTRY_TYPE = "pi-usage:snapshot";
 
@@ -10,16 +15,23 @@ export const SNAPSHOT_ENTRY_TYPE = "pi-usage:snapshot";
  * namespace rather than the cache's process-random salt; it identifies a
  * credential, not an account that survives credential rotation.
  */
-export function createUsageSnapshot(report: UsageReport, auth: ResolvedUsageAuth): UsageSnapshot {
-  const identity = auth.accountKey
-    ? { kind: "account" as const, id: auth.accountKey.slice(0, 24) }
+export function deriveUsageSnapshotIdentity(
+  providerId: string,
+  auth: ResolvedUsageAuth,
+): UsageSnapshotIdentity {
+  return auth.accountKey
+    ? { kind: "account", id: auth.accountKey.slice(0, 24) }
     : {
-        kind: "credential" as const,
+        kind: "credential",
         id: fingerprintResolvedAuth(
           { headers: auth.headers },
-          Buffer.from(`pi-usage:snapshot:v1:${report.providerId}`),
+          Buffer.from(`pi-usage:snapshot:v1:${providerId}`),
         ).slice(0, 24),
       };
+}
+
+export function createUsageSnapshot(report: UsageReport, auth: ResolvedUsageAuth): UsageSnapshot {
+  const identity = deriveUsageSnapshotIdentity(report.providerId, auth);
   return {
     version: 1,
     observationId: randomUUID(),

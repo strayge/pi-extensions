@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
+import type { LoadedHistory } from "../src/history.ts";
 import type { UsageSnapshot } from "../src/types.ts";
 import usageExtension from "../src/usage.ts";
 import { createMockContext, createMockPi } from "./support.ts";
@@ -16,6 +17,14 @@ process.env.PI_CODING_AGENT_DIR = agentDir;
 writeFileSync(join(agentDir, "usage.json"), JSON.stringify({ version: 1, preset: "legacy" }));
 
 initTheme("dark", false);
+
+const emptyHistory: LoadedHistory = {
+  now: Date.now(),
+  calls: [],
+  snapshots: [],
+  warnings: [],
+  subagents: [],
+};
 
 const openRouterModel = {
   id: "openai/gpt-4o",
@@ -129,8 +138,176 @@ test("/usage queries the current runtime account and offers its next actions", a
   assert.equal(selections.length, 1);
   assert.match(selections[0]?.title ?? "", /OpenRouter Usage · Current/);
   assert.match(selections[0]?.title ?? "", /test-key/);
-  assert.deepEqual(selections[0]?.options, ["Refresh usage", "Display options…", "Close"]);
+  assert.deepEqual(selections[0]?.options, [
+    "Statistics",
+    "Refresh usage",
+    "Display options…",
+    "Close",
+  ]);
   assert.equal(statuses.get("usage"), "openrouter $75.00 left");
+});
+
+test("opening and closing usage history reuses the fetched live outcome", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let fetches = 0;
+  globalThis.fetch = (input) => {
+    fetches += 1;
+    return usageFetch(input);
+  };
+
+  const choices = ["Statistics", "Close"];
+  const mock = createMockPi();
+  let shown = 0;
+  usageExtension(mock.pi, {
+    load: async (_ctx, options) => {
+      assert.equal(options.signal?.aborted, false);
+      return emptyHistory;
+    },
+    show: async (_ctx, options) => {
+      shown += 1;
+      assert.equal(options.history, emptyHistory);
+      assert.equal(options.live?.providerId, "openrouter");
+      assert.equal(options.live?.providerName, "OpenRouter");
+      assert.equal(options.live?.identity?.kind, "credential");
+      assert.equal(options.live?.report.buckets[0]?.id, "credits");
+      assert.equal(options.signal.aborted, false);
+    },
+  });
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  const { ctx } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model: openRouterModel,
+    select: async () => choices.shift(),
+    modelRegistry: {
+      getProviderAuth: async () => ({ auth: { apiKey: "openrouter-key" } }),
+      getAvailable: () => [openRouterModel],
+      getAll: () => [openRouterModel],
+      getProviderAuthStatus: () => ({ configured: true }),
+      getProviderDisplayName: (provider: string) => provider,
+    },
+  });
+
+  await command.handler("", ctx);
+
+  assert.equal(fetches, 1);
+  assert.equal(shown, 1);
+  assert.equal(mock.entries.length, 1);
+  assert.deepEqual(choices, []);
+});
+
+test("usage history loading is cancellable and returns silently to the action menu", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = usageFetch;
+
+  const choices = ["Statistics", "Close"];
+  let loadingAborted = false;
+  let customCalls = 0;
+  const mock = createMockPi();
+  usageExtension(mock.pi, {
+    load: async (_ctx, options) =>
+      new Promise<LoadedHistory>((_resolve, reject) => {
+        options.signal?.addEventListener(
+          "abort",
+          () => {
+            loadingAborted = true;
+            reject(Object.assign(new Error("cancelled"), { name: "AbortError" }));
+          },
+          { once: true },
+        );
+      }),
+    show: async () => {
+      assert.fail("cancelled history must not be shown");
+    },
+  });
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  const { ctx, notifications } = createMockContext({
+    hasUI: true,
+    mode: "tui",
+    model: openRouterModel,
+    select: async () => choices.shift(),
+    custom: async (factory: unknown) =>
+      new Promise<unknown>((resolve) => {
+        customCalls += 1;
+        let component: { dispose?(): void; handleInput(data: string): void };
+        const done = (value: unknown) => {
+          component.dispose?.();
+          resolve(value);
+        };
+        component = (
+          factory as (
+            tui: { requestRender(): void },
+            theme: { fg(_color: string, text: string): string },
+            keybindings: object,
+            done: (value: unknown) => void,
+          ) => { dispose?(): void; handleInput(data: string): void }
+        )({ requestRender() {} }, { fg: (_color, text) => text }, {}, done);
+        if (customCalls === 2) setImmediate(() => component.handleInput("\u001b"));
+      }),
+    modelRegistry: {
+      getProviderAuth: async () => ({ auth: { apiKey: "openrouter-key" } }),
+      getAvailable: () => [openRouterModel],
+      getAll: () => [openRouterModel],
+      getProviderAuthStatus: () => ({ configured: true }),
+      getProviderDisplayName: (provider: string) => provider,
+    },
+  });
+
+  await command.handler("", ctx);
+
+  assert.equal(customCalls, 2);
+  assert.equal(loadingAborted, true);
+  assert.deepEqual(notifications, []);
+  assert.deepEqual(choices, []);
+});
+
+test("a history read failure preserves live usage and reports no source details", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = usageFetch;
+
+  const choices = ["Statistics", "Close"];
+  const mock = createMockPi();
+  usageExtension(mock.pi, {
+    load: async () => {
+      throw new Error("/home/private/sessions.jsonl: bearer-secret");
+    },
+    show: async () => {
+      assert.fail("failed history must not be shown");
+    },
+  });
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  const { ctx, notifications, statuses } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model: openRouterModel,
+    select: async () => choices.shift(),
+    modelRegistry: {
+      getProviderAuth: async () => ({ auth: { apiKey: "openrouter-key" } }),
+      getAvailable: () => [openRouterModel],
+      getAll: () => [openRouterModel],
+      getProviderAuthStatus: () => ({ configured: true }),
+      getProviderDisplayName: (provider: string) => provider,
+    },
+  });
+
+  await command.handler("", ctx);
+
+  assert.equal(statuses.get("usage"), "openrouter $75.00 left");
+  assert.deepEqual(notifications, [{ message: "Could not load usage history.", level: "warning" }]);
+  assert.doesNotMatch(notifications[0]?.message ?? "", /private|bearer-secret/);
+  assert.deepEqual(choices, []);
 });
 
 test("/usage fetches OpenCode Go usage with Pi's resolved bearer token", async (t) => {
@@ -322,8 +499,14 @@ test("/usage confirms and redeems one backend-selected reset before refreshing",
 
   await command.handler("", ctx);
 
-  assert.deepEqual(selections[0], ["Refresh usage", "Use one reset…", "Display options…", "Close"]);
-  assert.deepEqual(selections[1], ["Refresh usage", "Display options…", "Close"]);
+  assert.deepEqual(selections[0], [
+    "Statistics",
+    "Refresh usage",
+    "Use one reset…",
+    "Display options…",
+    "Close",
+  ]);
+  assert.deepEqual(selections[1], ["Statistics", "Refresh usage", "Display options…", "Close"]);
   assert.match(confirmations[0]?.title ?? "", /Use one saved reset/);
   assert.match(confirmations[0]?.message ?? "", /cannot be undone/);
   const consumeRequest = requests.find((request) => request.url.endsWith("/consume"));

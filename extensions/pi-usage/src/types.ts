@@ -52,14 +52,16 @@ export interface UsageReport {
   notes?: string[];
 }
 
+export interface UsageSnapshotIdentity {
+  kind: "account" | "credential";
+  id: string;
+}
+
 /** Observations remain distinct from the session's per-request token accounting. */
 export interface UsageSnapshot {
   version: 1;
   observationId: string;
-  identity: {
-    kind: "account" | "credential";
-    id: string;
-  };
+  identity: UsageSnapshotIdentity;
   modelId: string;
   report: UsageReport;
 }
