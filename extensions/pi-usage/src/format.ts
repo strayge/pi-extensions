@@ -145,6 +145,11 @@ function formatCodexReport(
 ): void {
   let previousGroup: string | undefined;
   for (const bucket of report.buckets) {
+    const mainLimit =
+      bucket.groupId !== undefined
+        ? bucket.groupId === "codex"
+        : bucket.id === "codex" || bucket.id.startsWith("codex:");
+    if (!mainLimit) continue;
     const group = bucket.groupId ?? bucket.id;
     if (group !== previousGroup && group !== "codex") {
       lines.push(`${bucket.groupLabel ?? group} limit:`);

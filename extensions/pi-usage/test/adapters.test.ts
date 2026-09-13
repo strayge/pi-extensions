@@ -364,8 +364,10 @@ test("Codex adapter preserves windows, credits, and model-specific statusline bu
   });
   assert.equal(report.buckets.length, 3);
   assert.equal(report.metrics.find((metric) => metric.id === "reset-credits")?.value, 2);
-  assert.match(formatUsageReport(report, "current"), /5h limit:/);
-  assert.match(formatUsageReport(report, "current"), /Weekly limit:/);
+  const usageReport = formatUsageReport(report, "current");
+  assert.match(usageReport, /5h limit:/);
+  assert.match(usageReport, /Weekly limit:/);
+  assert.doesNotMatch(usageReport, /GPT-5\.3 Codex Spark/);
   const sparkModel = {
     id: "gpt-5.3-codex-spark",
     name: "GPT-5.3 Codex Spark",
