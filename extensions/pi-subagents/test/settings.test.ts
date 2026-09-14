@@ -259,6 +259,19 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ defaultMaxTurns: 0 });
   });
 
+  it("round-trips model progress timeout values, including disabled", () => {
+    saveSettings({ modelProgressTimeoutMinutes: 10 }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ modelProgressTimeoutMinutes: 10 });
+    saveSettings({ modelProgressTimeoutMinutes: 0 }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ modelProgressTimeoutMinutes: 0 });
+  });
+
+  it("uses the project model progress timeout over the global value", () => {
+    writeGlobal({ modelProgressTimeoutMinutes: 15 });
+    writeProject({ modelProgressTimeoutMinutes: 0 });
+    expect(loadSettings(projectDir)).toEqual({ modelProgressTimeoutMinutes: 0 });
+  });
+
   it("ignores unknown extra fields on load (forward-compat)", () => {
     writeProject({ maxConcurrent: 2, futureField: "ignored" });
     const loaded = loadSettings(projectDir);
@@ -315,6 +328,20 @@ describe("settings persistence", () => {
     it("drops negative defaultMaxTurns", () => {
       writeProject({ defaultMaxTurns: -1 });
       expect(loadSettings(projectDir)).toEqual({});
+    });
+
+    it("keeps non-negative integer model progress timeouts under the one-week ceiling", () => {
+      for (const value of [0, 10, 10_080]) {
+        writeProject({ modelProgressTimeoutMinutes: value });
+        expect(loadSettings(projectDir)).toEqual({ modelProgressTimeoutMinutes: value });
+      }
+    });
+
+    it("drops invalid model progress timeouts", () => {
+      for (const value of [-1, 1.5, 10_081, "10", null]) {
+        writeProject({ modelProgressTimeoutMinutes: value });
+        expect(loadSettings(projectDir)).toEqual({});
+      }
     });
 
     it("drops graceTurns < 1", () => {
@@ -535,6 +562,7 @@ describe("settings persistence", () => {
         setMaxConcurrent: vi.fn(),
         setMaxConcurrentForeground: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
+        setModelProgressTimeoutMinutes: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
         setBackgroundByDefault: vi.fn(),
@@ -726,6 +754,13 @@ describe("settings persistence", () => {
       expect(appliers.setDefaultMaxTurns).toHaveBeenCalledWith(0);
     });
 
+    it("applies modelProgressTimeoutMinutes, including explicit zero", () => {
+      applySettings({ modelProgressTimeoutMinutes: 10 }, appliers);
+      expect(appliers.setModelProgressTimeoutMinutes).toHaveBeenCalledWith(10);
+      applySettings({ modelProgressTimeoutMinutes: 0 }, appliers);
+      expect(appliers.setModelProgressTimeoutMinutes).toHaveBeenCalledWith(0);
+    });
+
     it("calls setBackgroundByDefault with either boolean", () => {
       applySettings({ backgroundByDefault: false }, appliers);
       expect(appliers.setBackgroundByDefault).toHaveBeenCalledWith(false);
@@ -786,6 +821,7 @@ describe("settings persistence", () => {
         setMaxConcurrent: vi.fn(),
         setMaxConcurrentForeground: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
+        setModelProgressTimeoutMinutes: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
         setBackgroundByDefault: vi.fn(),
@@ -810,22 +846,23 @@ describe("settings persistence", () => {
     });
 
     it("loads, applies, and emits subagents:settings_loaded with merged settings", () => {
-      writeGlobal({ maxConcurrent: 16 });
-      writeProject({ graceTurns: 7 });
+      writeGlobal({ maxConcurrent: 16, modelProgressTimeoutMinutes: 10 });
+      writeProject({ graceTurns: 7, modelProgressTimeoutMinutes: 0 });
       const emit = vi.fn();
 
       const result = applyAndEmitLoaded(appliers, emit, projectDir);
 
       expect(appliers.setMaxConcurrent).toHaveBeenCalledWith(16);
+      expect(appliers.setModelProgressTimeoutMinutes).toHaveBeenCalledWith(0);
       expect(appliers.setGraceTurns).toHaveBeenCalledWith(7);
       expect(appliers.setDefaultMaxTurns).not.toHaveBeenCalled();
       expect(appliers.setDefaultJoinMode).not.toHaveBeenCalled();
 
       expect(emit).toHaveBeenCalledTimes(1);
       expect(emit).toHaveBeenCalledWith("subagents:settings_loaded", {
-        settings: { maxConcurrent: 16, graceTurns: 7 },
+        settings: { maxConcurrent: 16, modelProgressTimeoutMinutes: 0, graceTurns: 7 },
       });
-      expect(result).toEqual({ maxConcurrent: 16, graceTurns: 7 });
+      expect(result).toEqual({ maxConcurrent: 16, modelProgressTimeoutMinutes: 0, graceTurns: 7 });
     });
 
     it("still emits the event when both files are missing (payload carries {})", () => {
@@ -838,6 +875,7 @@ describe("settings persistence", () => {
       // No setters fired — defaults preserved
       expect(appliers.setMaxConcurrent).not.toHaveBeenCalled();
       expect(appliers.setDefaultMaxTurns).not.toHaveBeenCalled();
+      expect(appliers.setModelProgressTimeoutMinutes).not.toHaveBeenCalled();
       expect(appliers.setGraceTurns).not.toHaveBeenCalled();
       expect(appliers.setDefaultJoinMode).not.toHaveBeenCalled();
     });

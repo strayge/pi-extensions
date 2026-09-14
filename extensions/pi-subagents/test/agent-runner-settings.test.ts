@@ -2,10 +2,25 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   getDefaultMaxTurns,
   getGraceTurns,
+  getModelProgressTimeoutMinutes,
   normalizeMaxTurns,
   setDefaultMaxTurns,
   setGraceTurns,
+  setModelProgressTimeoutMinutes,
 } from "../src/agent-runner.js";
+
+describe("model progress timeout runtime setting", () => {
+  beforeEach(() => {
+    setModelProgressTimeoutMinutes(10);
+  });
+
+  it("round-trips minutes and preserves zero as disabled", () => {
+    setModelProgressTimeoutMinutes(7);
+    expect(getModelProgressTimeoutMinutes()).toBe(7);
+    setModelProgressTimeoutMinutes(0);
+    expect(getModelProgressTimeoutMinutes()).toBe(0);
+  });
+});
 
 describe("setDefaultMaxTurns / getDefaultMaxTurns", () => {
   beforeEach(() => {

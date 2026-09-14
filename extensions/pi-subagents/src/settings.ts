@@ -11,6 +11,12 @@ import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from 
 export interface SubagentsSettings {
   maxConcurrent?: number;
   /**
+   * Minutes without assistant stream progress before a child model turn is
+   * interrupted. `0` disables the watchdog. Defaults to 10 and applies when an
+   * invocation starts, so changing it does not alter an invocation in flight.
+   */
+  modelProgressTimeoutMinutes?: number;
+  /**
    * Max concurrent FOREGROUND (blocking) agents — `0` = unlimited, the default,
    * which preserves the behaviour that has always applied: nothing bounded
    * foreground work, and pi dispatches a message's tool calls through
@@ -310,6 +316,7 @@ export type ToolDescriptionMode = "full" | "compact" | "custom";
 export interface SettingsAppliers {
   setMaxConcurrent: (n: number) => void;
   setMaxConcurrentForeground: (n: number) => void;
+  setModelProgressTimeoutMinutes: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
@@ -348,6 +355,9 @@ const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>
 // that any realistic power-user setting passes through.
 const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
+// One week is well beyond a useful progress detector while still rejecting
+// accidental epoch-like values in hand-edited configuration.
+export const MODEL_PROGRESS_TIMEOUT_MINUTES_CEILING = 7 * 24 * 60;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
 
@@ -378,6 +388,13 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.defaultMaxTurns as number) <= MAX_TURNS_CEILING
   ) {
     out.defaultMaxTurns = r.defaultMaxTurns as number;
+  }
+  if (
+    Number.isInteger(r.modelProgressTimeoutMinutes) &&
+    (r.modelProgressTimeoutMinutes as number) >= 0 &&
+    (r.modelProgressTimeoutMinutes as number) <= MODEL_PROGRESS_TIMEOUT_MINUTES_CEILING
+  ) {
+    out.modelProgressTimeoutMinutes = r.modelProgressTimeoutMinutes as number;
   }
   if (
     Number.isInteger(r.graceTurns) &&
@@ -516,6 +533,9 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
     appliers.setMaxConcurrentForeground(s.maxConcurrentForeground);
   }
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
+  if (typeof s.modelProgressTimeoutMinutes === "number") {
+    appliers.setModelProgressTimeoutMinutes(s.modelProgressTimeoutMinutes);
+  }
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);

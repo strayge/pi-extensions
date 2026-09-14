@@ -127,6 +127,7 @@ import {
   getAgentConversation,
   getDefaultMaxTurns,
   getGraceTurns,
+  getModelProgressTimeoutMinutes,
   parseExtensionsSpec,
   parseExtSelectors,
   resolveDefaultModel,
@@ -136,8 +137,14 @@ import {
   SUBAGENT_TOOL_NAMES,
   setDefaultMaxTurns,
   setGraceTurns,
+  setModelProgressTimeoutMinutes,
   setRememberAgents,
 } from "../src/agent-runner.js";
+import {
+  MODEL_PROGRESS_CONTINUATION_PROMPT,
+  MODEL_PROGRESS_RECOVERY_FAILURE,
+  MODEL_PROGRESS_TIMEOUT_FAILURE,
+} from "../src/model-progress-watchdog.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
@@ -152,7 +159,10 @@ function createSession(finalText: string) {
     messages: [] as any[],
     subscribe: vi.fn((listener: (event: any) => void) => {
       listeners.push(listener);
-      return () => {};
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index !== -1) listeners.splice(index, 1);
+      };
     }),
     prompt: vi.fn(async () => {
       session.messages.push({
@@ -209,6 +219,7 @@ beforeEach(() => {
   // The setting is process-global; a test that flips it must not leak the
   // flip into the next one.
   setRememberAgents(true);
+  setModelProgressTimeoutMinutes(10);
   settingsManagerGetSessionDir.mockReset();
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
@@ -402,6 +413,463 @@ describe("agent-runner final output capture", () => {
     await runAgent(ctx, "Explore", "go", { pi, agentId: "a1b2c3d4e5f6" });
 
     expect(session.setSessionName).toHaveBeenCalledWith("Explore#a1b2c3d4");
+  });
+});
+
+describe("agent-runner model progress watchdog integration", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    setModelProgressTimeoutMinutes(1);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    setGraceTurns(5);
+    setModelProgressTimeoutMinutes(10);
+  });
+
+  function installTimeoutThenAnswer(session: ReturnType<typeof createSession>["session"], listeners: Array<(event: any) => void>) {
+    let settle: (() => void) | undefined;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation((message: string) => {
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      if (message === MODEL_PROGRESS_CONTINUATION_PROMPT) {
+        for (const listener of [...listeners]) {
+          listener({ type: "message_start", message: { role: "assistant" } });
+          listener({
+            type: "message_update",
+            assistantMessageEvent: { type: "text_delta", delta: "RECOVERED" },
+          });
+          listener({ type: "message_end", message: { role: "assistant" } });
+        }
+        session.messages.push({ role: "assistant", content: [{ type: "text", text: "RECOVERED" }] });
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+    });
+  }
+
+  function installTimeoutThenProviderError(
+    session: ReturnType<typeof createSession>["session"],
+    listeners: Array<(event: any) => void>,
+  ) {
+    let settle: (() => void) | undefined;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation((message: string) => {
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      if (message === MODEL_PROGRESS_CONTINUATION_PROMPT) {
+        const providerError = {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "retries exhausted: provider overloaded",
+        };
+        session.messages.push(providerError);
+        for (const listener of [...listeners]) listener({ type: "message_end", message: providerError });
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+    });
+  }
+
+  it("returns a fresh run's recovered answer unchanged and cleans up subscriptions", async () => {
+    const { session, listeners } = createSession("");
+    installTimeoutThenAnswer(session, listeners);
+    createAgentSession.mockResolvedValue({ session });
+
+    const running = runAgent(ctx, "Explore", "go", { pi });
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await running;
+
+    expect(result.responseText).toBe("RECOVERED");
+    expect(result.failure).toBeUndefined();
+    expect(result.modelProgressWatchdog).toEqual({
+      timeoutMinutes: 1,
+      timeoutCount: 1,
+      recoveryAttempted: true,
+      recovered: true,
+    });
+    expect(listeners).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not treat a handled continuation with no assistant turn as recovered", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    let promptNumber = 0;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation(() => {
+      promptNumber++;
+      if (promptNumber === 1) {
+        for (const listener of [...listeners]) {
+          listener({ type: "turn_start" });
+          listener({
+            type: "message_update",
+            assistantMessageEvent: { type: "text_delta", delta: "PARTIAL" },
+          });
+        }
+        return new Promise<void>((resolve) => {
+          settle = resolve;
+        });
+      }
+      // Mirrors an input hook returning { action: "handled" }: prompt resolves
+      // without turn_start or an assistant message.
+      return Promise.resolve();
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const running = runAgent(ctx, "Explore", "go", { pi });
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await running;
+
+    expect(result.responseText).toBe("PARTIAL");
+    expect(result.failure).toBe(MODEL_PROGRESS_RECOVERY_FAILURE);
+    expect(result.modelProgressWatchdog?.recovered).toBe(false);
+  });
+
+  it("preserves a resolved provider error from a fresh run's continuation", async () => {
+    const { session, listeners } = createSession("");
+    installTimeoutThenProviderError(session, listeners);
+    createAgentSession.mockResolvedValue({ session });
+
+    const running = runAgent(ctx, "Explore", "go", { pi });
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await running;
+
+    expect(result.failure).toBe("retries exhausted: provider overloaded");
+    expect(result.failure).not.toBe(MODEL_PROGRESS_RECOVERY_FAILURE);
+    expect(result.modelProgressWatchdog).toMatchObject({
+      timeoutCount: 1,
+      recoveryAttempted: true,
+      recovered: false,
+    });
+  });
+
+  it("preserves a resolved provider error from a resume continuation", async () => {
+    const { session, listeners } = createSession("");
+    installTimeoutThenProviderError(session, listeners);
+
+    const resuming = resumeAgent(session as never, "continue");
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await resuming;
+
+    expect(result.failure).toBe("retries exhausted: provider overloaded");
+    expect(result.failure).not.toBe(MODEL_PROGRESS_RECOVERY_FAILURE);
+    expect(result.modelProgressWatchdog).toMatchObject({
+      timeoutCount: 1,
+      recoveryAttempted: true,
+      recovered: false,
+    });
+  });
+
+  it("gives every explicit resume a fresh recovery budget", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    let promptNumber = 0;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation((message: string) => {
+      promptNumber++;
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      if (promptNumber % 2 === 0) {
+        expect(message).toBe(MODEL_PROGRESS_CONTINUATION_PROMPT);
+        for (const listener of [...listeners]) listener({ type: "message_end", message: { role: "assistant" } });
+        session.messages.push({ role: "assistant", content: [{ type: "text", text: `answer-${promptNumber / 2}` }] });
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+    });
+
+    const first = resumeAgent(session as never, "one");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect((await first).modelProgressWatchdog?.timeoutCount).toBe(1);
+    const second = resumeAgent(session as never, "two");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect((await second).modelProgressWatchdog?.timeoutCount).toBe(1);
+    expect(session.prompt).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps structured-output correction available after a successful recovery", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    let promptNumber = 0;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation(async (message: string) => {
+      promptNumber++;
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      if (promptNumber === 1) {
+        await new Promise<void>((resolve) => {
+          settle = resolve;
+        });
+        return;
+      }
+      for (const listener of [...listeners]) listener({ type: "message_end", message: { role: "assistant" } });
+      if (promptNumber === 2) {
+        expect(message).toBe(MODEL_PROGRESS_CONTINUATION_PROMPT);
+        return;
+      }
+      expect(message).toMatch(/Call StructuredOutput now/);
+      await customTool("StructuredOutput").execute("tc-watchdog", { answer: "recovered-json" });
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const running = runAgent(ctx, "Explore", "go", { pi, structuredOutput: STRUCTURED });
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await running;
+
+    expect(result.structuredJson).toBe(JSON.stringify({ answer: "recovered-json" }));
+    expect(result.structuredRetried).toBe(true);
+    expect(result.modelProgressWatchdog?.recovered).toBe(true);
+    expect(session.prompt).toHaveBeenCalledTimes(3);
+  });
+
+  it("shares the watchdog with correction and accepts structured output from its recovery", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    let promptNumber = 0;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation(async (message: string) => {
+      promptNumber++;
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      if (promptNumber === 1) {
+        for (const listener of [...listeners]) listener({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "stop" },
+        });
+        return;
+      }
+      if (promptNumber === 2) {
+        expect(message).toMatch(/Call StructuredOutput now/);
+        await new Promise<void>((resolve) => {
+          settle = resolve;
+        });
+        return;
+      }
+      expect(message).toBe(MODEL_PROGRESS_CONTINUATION_PROMPT);
+      await customTool("StructuredOutput").execute("tc-correction-recovery", { answer: "from-recovery" });
+      for (const listener of [...listeners]) listener({
+        type: "message_end",
+        message: { role: "assistant", stopReason: "toolUse" },
+      });
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const running = runAgent(ctx, "Explore", "go", { pi, structuredOutput: STRUCTURED });
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await running;
+
+    expect(result.structuredJson).toBe(JSON.stringify({ answer: "from-recovery" }));
+    expect(result.structuredRetried).toBe(true);
+    expect(result.modelProgressWatchdog).toMatchObject({
+      timeoutCount: 1,
+      recoveryAttempted: true,
+      recovered: true,
+    });
+    expect(session.prompt).toHaveBeenCalledTimes(3);
+  });
+
+  it("makes a timeout in correction terminal after initial-prompt recovery used the budget", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    let promptNumber = 0;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation((message: string) => {
+      promptNumber++;
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      if (promptNumber === 2) {
+        expect(message).toBe(MODEL_PROGRESS_CONTINUATION_PROMPT);
+        for (const listener of [...listeners]) listener({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "stop" },
+        });
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const running = runAgent(ctx, "Explore", "go", { pi, structuredOutput: STRUCTURED });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await running;
+
+    expect(result.failure).toBe(MODEL_PROGRESS_TIMEOUT_FAILURE);
+    expect(result.structuredRetried).toBe(true);
+    expect(result.modelProgressWatchdog).toMatchObject({ timeoutCount: 2, recovered: false });
+    expect(session.prompt).toHaveBeenCalledTimes(3);
+  });
+
+  it("retains timeout metadata when a fresh-run continuation rejects", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation((message: string) => {
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      if (message === MODEL_PROGRESS_CONTINUATION_PROMPT) throw new Error("continuation preflight failed");
+      return new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const running = runAgent(ctx, "Explore", "go", { pi });
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await running;
+
+    expect(result.failure).toBe("continuation preflight failed");
+    expect(result.modelProgressWatchdog).toMatchObject({
+      timeoutCount: 1,
+      recoveryAttempted: true,
+      recovered: false,
+    });
+  });
+
+  it("retains timeout metadata when a resumed continuation rejects", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation((message: string) => {
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      if (message === MODEL_PROGRESS_CONTINUATION_PROMPT) throw new Error("resume continuation failed");
+      return new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+    });
+
+    const running = resumeAgent(session as never, "continue");
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await running;
+
+    expect(result.failure).toBe("resume continuation failed");
+    expect(result.modelProgressWatchdog).toMatchObject({
+      timeoutCount: 1,
+      recoveryAttempted: true,
+      recovered: false,
+    });
+  });
+
+  it("stops after a second timeout and skips structured-output correction", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation(() => {
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      return new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const running = runAgent(ctx, "Explore", "go", {
+      pi,
+      structuredOutput: { schema: { type: "object" }, check: () => true },
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await running;
+
+    expect(result.failure).toBe(MODEL_PROGRESS_TIMEOUT_FAILURE);
+    expect(result.structuredRetried).toBeUndefined();
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not recover after parent cancellation", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation(() => {
+      for (const listener of [...listeners]) listener({ type: "turn_start" });
+      return new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+    });
+    createAgentSession.mockResolvedValue({ session });
+    const controller = new AbortController();
+
+    const running = runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(1);
+    controller.abort();
+    const result = await running;
+
+    expect(result.modelProgressWatchdog).toBeUndefined();
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not recover after a hard max-turn abort", async () => {
+    const { session, listeners } = createSession("");
+    let settle: (() => void) | undefined;
+    session.abort.mockImplementation(() => {
+      settle?.();
+      return Promise.resolve();
+    });
+    session.prompt.mockImplementation(() => new Promise<void>((resolve) => {
+      settle = resolve;
+      for (const listener of [...listeners]) {
+        listener({ type: "turn_start" });
+        listener({ type: "turn_end" });
+        listener({ type: "turn_end" });
+      }
+    }));
+    createAgentSession.mockResolvedValue({ session });
+    setGraceTurns(1);
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, maxTurns: 1 });
+
+    expect(result.aborted).toBe(true);
+    expect(result.modelProgressWatchdog).toBeUndefined();
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("captures the timeout setting when the invocation starts", async () => {
+    const { session, listeners } = createSession("");
+    installTimeoutThenAnswer(session, listeners);
+    createAgentSession.mockResolvedValue({ session });
+
+    const running = runAgent(ctx, "Explore", "go", { pi });
+    setModelProgressTimeoutMinutes(0);
+    expect(getModelProgressTimeoutMinutes()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect((await running).modelProgressWatchdog?.timeoutMinutes).toBe(1);
   });
 });
 
@@ -2658,6 +3126,33 @@ describe("agent-runner turn limits", () => {
 // nothing checked that the signal actually reaches the session, so a child could
 // be marked stopped while it keeps running and burning tokens.
 describe("agent-runner abort signal forwarding", () => {
+  it("does not start a fresh prompt when the parent signal is already aborted", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("must not appear");
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+
+    expect(session.abort).toHaveBeenCalledOnce();
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(result.responseText).toBe("");
+    expect(result.modelProgressWatchdog).toBeUndefined();
+  });
+
+  it("does not start a resumed prompt when its signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("must not appear");
+
+    const result = await resumeAgent(session as never, "continue", { signal: controller.signal });
+
+    expect(session.abort).toHaveBeenCalledOnce();
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(result).toEqual({ text: "", failure: undefined });
+  });
+
   it("aborts the session when the parent signal fires mid-run", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
     const controller = new AbortController();

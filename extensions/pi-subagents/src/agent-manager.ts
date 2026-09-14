@@ -30,6 +30,7 @@ import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorkt
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
 export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
+export type OnAgentWatchdogRecovered = (record: AgentRecord) => void;
 /**
  * Fired once per assistant `message_end`, for EVERY agent this manager owns —
  * top-level and nested alike, spawns and resumes. The one place where each
@@ -370,6 +371,7 @@ export class AgentManager {
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
   private onUsage?: OnAgentUsage;
+  private onWatchdogRecovered?: OnAgentWatchdogRecovered;
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
   /** Base repos worktrees were created from — so dispose() can prune them all,
@@ -414,6 +416,11 @@ export class AgentManager {
   private runningBackground = 0;
   /** Number of currently running foreground (blocking) agents. */
   private runningForeground = 0;
+  /**
+   * Invocations whose runner promise has not settled. Status cannot represent
+   * this invariant because abort() deliberately exposes "stopped" immediately.
+   */
+  private activeInvocations = new Set<string>();
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -421,11 +428,13 @@ export class AgentManager {
     onStart?: OnAgentStart,
     onCompact?: OnAgentCompact,
     onUsage?: OnAgentUsage,
+    onWatchdogRecovered?: OnAgentWatchdogRecovered,
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
     this.onCompact = onCompact;
     this.onUsage = onUsage;
+    this.onWatchdogRecovered = onWatchdogRecovered;
     this.maxConcurrent = maxConcurrent;
     // Periodically remove completed agents after the retention window.
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
@@ -761,6 +770,7 @@ export class AgentManager {
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
 
+    this.activeInvocations.add(id);
     const promise = runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
@@ -850,7 +860,8 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     })
-      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
+      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried, modelProgressWatchdog }) => {
+        record.modelProgressWatchdog = modelProgressWatchdog;
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
@@ -907,6 +918,7 @@ export class AgentManager {
         }
 
         this.abortOwnedChildren(id);
+        this.reportWatchdogRecovery(record);
 
         this.settleRun(record, true, pool);
         return responseText;
@@ -939,6 +951,9 @@ export class AgentManager {
 
         this.settleRun(record, false, pool);
         return "";
+      })
+      .finally(() => {
+        this.activeInvocations.delete(id);
       });
 
     record.promise = promise;
@@ -969,6 +984,15 @@ export class AgentManager {
    *   recomputed, so a mid-run change to `maxConcurrentForeground` can't make
    *   the release disagree with the acquire.
    */
+  private reportWatchdogRecovery(record: AgentRecord): void {
+    if (
+      (record.status === "completed" || record.status === "steered")
+      && record.modelProgressWatchdog?.recovered === true
+    ) {
+      try { this.onWatchdogRecovered?.(record); } catch { /* ignore reporting side-effect errors */ }
+    }
+  }
+
   private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): void {
     if (!record.isBackground) record.resultConsumed = true;
     if (pool === "background") this.runningBackground--;
@@ -1117,6 +1141,11 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
 
+    // Status becomes "stopped" as soon as abort is requested, before a
+    // cooperative child necessarily settles. Keep the actual runner lifecycle
+    // separate so an immediate resume cannot replace its live controller.
+    if (this.activeInvocations.has(id) || record.status === "running" || record.status === "queued") return undefined;
+
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
     // "running" — or "queued" when at the concurrency limit. Previously
@@ -1124,30 +1153,23 @@ export class AgentManager {
     // returned before its background branch, and resume() only ever awaited
     // inline), so a resumed agent always blocked the caller until it finished.
     if (options?.isBackground) {
-      // Never re-enter a run that is still in flight. Detaching means the caller
-      // gets control back while the record stays "running", so nothing stops the
-      // model from resuming the same agent again. Starting a second run would
-      // overwrite record.abortController — orphaning the live run beyond the
-      // reach of `/agents` stop and abortAll() — double-count the pool slot, and
-      // then reject from session.prompt() with "Agent is already processing",
-      // whose settle path would abort the LIVE run's children and report a
-      // failure for a run that is still going. Refuse instead, leaving the
-      // record untouched; the caller decides whether to wait or steer.
-      if (record.status === "running" || record.status === "queued") return undefined;
-
       record.isBackground = true;
       record.resultConsumed = false;
       record.result = undefined;
       record.error = undefined;
       record.completedAt = undefined;
+      record.modelProgressWatchdog = undefined;
       record.status = "queued";
 
       const start = () => this.startResume(id, record, prompt, signal, options);
       if (occupiesPoolSlot(record) && !this.poolHasRoom("background")) {
         // At the concurrency limit — queue it, drains when a slot frees. A
-        // detached resume has no inline caller, hence nothing to release. The
-        // queue is shared with spawns, whose startup is async, so entries are
-        // promise-shaped even though a resume starts synchronously; failures
+        // detached resume has no inline caller, hence nothing to release. Arm
+        // cancellation before enqueueing, just like a queued spawn, so a parent
+        // that stops while capacity is full cannot start this invocation later.
+        if (!this.armQueuedAbort(id, signal)) return record;
+        // The queue is shared with spawns, whose startup is async, so entries
+        // are promise-shaped even though a resume starts synchronously; failures
         // land on the record here, since drainQueue no longer catches.
         this.queue.push({
           id,
@@ -1176,9 +1198,23 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    record.modelProgressWatchdog = undefined;
 
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    const wasStopped = () => record.status === "stopped";
+    let detachParentSignal: (() => void) | undefined;
+    if (signal?.aborted) {
+      this.abort(id);
+    } else if (signal) {
+      const onParentAbort = () => this.abort(id);
+      signal.addEventListener("abort", onParentAbort, { once: true });
+      detachParentSignal = () => signal.removeEventListener("abort", onParentAbort);
+    }
+
+    this.activeInvocations.add(id);
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const { text, failure, modelProgressWatchdog } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
@@ -1193,23 +1229,32 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        signal: abortController.signal,
       });
+      record.modelProgressWatchdog = modelProgressWatchdog;
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
+      if (!wasStopped()) {
+        record.status = failure ? "error" : "completed";
+        if (failure) record.error = failure;
+      }
       record.result = text;
-      record.completedAt = Date.now();
+      record.completedAt ??= Date.now();
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+      if (!wasStopped()) {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+      }
+      record.completedAt ??= Date.now();
+    } finally {
+      detachParentSignal?.();
+      this.activeInvocations.delete(id);
     }
 
     // Same contract as the spawn settle paths: children spawned during the
     // resumed turn must not outlive it — nothing else can see or reach them.
     this.abortOwnedChildren(id);
+    this.reportWatchdogRecovery(record);
 
     return record;
   }
@@ -1244,7 +1289,9 @@ export class AgentManager {
     // right for a foreground run whose result the caller is awaiting, and wrong
     // for a detached one — background spawns omit it for exactly this reason.
     let detachParentSignal: (() => void) | undefined;
-    if (parentSignal) {
+    if (parentSignal?.aborted) {
+      this.abort(id);
+    } else if (parentSignal) {
       const onParentAbort = () => this.abort(id);
       parentSignal.addEventListener("abort", onParentAbort, { once: true });
       detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
@@ -1265,10 +1312,12 @@ export class AgentManager {
       // Children spawned during the resumed turn must not outlive it.
       this.abortOwnedChildren(id);
       if (occupiesPoolSlot(record)) this.runningBackground--;
+      this.reportWatchdogRecovery(record);
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
       this.drainQueue();
     };
 
+    this.activeInvocations.add(id);
     const promise = resumeAgent(record.session, prompt, {
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
@@ -1286,7 +1335,8 @@ export class AgentManager {
       },
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
+      .then(({ text, failure, modelProgressWatchdog }) => {
+        record.modelProgressWatchdog = modelProgressWatchdog;
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
@@ -1307,6 +1357,9 @@ export class AgentManager {
         record.completedAt ??= Date.now();
         settle();
         return "";
+      })
+      .finally(() => {
+        this.activeInvocations.delete(id);
       });
 
     record.promise = promise;

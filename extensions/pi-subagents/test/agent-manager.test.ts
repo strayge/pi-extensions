@@ -2042,6 +2042,285 @@ describe("AgentManager — dispose prunes worktree repos", () => {
   });
 });
 
+describe("AgentManager — model-progress watchdog outcomes", () => {
+  let manager: AgentManager;
+  const recovered = {
+    timeoutMinutes: 10,
+    timeoutCount: 1,
+    recoveryAttempted: true,
+    recovered: true,
+  };
+
+  afterEach(() => manager?.dispose());
+
+  it("propagates fresh-run metadata before completion and reports successful recovery once", async () => {
+    const onComplete = vi.fn();
+    const onRecovered = vi.fn();
+    manager = new AgentManager(onComplete, undefined, undefined, undefined, undefined, onRecovered);
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "unchanged answer",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+      modelProgressWatchdog: recovered,
+    });
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+      parentAgentId: "owner",
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(manager.getRecord(id)).toMatchObject({
+      status: "completed",
+      result: "unchanged answer",
+      modelProgressWatchdog: recovered,
+    });
+    expect(onRecovered).toHaveBeenCalledOnce();
+    expect(onRecovered).toHaveBeenCalledWith(expect.objectContaining({ id, parentAgentId: "owner" }));
+    expect(onComplete.mock.calls[0][0].modelProgressWatchdog).toEqual(recovered);
+  });
+
+  it("keeps partial output and reports no successful recovery for a terminal timeout", async () => {
+    const onRecovered = vi.fn();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, onRecovered);
+    const terminal = { ...recovered, timeoutCount: 2, recovered: false };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "partial before timeout",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+      failure: "Model made no progress before the watchdog timed out twice.",
+      modelProgressWatchdog: terminal,
+    });
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(manager.getRecord(id)).toMatchObject({
+      status: "error",
+      result: "partial before timeout",
+      modelProgressWatchdog: terminal,
+    });
+    expect(onRecovered).not.toHaveBeenCalled();
+  });
+
+  it("foreground resume clears stale metadata, owns cancellation, and preserves stopped", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+    const record = manager.getRecord(id)!;
+    record.modelProgressWatchdog = recovered;
+    const oldController = record.abortController;
+
+    let resumeSignal: AbortSignal | undefined;
+    vi.mocked(resumeAgent).mockImplementation((_session, _prompt, options: any) => {
+      resumeSignal = options.signal;
+      expect(record.modelProgressWatchdog).toBeUndefined();
+      return new Promise(resolve => {
+        options.signal.addEventListener("abort", () => resolve({
+          text: "partial resumed output",
+          failure: "late provider failure",
+          modelProgressWatchdog: { ...recovered, recovered: false },
+        }));
+      });
+    });
+    const caller = new AbortController();
+    const resumed = manager.resume(id, "continue", caller.signal);
+
+    expect(record.abortController).not.toBe(oldController);
+    expect(resumeSignal).toBe(record.abortController!.signal);
+    caller.abort();
+    await resumed;
+
+    expect(record.status).toBe("stopped");
+    expect(record.result).toBe("partial resumed output");
+    expect(record.error).toBeUndefined();
+    expect(record.modelProgressWatchdog).toEqual({ ...recovered, recovered: false });
+  });
+
+  it("rejects resume while a stopped fresh run is still settling, then permits it", async () => {
+    manager = new AgentManager();
+    const childSession = mockSession();
+    let settle!: (result: any) => void;
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options: any) => {
+      options.onSessionCreated?.(childSession);
+      return new Promise(resolve => { settle = resolve; });
+    });
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+    });
+    const record = manager.getRecord(id)!;
+    const liveController = record.abortController;
+    const resumeCallsBefore = vi.mocked(resumeAgent).mock.calls.length;
+
+    manager.abort(id);
+    const overlapping = await manager.resume(id, "too soon");
+
+    expect(overlapping).toBeUndefined();
+    expect(resumeAgent).toHaveBeenCalledTimes(resumeCallsBefore);
+    expect(record.abortController).toBe(liveController);
+
+    settle({ responseText: "stopped output", session: childSession, aborted: false, steered: false });
+    await record.promise;
+    vi.mocked(resumeAgent).mockResolvedValueOnce({ text: "later output" });
+
+    const later = await manager.resume(id, "later");
+
+    expect(later).toMatchObject({ status: "completed", result: "later output" });
+    expect(resumeAgent).toHaveBeenCalledTimes(resumeCallsBefore + 1);
+  });
+
+  it("rejects resume while a stopped resume is still settling, then permits it", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+
+    let settle!: (result: { text: string }) => void;
+    const resumeCallsBefore = vi.mocked(resumeAgent).mock.calls.length;
+    vi.mocked(resumeAgent).mockImplementationOnce(() =>
+      new Promise(resolve => { settle = resolve; }));
+    const firstResume = manager.resume(id, "first");
+    const liveController = manager.getRecord(id)!.abortController;
+
+    manager.abort(id);
+    const overlapping = await manager.resume(id, "too soon");
+
+    expect(overlapping).toBeUndefined();
+    expect(resumeAgent).toHaveBeenCalledTimes(resumeCallsBefore + 1);
+    expect(manager.getRecord(id)!.abortController).toBe(liveController);
+
+    settle({ text: "stopped output" });
+    await firstResume;
+    vi.mocked(resumeAgent).mockResolvedValueOnce({ text: "later output" });
+
+    const later = await manager.resume(id, "later");
+
+    expect(later).toMatchObject({ status: "completed", result: "later output" });
+    expect(resumeAgent).toHaveBeenCalledTimes(resumeCallsBefore + 2);
+  });
+
+  it("preserves stopped when a foreground resume rejects after cancellation", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+    const record = manager.getRecord(id)!;
+    vi.mocked(resumeAgent).mockImplementation((_session, _prompt, options: any) =>
+      new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(new Error("abort settled late")));
+      }));
+
+    const resumed = manager.resume(id, "continue");
+    manager.abort(id);
+    await resumed;
+
+    expect(record.status).toBe("stopped");
+    expect(record.error).toBeUndefined();
+  });
+
+  it("reports a successful foreground resume recovery", async () => {
+    const onRecovered = vi.fn();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, onRecovered);
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+    vi.mocked(resumeAgent).mockResolvedValue({
+      text: "resumed answer",
+      modelProgressWatchdog: recovered,
+    });
+
+    const record = await manager.resume(id, "continue");
+
+    expect(record?.status).toBe("completed");
+    expect(onRecovered).toHaveBeenCalledOnce();
+  });
+
+  it("prechecks an already-aborted foreground resume signal", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+    const caller = new AbortController();
+    caller.abort();
+    vi.mocked(resumeAgent).mockImplementation(async (_session, _prompt, options: any) => {
+      expect(options.signal.aborted).toBe(true);
+      return { text: "" };
+    });
+
+    const record = await manager.resume(id, "continue", caller.signal);
+
+    expect(record?.status).toBe("stopped");
+  });
+
+  it("prechecks an already-aborted background resume signal", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+    const caller = new AbortController();
+    caller.abort();
+    vi.mocked(resumeAgent).mockImplementationOnce(async (_session, _prompt, options: any) => {
+      expect(options.signal.aborted).toBe(true);
+      return { text: "" };
+    });
+
+    const record = await manager.resume(id, "continue", caller.signal, { isBackground: true });
+    await record!.promise;
+
+    expect(record?.status).toBe("stopped");
+  });
+
+  it("background resume resets stale metadata and reports only a successful settlement", async () => {
+    const onRecovered = vi.fn();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, onRecovered);
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+    const record = manager.getRecord(id)!;
+    record.modelProgressWatchdog = { ...recovered, timeoutMinutes: 3 };
+    vi.mocked(resumeAgent).mockImplementation(async () => {
+      expect(record.modelProgressWatchdog).toBeUndefined();
+      return { text: "resumed unchanged", modelProgressWatchdog: recovered };
+    });
+
+    await manager.resume(id, "continue", undefined, { isBackground: true });
+    await record.promise;
+
+    expect(record.result).toBe("resumed unchanged");
+    expect(record.modelProgressWatchdog).toEqual(recovered);
+    expect(onRecovered).toHaveBeenCalledOnce();
+  });
+});
+
 describe("AgentManager — background resume", () => {
   let manager: AgentManager;
 
@@ -2157,6 +2436,71 @@ describe("AgentManager — background resume", () => {
     expect(resumeAgent).not.toHaveBeenCalled();
   });
 
+  it("does not enqueue an already-cancelled background resume when the pool is full", async () => {
+    const onComplete = vi.fn();
+    const onStart = vi.fn();
+    manager = new AgentManager(onComplete, 1, onStart);
+    const id = await spawnSettled(manager);
+
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    manager.spawn(mockPi, mockCtx, "general-purpose", "blocker", {
+      description: "blocker",
+      isBackground: true,
+    });
+    onComplete.mockClear();
+    onStart.mockClear();
+    vi.mocked(resumeAgent).mockClear();
+    const onStarted = vi.fn();
+    const signal = AbortSignal.abort();
+
+    const record = await manager.resume(id, "must not start", signal, {
+      isBackground: true,
+      onStarted,
+    });
+    manager.setMaxConcurrent(2);
+
+    expect(record).toMatchObject({ status: "stopped" });
+    expect(record?.completedAt).toBeDefined();
+    expect(resumeAgent).not.toHaveBeenCalled();
+    expect(onStarted).not.toHaveBeenCalled();
+    expect(onStart).not.toHaveBeenCalled();
+    expect(onComplete).not.toHaveBeenCalled();
+  });
+
+  it("removes a queued background resume when its signal is cancelled", async () => {
+    const onComplete = vi.fn();
+    const onStart = vi.fn();
+    manager = new AgentManager(onComplete, 1, onStart);
+    const id = await spawnSettled(manager);
+
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    manager.spawn(mockPi, mockCtx, "general-purpose", "blocker", {
+      description: "blocker",
+      isBackground: true,
+    });
+    onComplete.mockClear();
+    onStart.mockClear();
+    vi.mocked(resumeAgent).mockClear();
+    const onStarted = vi.fn();
+    const controller = new AbortController();
+
+    const record = await manager.resume(id, "must not start", controller.signal, {
+      isBackground: true,
+      onStarted,
+    });
+    expect(record?.status).toBe("queued");
+
+    controller.abort();
+    manager.setMaxConcurrent(2);
+
+    expect(record).toMatchObject({ status: "stopped" });
+    expect(record?.completedAt).toBeDefined();
+    expect(resumeAgent).not.toHaveBeenCalled();
+    expect(onStarted).not.toHaveBeenCalled();
+    expect(onStart).not.toHaveBeenCalled();
+    expect(onComplete).not.toHaveBeenCalled();
+  });
+
   it("foreground resume is unchanged: awaits inline and does not fire onComplete", async () => {
     const onComplete = vi.fn();
     manager = new AgentManager(onComplete);
@@ -2170,6 +2514,58 @@ describe("AgentManager — background resume", () => {
     expect(record?.result).toBe("inline result");
     // Foreground resume returns its result inline and never notified (historical).
     expect(onComplete).not.toHaveBeenCalled();
+  });
+
+  it("refuses to foreground-resume an agent whose run is still active", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+
+    let finish!: (value: { text: string }) => void;
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation(
+      () => new Promise((resolve) => { finish = resolve; }),
+    );
+    const active = await manager.resume(id, "active", undefined, { isBackground: true });
+    const record = manager.getRecord(id)!;
+    const liveController = record.abortController;
+    const livePromise = record.promise;
+
+    const rejected = await manager.resume(id, "must not overlap");
+
+    expect(rejected).toBeUndefined();
+    expect(resumeAgent).toHaveBeenCalledTimes(1);
+    expect(record.status).toBe("running");
+    expect(record.abortController).toBe(liveController);
+    expect(record.promise).toBe(livePromise);
+
+    finish({ text: "active result" });
+    await active!.promise;
+  });
+
+  it("refuses to foreground-resume an agent whose invocation is queued", async () => {
+    manager = new AgentManager(undefined, 1);
+    const id = await spawnSettled(manager);
+
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    manager.spawn(mockPi, mockCtx, "general-purpose", "blocker", {
+      description: "blocker",
+      isBackground: true,
+    });
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise(() => {}));
+    const queued = await manager.resume(id, "queued", undefined, { isBackground: true });
+    const record = manager.getRecord(id)!;
+    const queuedController = record.abortController;
+    const queuedPromise = record.promise;
+
+    const rejected = await manager.resume(id, "must not bypass queue");
+
+    expect(rejected).toBeUndefined();
+    expect(resumeAgent).not.toHaveBeenCalled();
+    expect(record.status).toBe("queued");
+    expect(record.abortController).toBe(queuedController);
+    expect(record.promise).toBe(queuedPromise);
+    expect(queued).toBe(record);
   });
 
   // A detached resume returns while the record is still "running", so nothing

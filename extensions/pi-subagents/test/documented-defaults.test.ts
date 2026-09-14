@@ -23,6 +23,11 @@ describe("documented defaults (README:441)", () => {
   // rather than a retry.
   const HEAVY_REIMPORT_MS = 60_000;
 
+  it("model progress timeout defaults to 10 minutes", async () => {
+    const { getModelProgressTimeoutMinutes } = await import("../src/agent-runner.js");
+    expect(getModelProgressTimeoutMinutes()).toBe(10);
+  }, HEAVY_REIMPORT_MS);
+
   it("grace turns after the soft limit default to 5", async () => {
     const { getGraceTurns } = await import("../src/agent-runner.js");
     expect(getGraceTurns()).toBe(5);

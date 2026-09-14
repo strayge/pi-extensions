@@ -612,12 +612,16 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Persistent Settings
 
-Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Two files, merged on load:
+Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, model progress timeout, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Two files, merged on load:
 
 - **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
 
-**Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
+**Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, model progress timeout `10` minutes, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
+
+**Model progress timeout** (`modelProgressTimeoutMinutes`, default `10`): a child model wait with no assistant stream progress for this many minutes is interrupted. The accepted range is integer `0..10080` minutes (one week); hand-edited values outside it are ignored and normal fallback applies. Set `0` to disable the watchdog. Any assistant update — text, thinking, or a streaming tool call — restarts the timer. The timer is disarmed when the assistant message ends, so tool execution is not timed; it starts again at the next `turn_start`. The first timeout gets one continuation in the same child session, preserving completed conversation and tool results, while a second timeout in that invocation fails the run. A successful recovery produces a warning in the UI only and does not alter the child answer or send a model-visible parent message.
+
+The global/project precedence above applies normally. A change made in `/agents → Settings → Model progress timeout` is captured by later fresh or resumed invocations; it does not modify watchdogs already running. Cancellation is cooperative: if a provider ignores the abort request, its prompt may remain stuck. The watchdog also cannot cover hangs before pi emits `turn_start`, including prompt preflight, initial authentication, prior compaction, and `before_agent_start`.
 
 **Nested depth** (`maxSubagentDepth`, default `2`): the hard ceiling on [nested delegation](#nested-subagents), counted from the main session (main = 0, its subagents = 1). `0` or `1` disables nesting project-wide regardless of any agent's `allowed_subagents`. Read when a subagent session is built, so a change applies to agents started after it.
 

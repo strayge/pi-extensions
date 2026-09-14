@@ -24,11 +24,12 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { createModelProgressWatchdog } from "./model-progress-watchdog.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { ModelProgressWatchdogMetadata, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 
@@ -309,6 +310,15 @@ export function installExtensionToolScope(
   };
 }
 
+export const DEFAULT_MODEL_PROGRESS_TIMEOUT_MINUTES = 10;
+
+let modelProgressTimeoutMinutes = DEFAULT_MODEL_PROGRESS_TIMEOUT_MINUTES;
+
+/** Get the silence window captured by each new child invocation. */
+export function getModelProgressTimeoutMinutes(): number { return modelProgressTimeoutMinutes; }
+/** Set the silence window for later child invocations; 0 disables the watchdog. */
+export function setModelProgressTimeoutMinutes(minutes: number): void { modelProgressTimeoutMinutes = minutes; }
+
 /** Default max turns. undefined = unlimited (no turn limit). */
 let defaultMaxTurns: number | undefined;
 
@@ -524,6 +534,8 @@ export interface RunResult {
   structuredJson?: string;
   /** Whether the extra structured-output prompt had to be sent. */
   structuredRetried?: boolean;
+  /** Invocation-local details, present only after at least one model-progress timeout. */
+  modelProgressWatchdog?: ModelProgressWatchdogMetadata;
 }
 
 /**
@@ -598,7 +610,18 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
  */
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
-  const onAbort = () => session.abort();
+  const onAbort = () => {
+    try {
+      void Promise.resolve(session.abort()).catch(() => {});
+    } catch {
+      // Cancellation is already represented by the signal; an abort transport
+      // failure must not turn it into an unrelated runner rejection.
+    }
+  };
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
 }
@@ -616,6 +639,7 @@ export async function runAgent(
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
+  const invocationModelProgressTimeoutMinutes = getModelProgressTimeoutMinutes();
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
@@ -1103,6 +1127,12 @@ export async function runAgent(
 
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
+  const watchdog = createModelProgressWatchdog({
+    session,
+    timeoutMinutes: invocationModelProgressTimeoutMinutes,
+    signal: options.signal,
+    isHardTurnLimitAborted: () => aborted,
+  });
 
   // Build the effective prompt: optionally prepend parent context
   let effectivePrompt = prompt;
@@ -1117,8 +1147,9 @@ export async function runAgent(
   // on counts as this run's output (a fresh session, so usually 0).
   const startLen = session.messages.length;
   let structuredRetried = false;
+  let rejectedPromptFailure: string | undefined;
   try {
-    await session.prompt(effectivePrompt);
+    await watchdog.prompt(effectivePrompt);
 
     // One more prompt when a schema was asked for and nothing usable came back
     // — the model answered in prose, or only ever called the tool invalidly.
@@ -1126,11 +1157,18 @@ export async function runAgent(
     // the abort forwarding are still live: torn down first, a retry would be
     // unkillable.
     if (structuredCapture !== undefined && structuredCapture.json === undefined
-      && !aborted && options.signal?.aborted !== true) {
+      && watchdog.getFailure() === undefined && !aborted && options.signal?.aborted !== true) {
       structuredRetried = true;
-      await session.prompt(structuredRetryPrompt(structuredCapture));
+      await watchdog.prompt(structuredRetryPrompt(structuredCapture));
     }
+  } catch (error) {
+    // Before a timeout, preserve the established rejection path. Once recovery
+    // has started, settle through RunResult so its watchdog metadata reaches the
+    // record alongside the original prompt error.
+    if (watchdog.getMetadata(false) === undefined) throw error;
+    rejectedPromptFailure = error instanceof Error ? error.message : String(error);
   } finally {
+    watchdog.cleanup();
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
@@ -1145,14 +1183,22 @@ export async function runAgent(
       ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
       : "The agent did not report its answer through StructuredOutput."
     : undefined;
+  const ordinaryFailure = rejectedPromptFailure ?? finalTurnError(session, startLen) ?? structuredFailure;
+  const failure = aborted || options.signal?.aborted === true
+    ? ordinaryFailure
+    : watchdog.getFailure() ?? ordinaryFailure;
+  const modelProgressWatchdog = watchdog.getMetadata(
+    failure === undefined && !aborted && options.signal?.aborted !== true,
+  );
   return {
     responseText,
     session,
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
+    failure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
+    ...(modelProgressWatchdog !== undefined ? { modelProgressWatchdog } : {}),
   };
 }
 
@@ -1168,13 +1214,20 @@ export async function resumeAgent(
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; failure?: string; modelProgressWatchdog?: ModelProgressWatchdogMetadata }> {
+  const invocationModelProgressTimeoutMinutes = getModelProgressTimeoutMinutes();
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
   const startLen = session.messages.length;
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
+  const watchdog = createModelProgressWatchdog({
+    session,
+    timeoutMinutes: invocationModelProgressTimeoutMinutes,
+    signal: options.signal,
+    isHardTurnLimitAborted: () => false,
+  });
 
   const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
     ? session.subscribe((event: AgentSessionEvent) => {
@@ -1196,17 +1249,32 @@ export async function resumeAgent(
       })
     : () => {};
 
+  let rejectedPromptFailure: string | undefined;
   try {
-    await session.prompt(prompt);
+    await watchdog.prompt(prompt);
+  } catch (error) {
+    // Match fresh runs: ordinary pre-timeout prompt rejections still reject,
+    // while a failed recovery settles with both the error and timeout details.
+    if (watchdog.getMetadata(false) === undefined) throw error;
+    rejectedPromptFailure = error instanceof Error ? error.message : String(error);
   } finally {
+    watchdog.cleanup();
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
   }
 
+  const ordinaryFailure = rejectedPromptFailure ?? finalTurnError(session, startLen);
+  const failure = options.signal?.aborted === true
+    ? ordinaryFailure
+    : watchdog.getFailure() ?? ordinaryFailure;
+  const modelProgressWatchdog = watchdog.getMetadata(
+    failure === undefined && options.signal?.aborted !== true,
+  );
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
+    failure,
+    ...(modelProgressWatchdog !== undefined ? { modelProgressWatchdog } : {}),
   };
 }
 

@@ -19,7 +19,7 @@ import { waitForTerminalRecord } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getModelProgressTimeoutMinutes, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setModelProgressTimeoutMinutes, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -34,7 +34,7 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, MODEL_PROGRESS_TIMEOUT_MINUTES_CEILING, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -588,6 +588,9 @@ export default function (pi: ExtensionAPI) {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
+      ...(record.modelProgressWatchdog !== undefined && {
+        modelProgressWatchdog: record.modelProgressWatchdog,
+      }),
     });
 
     // Skip notification if result was already consumed via get_subagent_result
@@ -646,6 +649,13 @@ export default function (pi: ExtensionAPI) {
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
+  }, (record) => {
+    const watchdog = record.modelProgressWatchdog;
+    if (!currentCtx?.hasUI || !watchdog) return;
+    currentCtx.ui.notify(
+      `Agent "${record.description}" recovered after ${watchdog.timeoutMinutes} minute${watchdog.timeoutMinutes === 1 ? "" : "s"} without model progress.`,
+      "warning",
+    );
   });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
@@ -1415,6 +1425,7 @@ export default function (pi: ExtensionAPI) {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
       setMaxConcurrentForeground: (n) => manager.setMaxConcurrentForeground(n),
       setDefaultMaxTurns,
+      setModelProgressTimeoutMinutes,
       setGraceTurns,
       setDefaultJoinMode,
       setBackgroundByDefault,
@@ -3446,6 +3457,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // 0 = unlimited — per SubagentsSettings.defaultMaxTurns docstring and
       // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
+      modelProgressTimeoutMinutes: getModelProgressTimeoutMinutes(),
       graceTurns: getGraceTurns(),
       defaultJoinMode: getDefaultJoinMode(),
       backgroundByDefault: getBackgroundByDefault(),
@@ -3493,7 +3505,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
   void _settingsSnapshotIsComplete;
 
   const NUMERIC_IDS = new Set([
-    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth",
+    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "modelProgressTimeoutMinutes", "graceTurns", "maxSubagentDepth",
   ]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
@@ -3501,6 +3513,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       const mc = manager.getMaxConcurrent();
       const mcf = manager.getMaxConcurrentForeground();
       const dmt = getDefaultMaxTurns() ?? 0;
+      const modelProgressTimeout = getModelProgressTimeoutMinutes();
       const gt = getGraceTurns();
       const msd = getMaxSubagentDepth();
       // Label what unset actually does — it targets general-purpose even when
@@ -3532,6 +3545,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description: "Default max turns before wrap-up (0 = unlimited, Enter to type)",
           currentValue: String(dmt),
           values: [String(dmt)],
+        },
+        {
+          id: "modelProgressTimeoutMinutes",
+          label: "Model progress timeout",
+          description: "Minutes without assistant progress before recovery (0 = disabled, Enter to type)",
+          currentValue: String(modelProgressTimeout),
+          values: [String(modelProgressTimeout)],
         },
         {
           id: "graceTurns",
@@ -3714,6 +3734,17 @@ Write the file using the write tool. Only write the file, nothing else.`;
         } else if (n >= 1) {
           setDefaultMaxTurns(n);
           notifyApplied(ctx, `Default max turns set to ${n}`);
+        }
+      } else if (id === "modelProgressTimeoutMinutes") {
+        const n = parseInt(value, 10);
+        if (n >= 0 && n <= MODEL_PROGRESS_TIMEOUT_MINUTES_CEILING) {
+          setModelProgressTimeoutMinutes(n);
+          notifyApplied(
+            ctx,
+            n === 0
+              ? "Model progress watchdog disabled. Applies to later invocations."
+              : `Model progress timeout set to ${n} minute${n === 1 ? "" : "s"}. Applies to later invocations.`,
+          );
         }
       } else if (id === "graceTurns") {
         const n = parseInt(value, 10);
@@ -3903,9 +3934,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
           ? String(manager.getMaxConcurrentForeground())
           : result === "defaultMaxTurns"
             ? String(getDefaultMaxTurns() ?? 0)
-            : result === "maxSubagentDepth"
-              ? String(getMaxSubagentDepth())
-              : String(getGraceTurns());
+            : result === "modelProgressTimeoutMinutes"
+              ? String(getModelProgressTimeoutMinutes())
+              : result === "maxSubagentDepth"
+                ? String(getMaxSubagentDepth())
+                : String(getGraceTurns());
 
       const label = result === "maxConcurrent"
         ? "Max concurrency (1+)"
@@ -3913,9 +3946,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
           ? "Max foreground concurrency (0 = unlimited)"
           : result === "defaultMaxTurns"
             ? "Default max turns (0 = unlimited)"
-            : result === "maxSubagentDepth"
-              ? "Nested depth (0/1 = nesting off)"
-              : "Grace turns (1+)";
+            : result === "modelProgressTimeoutMinutes"
+              ? `Model progress timeout minutes (0 = disabled, max ${MODEL_PROGRESS_TIMEOUT_MINUTES_CEILING})`
+              : result === "maxSubagentDepth"
+                ? "Nested depth (0/1 = nesting off)"
+                : "Grace turns (1+)";
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.
@@ -3923,7 +3958,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
       while (input != null) {
         const trimmed = input.trim();
         const n = Number(trimmed);
-        if (trimmed !== "" && Number.isInteger(n)) {
+        const inRange = result !== "modelProgressTimeoutMinutes"
+          || (n >= 0 && n <= MODEL_PROGRESS_TIMEOUT_MINUTES_CEILING);
+        if (trimmed !== "" && Number.isInteger(n) && inRange) {
           applyValue(result, String(n));
           await showSettings(ctx);
           return;

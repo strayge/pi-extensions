@@ -153,6 +153,13 @@ export type MentionResolution =
   | { kind: "live"; record: AgentRecord }
   | { kind: "tombstone"; entry: AgentTombstone };
 
+export interface ModelProgressWatchdogMetadata {
+  timeoutMinutes: number;
+  timeoutCount: number;
+  recoveryAttempted: boolean;
+  recovered: boolean;
+}
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -253,6 +260,8 @@ export interface AgentRecord {
   structuredJson?: string;
   /** Whether the child needed the extra structured-output prompt. */
   structuredRetried?: boolean;
+  /** Invocation-local details, present only after at least one model-progress timeout. */
+  modelProgressWatchdog?: ModelProgressWatchdogMetadata;
   /** Parent agent ID for ownership-scoped nested controls. */
   parentAgentId?: string;
   /**
