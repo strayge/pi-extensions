@@ -115,19 +115,18 @@ function ownsRecord(record: AgentRecord | undefined, parentAgentId: string): rec
 /**
  * How the caller received this record, which decides the outcome wording.
  *
- *   - "inline": a foreground spawn or a resume. The full output is in this very
- *     result and no agent id was handed back, so the note must say there is
- *     nothing left to fetch — otherwise the parent invents an id, calls
- *     `get_subagent_result`, and hits "not owned by this parent" (#174, the same
- *     trap the top-level foreground path fell into).
+ *   - "inline": a foreground spawn or resume. The full output and exact agent
+ *     id are in this result, so the note says there is nothing left to fetch;
+ *     the id exists only to continue the same child with `resume`.
  *   - "fetched": `get_subagent_result` on a background child. The parent holds a
  *     valid id and can poll again, so the background wording applies.
  */
 type ResultPosition = "inline" | "fetched";
 
 function formatRecord(record: AgentRecord, position: ResultPosition): string {
+  const identity = position === "inline" ? `Agent ID: ${record.id}\n` : "";
   if (record.status === "error") {
-    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}`;
+    return `${identity}Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}`;
   }
   if (record.status === "queued" || record.status === "running") {
     return `Agent ${record.id} is ${record.status}.`;
@@ -139,7 +138,8 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   const note = position === "inline"
     ? getForegroundOutcomeNote(record.status)
     : getStatusNote(record.status);
-  return note ? `Nested agent${note}.\n\n${text}` : text;
+  const body = note ? `Nested agent${note}.\n\n${text}` : text;
+  return identity ? `${identity}\n${body}` : body;
 }
 
 /** Build child-safe orchestration tools scoped to one parent agent instance. */
@@ -175,7 +175,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           description: "Defaults to false for nested spawns — the call blocks and returns the child's result inline. Set true only for work you will collect later with get_subagent_result; a detached child is stopped when you finish.",
         }),
       ),
-      resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
+      resume: Type.Optional(Type.String({ description: "Exact agent ID returned by a previous nested Agent call. Copy it verbatim; resumes a child owned by this parent." })),
       isolated: Type.Optional(Type.Boolean()),
       inherit_context: Type.Optional(Type.Boolean()),
       ...isolationParam(isWorktreeIsolationEnabled()),

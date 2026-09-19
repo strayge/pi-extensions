@@ -432,12 +432,40 @@ describe("child-safe nested Agent tools", () => {
     });
 
     expect(result.isError).toBe(false);
-    // Foreground: the whole output is inline and no id came back, so the note
-    // must not invite a get_subagent_result call the parent cannot make (#174).
+    // Foreground: the whole output is inline, while the id exists only to
+    // continue this same child rather than fetch output already returned (#174).
+    expect(result.content[0].text).toContain("Agent ID: child-1");
     expect(result.content[0].text).toContain("everything the agent produced is above");
     expect(result.content[0].text).not.toContain("output is partial");
     // The warning leads, so it can't read as part of the child's own answer.
     expect(result.content[0].text.indexOf("half an answer")).toBeGreaterThan(0);
+  });
+
+  it("resumes a foreground child with the returned exact id", async () => {
+    const [agent] = tools();
+    const first = await execute(agent, {
+      subagent_type: "scout",
+      description: "map evidence",
+      prompt: "Map it",
+    });
+    const id = /Agent ID: (\S+)/.exec(first.content[0].text)?.[1];
+    expect(id).toBe("child-1");
+
+    vi.mocked(manager.resume).mockImplementation(async (resumeId: string) => ({
+      ...records.get(resumeId),
+      status: "completed",
+      result: "continued",
+    }));
+    const resumed = await execute(agent, {
+      subagent_type: "scout",
+      description: "continue evidence",
+      prompt: "Continue",
+      resume: id,
+    });
+
+    expect(manager.resume).toHaveBeenCalledWith("child-1", "Continue", undefined);
+    expect(resumed.content[0].text).toContain("Agent ID: child-1");
+    expect(resumed.content[0].text).toContain("continued");
   });
 
   it("uses the fetchable wording when the parent polls a background child by id", async () => {
@@ -468,6 +496,7 @@ describe("child-safe nested Agent tools", () => {
     });
 
     expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Agent ID: child-1");
     expect(result.content[0].text).toContain("provider exploded");
     expect(result.content[0].text).toContain("got this far");
   });

@@ -391,7 +391,7 @@ export class AgentManager {
 
   /**
    * Evicted agents that can still be reached by name, keyed by handle. Outlives
-   * the 10-minute record cleanup — that timer exists to bound memory, not to
+   * the one-hour record cleanup — that timer exists to bound memory, not to
    * expire a conversation the user might still want — and is cleared alongside
    * completed records on session start/switch.
    */

@@ -333,7 +333,7 @@ describe("toolDescriptionMode", () => {
       const tools = setup({ toolDescriptionMode: "compact", worktreeIsolation: false });
       expect(tools.get("Agent").description).not.toContain("isolation");
       // The bullet above it survives — the gate trims a suffix, not the list.
-      expect(tools.get("Agent").description).toContain("resume continues a previous agent by ID");
+      expect(tools.get("Agent").description).toContain("resume continues a previous agent by the exact ID returned from Agent");
     });
   });
 

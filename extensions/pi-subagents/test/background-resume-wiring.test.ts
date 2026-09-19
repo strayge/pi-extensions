@@ -108,6 +108,7 @@ describe("Agent tool — background resume wiring", () => {
       ],
       subscribe: vi.fn(() => vi.fn()),
       steer: vi.fn(async () => {}),
+      abort: vi.fn(async () => {}),
       dispose: vi.fn(),
     };
     vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options: any) => {
@@ -264,6 +265,36 @@ describe("Agent tool — background resume wiring", () => {
     await lifecycle.get("session_shutdown")?.({}, ctx);
   });
 
+  it("frames a stopped foreground resume as incomplete", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx);
+
+    let finish: (value: any) => void = () => {};
+    vi.mocked(resumeAgent).mockReturnValue(new Promise((resolve) => { finish = resolve; }) as any);
+    const parent = new AbortController();
+    const call = tools.get("Agent").execute(
+      "resume-call",
+      { prompt: "keep going", description: "Keep going", subagent_type: "general-purpose", resume: id, run_in_background: false },
+      parent.signal,
+      undefined,
+      ctx,
+    );
+
+    await new Promise((resolve) => setImmediate(resolve));
+    parent.abort();
+    finish({ text: "partial resumed answer" });
+
+    const text = resultText(await call);
+    expect(text).toContain("STOPPED BY THE USER");
+    expect(text).toContain("everything the agent produced is above");
+    expect(text).toContain(`Agent ID: ${id}`);
+    expect(text).toContain("partial resumed answer");
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
   // Resume follows the same default as a fresh spawn — background — so
   // foreground is now the explicit case rather than the implicit one.
   it("still resumes in the foreground when run_in_background is false", async () => {
@@ -281,7 +312,9 @@ describe("Agent tool — background resume wiring", () => {
       ctx,
     );
 
-    // Foreground resume returns the answer inline — no background handoff text.
+    // Foreground resume returns the answer inline and repeats the exact id for
+    // another continuation — no background handoff text.
+    expect(resultText(res)).toContain(`Agent ID: ${id}`);
     expect(resultText(res)).toContain("inline answer");
     expect(resultText(res)).not.toContain("You will be notified");
 

@@ -1,4 +1,4 @@
-// The 10-minute record GC (AgentManager.cleanup) has never run in a test: the
+// The one-hour record GC (AgentManager.cleanup) has never run in a test: the
 // main agent-manager suite uses real timers throughout, and nothing calls the
 // private method. Its two guards are load-bearing in opposite directions —
 // inverting the cutoff disposes results the LLM hasn't read yet, and dropping
@@ -84,7 +84,7 @@ describe("AgentManager — record GC", () => {
   });
 
   it("closes the evicted session's extension lifecycle before disposing it (#242)", async () => {
-    // The reported crash, on its own path: this sweep is what fires ~10 min after a
+    // The reported crash, on its own path: this sweep fires one hour after a
     // subagent finishes. Disposing only invalidates the ExtensionRunner, so whatever
     // an extension armed in `session_start` stayed armed — and its next tick threw
     // `assertActive()` from a bare timer callback, killing interactive pi.

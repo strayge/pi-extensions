@@ -153,7 +153,7 @@ export interface SubagentsSettings {
    * reopen an agent's conversation long after its in-memory record is gone.
    * Defaults to `true`. Per-agent `persist_session:` frontmatter overrides it
    * in both directions. Turning it off restores the previous behaviour, where
-   * a handle stops resolving roughly ten minutes after the agent finishes and
+   * a handle stops resolving one hour after the agent finishes and
    * mentioning it starts a fresh run instead. Persisted sessions also appear
    * nested under the spawning session in pi's `/resume`.
    */

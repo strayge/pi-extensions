@@ -91,9 +91,10 @@ describe("status note reaches the parent through the real handlers", () => {
     expect(out).toContain("partial work so far");     // partial result still delivered
     expect(out).not.toContain("STOPPED BY THE USER"); // not mislabelled as a user stop
 
-    // The two answers a foreground parent needs: is this all of it, and is the
-    // task done. The first is what #174 turned on — the parent has no agent id,
-    // so it must not read "partial" as "go fetch the rest".
+    // The foreground parent gets all three facts it needs: exact resumable
+    // identity, whether this is all produced output, and whether the task ended.
+    // The completeness wording prevents the #174 id from becoming a retrieval cue.
+    expect(out).toMatch(/Agent ID: \S+/);
     expect(out).toContain("everything the agent produced is above");
     expect(out).toContain("the task is unfinished");
     // State only, never an instruction to act (see getForegroundOutcomeNote):

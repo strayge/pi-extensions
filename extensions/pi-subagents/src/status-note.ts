@@ -38,12 +38,11 @@ export function getStatusNote(status: string): string {
  *
  *   - It already holds the agent's ENTIRE output inline, whereas the background
  *     notification carries a 500-char preview. So only here can we truthfully
- *     say there is nothing more to fetch — which is the whole point, because
- *   - it has no agent id. The id travels in the tool result's renderer
- *     `details`, which is never serialized to the model. A parent that reads
- *     "output may be partial" as "truncated, go retrieve the rest" therefore
- *     has nothing valid to call `get_subagent_result` with, and will invent an
- *     id (#174).
+ *     say there is nothing more to fetch.
+ *   - It also receives the exact agent id in model-visible content, but that id
+ *     exists to continue the same session with `resume`, not to fetch output
+ *     that is already present. This preserves the fix for the misleading
+ *     retrieval cue from #174 while making foreground sessions resumable.
  *
  * Only the lead clause varies between the three, and each variation carries
  * information: `wrapped up` vs `aborted` tells the parent whether the output is

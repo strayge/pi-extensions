@@ -55,6 +55,7 @@ describe("issue #144 — empty-error final turns must not be 'completed'", () =>
     // not a clean success reading "No output.".
     const toolResult = agentToolResult(run.parentSession);
     expect(toolResult).toContain(FATAL);
+    expect(toolResult).toMatch(/Agent ID: \S+/);
     expect(toolResult).not.toContain("No output.");
   });
 

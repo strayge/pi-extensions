@@ -7,19 +7,12 @@
  * afterwards answers `Agent not found ... It may have been cleaned up.` — with
  * no /new, /resume or session switch in between.
  *
- * Tracing says the premise can't hold, and these tests pin both halves of why:
- *
- *   1. The record is NOT cleaned up. Foreground completion mutates the record
- *      in place (agent-manager.ts startAgent's .then) — nothing deletes it. So
- *      a lookup with the REAL id succeeds.
- *   2. The model never HAD the real id. Foreground returns the result text
- *      only; the id travels in `details`, which is renderer metadata and never
- *      reaches the API (only `content` is serialized). The background path is
- *      the one that puts `Agent ID: ...` in the text.
- *
- * Together: whatever id the reporter's model passed, it wasn't one we issued,
- * and "not found" was the correct answer. Test 3 pins the eviction rule that
- * DOES apply, so the two are not confused again.
+ * Tracing showed that the record was never cleaned up: foreground completion
+ * mutates it in place, and lookup with the real id succeeds. The failure was
+ * identity delivery — the id existed only in renderer `details`, which the API
+ * does not send to the model. These tests pin the corrected contract: foreground
+ * `content` exposes the exact id, that id resumes the same session, and session
+ * switches still evict an already-consumed foreground record.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,10 +21,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
-  return { ...actual, runAgent: vi.fn() };
+  return { ...actual, runAgent: vi.fn(), resumeAgent: vi.fn() };
 });
 
-import { runAgent } from "../src/agent-runner.js";
+import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
 function makePi() {
@@ -75,8 +68,8 @@ const textOf = (r: any): string => r.content[0].text;
  * which is what produces the reporter's "(wrapped up at the turn limit —
  * output may be partial)" note.
  *
- * Returns the tool result plus the id read out of `details` — the only place
- * a foreground id exists, which is the point of test 2.
+ * Returns the tool result plus the canonical id from renderer details so tests
+ * can verify that model-visible content exposes that exact value.
  */
 async function runForegroundSteeredAgent(tools: Map<string, any>) {
   vi.mocked(runAgent).mockResolvedValue({
@@ -154,26 +147,41 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("never hands the model an agent id — the id lives only in renderer details", async () => {
+  it("hands the model the exact agent id in foreground content", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     const { res, id } = await runForegroundSteeredAgent(tools);
 
-    // `content` is the only thing serialized to the API. If the id isn't here,
-    // the model cannot have obtained it — any id it passes is invented.
-    expect(textOf(res)).not.toContain(id);
-    expect(textOf(res)).not.toMatch(/Agent ID:/);
+    // `content` is what the API serializes. The model must receive the same id
+    // the renderer carries, not infer or expand a hidden value.
+    expect(textOf(res)).toContain(`Agent ID: ${id}`);
 
-    // An invented id is correctly rejected — this is the reporter's error,
-    // reproduced WITHOUT any record having been cleaned up.
-    const bogus = await tools.get("get_subagent_result").execute(
-      "tc-bogus",
-      { agent_id: "3f1320a7-74ec-422" },
+    await lifecycle.get("session_shutdown")?.({}, ctx());
+  });
+
+  it("resumes the same foreground session with the returned id", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const { id } = await runForegroundSteeredAgent(tools);
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "FOLLOW-UP-RESULT" } as any);
+
+    const resumed = await tools.get("Agent").execute(
+      "tc-resume",
+      {
+        prompt: "Close the remaining gap.",
+        description: "Close remaining gap",
+        subagent_type: "Explore",
+        resume: id,
+        run_in_background: false,
+      },
       undefined,
       undefined,
       ctx(),
     );
-    expect(textOf(bogus)).toContain("Agent not found");
+
+    expect(resumeAgent).toHaveBeenCalledOnce();
+    expect(textOf(resumed)).toContain(`Agent ID: ${id}`);
+    expect(textOf(resumed)).toContain("FOLLOW-UP-RESULT");
 
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
