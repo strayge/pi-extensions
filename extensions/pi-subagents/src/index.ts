@@ -1893,9 +1893,6 @@ Terse command-style prompts produce shallow, generic work.
         modelName,
         modelId,
         thinking,
-        // Only set where the agent file outranked the caller, so the surfaces can
-        // disclose a parameter that was accepted but could not take effect (#182).
-        requestedThinking: resolvedConfig.overridden?.thinking,
         requestedModel: askedModel,
         // Explicit value only — the default fallback would just add noise.
         // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".

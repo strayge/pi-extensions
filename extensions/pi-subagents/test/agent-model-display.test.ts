@@ -212,11 +212,7 @@ describe("Agent tool result — effective model", () => {
     expect(result.details.tags).toContain("thinking: high (asked max)");
   });
 
-  // Asserted on the immediate background result, which renders BEFORE a session
-  // exists. That is the only place the two causes of a mismatch are separable:
-  // a clamp cannot have happened yet, so "(asked max)" here can only come from
-  // the agent file outranking the parameter.
-  it("discloses a level an agent file pinned over the caller's (#182)", async () => {
+  it("uses the caller's thinking level over the agent default", async () => {
     pinnedAgent("thinking: low\n");
     const tool = agentTool();
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
@@ -229,7 +225,8 @@ describe("Agent tool result — effective model", () => {
       ctx(),
     );
 
-    expect(result.details.tags).toContain("thinking: low (asked max)");
+    expect(result.details.tags).toContain("thinking: max");
+    expect(result.details.tags).not.toContain("thinking: low (asked max)");
   });
 
   it("discloses a model an agent file pinned over the caller's (#182)", async () => {

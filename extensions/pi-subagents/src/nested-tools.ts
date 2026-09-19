@@ -168,7 +168,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       description: Type.String({ description: "Short 3-5 word task description." }),
       subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
-      thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
+      thinking: Type.Optional(Type.String({ description: "Optional thinking level override." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
         Type.Boolean({
