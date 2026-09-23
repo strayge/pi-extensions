@@ -45,7 +45,7 @@ describe("sanitizeTranscriptText", () => {
   });
 
   it("leaves no unsafe control in a hostile mix", () => {
-    const hostile = "x\x1b[2A\x1b]0;t\x07\x00\x1bXq\x07\x9b5\$y\tz\r\nw\rdone";
+    const hostile = "x\x1b[2A\x1b]0;t\x07\x00\x1bXq\x07\x9b5$y\tz\r\nw\rdone";
     const out = sanitizeTranscriptText(hostile);
     expect(out).not.toMatch(unsafeTerminalControl);
     expect(out).toContain("done");

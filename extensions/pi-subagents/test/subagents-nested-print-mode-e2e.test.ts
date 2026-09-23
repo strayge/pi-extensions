@@ -26,6 +26,7 @@ import {
   type PrintModeRun,
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
+import { contextToolNames } from "./helpers/transcript-context.js";
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -47,7 +48,7 @@ function userPrompt(ctx: Context): string {
 }
 
 function tools(ctx: Context): string[] {
-  return (ctx.tools ?? []).map((tool) => tool.name);
+  return contextToolNames(ctx);
 }
 
 function toolResults(ctx: Context, name: string): string[] {

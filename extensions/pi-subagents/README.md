@@ -51,7 +51,7 @@ pi -e ./src/index.ts
 
 Requires Node.js >=22.19.0.
 
-Requires pi **0.84.0 or newer**: the [`SubagentWorkflow`](#subagentworkflow) tool builds on `constrainedSampling` (pi 0.82.0) and pi-tui's `stripTerminalSequences` (0.84.0). The `peerDependencies` range declares it, so npm flags an older pi at install time.
+Requires pi **0.87.1 or newer**: conversation cloning and the test harness use system messages for the prompt and tool declarations. The `peerDependencies` range declares this floor, so npm flags an older pi at install time.
 
 ### Other hosts
 

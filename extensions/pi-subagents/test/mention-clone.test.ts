@@ -45,7 +45,7 @@ const CONVERSATION = [
 beforeEach(() => {
   createAgentSession.mockReset();
   inMemory.mockReset();
-  inMemory.mockReturnValue({ kind: "in-memory-session-manager" } as any);
+  inMemory.mockReturnValue({ kind: "in-memory-session-manager", appendMessage: vi.fn() } as any);
   buildSessionContext.mockReset();
   buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "high", model: null } as any);
 });
@@ -99,8 +99,9 @@ function visibleTools(opts: any): any[] {
  */
 function cloneSession(turn?: (tool: any) => Promise<void> | void) {
   const session = {
-    agent: { state: { systemPrompt: "rebuilt-from-cwd", messages: [] as any[] } },
+    agent: { transformContext: undefined },
     prompt: vi.fn(async () => {}),
+    refreshContext: vi.fn(),
     dispose: vi.fn(),
   } as any;
   createAgentSession.mockImplementation(async (opts: any) => {
@@ -137,10 +138,27 @@ describe("cloning the conversation", () => {
 
     await runMentionClone(opts());
 
-    expect(session.agent.state.messages).toEqual([
-      { role: "user", content: [{ type: "text", text: "hi" }] },
-      { role: "assistant", content: [{ type: "text", text: "hello" }] },
-    ]);
+    expect(session.createdWith.sessionManager.appendMessage.mock.calls).toEqual(
+      CONVERSATION.map((message) => [message]),
+    );
+    expect(session.refreshContext).toHaveBeenCalledOnce();
+  });
+
+  it("keeps compaction summaries in the context Pi sends to the model", async () => {
+    buildSessionContext.mockReturnValue({
+      messages: [
+        { role: "compactionSummary", summary: "EARLIER-CONTEXT", tokensBefore: 100, timestamp: 1 },
+        ...CONVERSATION,
+      ],
+    });
+    const session = cloneSession(callsAgent());
+
+    await runMentionClone(opts());
+
+    const copied = session.createdWith.sessionManager.appendMessage.mock.calls.map(([message]: any[]) => message);
+    expect(copied[0].role).toBe("user");
+    expect(JSON.stringify(copied[0].content)).toContain("EARLIER-CONTEXT");
+    expect(copied.slice(1)).toEqual(CONVERSATION);
   });
 
   it("takes the conversation from memory, never from the session file", async () => {
@@ -153,9 +171,7 @@ describe("cloning the conversation", () => {
     await runMentionClone(o);
 
     expect(buildSessionContext).toHaveBeenCalledWith([{ type: "message" }], "leaf-1");
-    expect(createAgentSession.mock.calls[0][0].sessionManager).toEqual({
-      kind: "in-memory-session-manager",
-    });
+    expect(createAgentSession.mock.calls[0][0].sessionManager).toBe(inMemory.mock.results[0].value);
   });
 
   it("thinks at the level the session is really on", async () => {
@@ -192,8 +208,8 @@ describe("cloning the conversation", () => {
     const result = await runMentionClone(o);
 
     expect(result).toEqual({ spawned: true });
-    expect(session.agent.state.messages).toEqual([]);
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
+    expect(session.createdWith.sessionManager.appendMessage).not.toHaveBeenCalled();
+    expect(session.refreshContext).toHaveBeenCalledOnce();
   });
 
   it("carries the live system prompt rather than the one it rebuilt", async () => {
@@ -203,7 +219,41 @@ describe("cloning the conversation", () => {
 
     await runMentionClone(opts());
 
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
+    const providerMessages = await session.agent.transformContext([
+      { role: "system", content: "rebuilt-from-cwd", timestamp: 0 },
+      ...CONVERSATION,
+    ]);
+    expect(providerMessages[0]).toEqual({
+      role: "system",
+      content: "the live system prompt",
+      timestamp: 0,
+    });
+    expect(providerMessages.slice(1)).toEqual(CONVERSATION);
+  });
+
+  it("does not replay parent system updates or replace the clone's tool declarations", async () => {
+    buildSessionContext.mockReturnValue({
+      messages: [
+        { role: "system", content: "old instructions", toolsAdded: [{ name: "bash" }] },
+        ...CONVERSATION,
+      ],
+    });
+    const session = cloneSession(callsAgent());
+
+    await runMentionClone(opts());
+
+    expect(session.createdWith.sessionManager.appendMessage.mock.calls).toEqual(
+      CONVERSATION.map((message) => [message]),
+    );
+    const providerMessages = await session.agent.transformContext([
+      { role: "system", content: "rebuilt-from-cwd", toolsAdded: [{ name: "bash" }], timestamp: 0 },
+      { role: "system", content: "", toolsAdded: [{ name: "Agent" }], timestamp: 1 },
+      ...CONVERSATION,
+    ]);
+    expect(providerMessages).toEqual([
+      { role: "system", content: "the live system prompt", toolsAdded: [{ name: "Agent" }], timestamp: 0 },
+      ...CONVERSATION,
+    ]);
   });
 
   it("inherits the parent's model, thinking level and providers", async () => {
