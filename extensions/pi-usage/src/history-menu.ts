@@ -385,7 +385,6 @@ function cacheLines(view: HistoryRangeView, width: number, theme?: HistoryTheme)
   if (view.cache.rows.length === 0) lines.push("No model calls in range");
   const countWidth = cacheCountWidth(view);
   const percentageWidth = Math.max(4, ...CACHE_GAP_BUCKETS.map((bucket) => visibleWidth(bucket)));
-  const cellWidth = percentageWidth + countWidth + 1;
   const wideHeader = `${column("Provider/model", 36)} ${CACHE_GAP_BUCKETS.map(
     (bucket) => `${bucket.padStart(percentageWidth)}${" ".repeat(countWidth + 1)}`,
   ).join(" ")}`;

@@ -27,8 +27,8 @@
  * against a Pi that does not aggregate, this fails rather than skipping, which
  * is how the range stays honest. `peerDependencies` moved to `>=0.81.0` for
  * exactly this reason, so the CI floor job runs it too. The floor has since moved
- * on past it (the Workflow tool needs 0.84.0), so this no longer pins the range's
- * lower edge — it still pins the behaviour that made 0.80.x unsupportable.
+ * on past it because cloning now depends on transcript-backed system prompts,
+ * but this still pins the behaviour that made 0.80.x unsupportable.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -114,20 +114,16 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
     }
   });
 
-  it("leaves the context-window percentage alone", async () => {
-    // pi derives context usage from assistant messages only. If that ever
-    // changed, a delegating session would look like it was filling its context
-    // with work that happened somewhere else entirely — and users would compact
-    // for no reason.
+  it("does not count delegated usage toward the parent's context window", async () => {
+    // Pi estimates the visible tool-result text in context, but the child's
+    // billed input tokens must not make the parent appear nearly full.
     const session = await realSession();
     try {
-      const before = session.getSessionStats().contextUsage?.percent ?? null;
-
       const pool = new PendingUsagePool();
       pool.add({ input: 150_000, output: 400, cacheWrite: 100, cost: 1.5 });
       session.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
 
-      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(before);
+      expect(session.getSessionStats().contextUsage?.tokens).toBeLessThan(1000);
     } finally {
       session.dispose?.();
     }

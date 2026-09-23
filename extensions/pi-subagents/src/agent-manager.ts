@@ -1041,7 +1041,7 @@ export class AgentManager {
       const record = this.agents.get(next.id);
       // Stale entries (aborted while queued) are not started — but are still
       // released, since nothing else will.
-      if (!record || record.status !== "queued") { next.release(); continue; }
+      if (record?.status !== "queued") { next.release(); continue; }
       // Detached, and never rejects: a late failure (e.g. strict worktree
       // isolation) lands on the record inside `launch`, exactly as the
       // synchronous throw did here before, and draining continues either way.

@@ -11,9 +11,9 @@
  *
  * So the turn happens somewhere else. The conversation is cloned into a
  * throwaway in-memory session — same messages, same system prompt, same model —
- * and that copy takes the turn off-screen. A literal clone: the session's own
- * entries, projected by pi's own `sessionEntryToContextMessages`, not
- * `inherit_context`'s text rendering of them.
+ * and that copy takes the turn off-screen. Pi projects the parent's session
+ * entries and converts them to the provider-visible messages, including
+ * compaction summaries, rather than rendering `inherit_context` text.
  *
  * Cloned from memory rather than from the session file, which cannot be relied
  * on: `SessionManager._persist` withholds every write until the first assistant
@@ -23,13 +23,6 @@
  * long conversation clones as what the main model is actually working from. A
  * conversation with nothing in it yet clones to nothing in it yet, which is the
  * correct answer rather than a failure.
- *
- * It is also the oldest of the equivalent Pi APIs — `buildContextEntries` on
- * ReadonlySessionManager and the `sessionEntryToContextMessages` export both
- * arrived in 0.80.5 — where this one has been exported unchanged from before
- * the declared peer floor, and is the same code path (`byId` is only an index
- * cache, so passing it or not cannot change the result). Keeping the floor
- * honest costs nothing here: see the `compat-floor-pi` job.
  *
  * Its `thinkingLevel` is NOT used, and is the one place the newer API would be
  * better. `getSessionContextSettings` starts at "off" and moves only on an
@@ -61,9 +54,10 @@
  * an invisible turn with the full toolset could do invisible work.
  */
 
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, Tool } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
+  convertToLlm,
   createAgentSession,
   type ExtensionContext,
   SessionManager,
@@ -146,12 +140,13 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     // the settings level instead, which is what a session that never ran
     // `/think` is on anyway. Same shim shape as `modelRuntime` below.
     const thinkingLevel = (ctx as { thinkingLevel?: ThinkingLevel }).thinkingLevel;
+    const cloneSessionManager = SessionManager.inMemory(ctx.cwd);
     const created = await runInChildSessionContext(() =>
       createAgentSession({
         cwd: ctx.cwd,
         // Nothing about the copy is worth persisting, and an in-memory manager
         // is also what keeps the real session untouched.
-        sessionManager: SessionManager.inMemory(ctx.cwd),
+        sessionManager: cloneSessionManager,
         model: ctx.model as Model<never> | undefined,
         ...(thinkingLevel && { thinkingLevel }),
         modelRegistry: ctx.modelRegistry,
@@ -170,16 +165,37 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     );
     session = created.session;
 
-    // The clone rebuilds a system prompt from cwd and agentDir, which is close
-    // but not the live one — extensions contribute to it per turn. Copy the
-    // real thing, so the copy reasons under the instructions the user's model
-    // is actually working under.
-    const systemPrompt = ctx.getSystemPrompt?.();
-    if (systemPrompt) session.agent.state.systemPrompt = systemPrompt;
+    // Pi rebuilds each request from the session manager, not agent.state.
+    // Convert summaries and other Pi messages just as the provider would see
+    // them. Parent system updates are already reflected in the live prompt;
+    // copying them would also reintroduce the parent's tools.
+    for (const message of convertToLlm(conversation.messages)) {
+      if (message.role !== "system") cloneSessionManager.appendMessage(message);
+    }
+    session.refreshContext();
 
-    // The conversation itself. Pushed rather than assigned so the array the
-    // session was built around stays the one it goes on using.
-    session.agent.state.messages.push(...conversation.messages);
+    const systemPrompt = ctx.getSystemPrompt?.();
+    if (systemPrompt) {
+      const previousTransform = session.agent.transformContext;
+      session.agent.transformContext = async (messages, signal) => {
+        const transformed = (await previousTransform?.(messages, signal)) ?? messages;
+        let tool: Tool | undefined;
+        for (const entry of transformed) {
+          if (entry.role !== "system") continue;
+          if (entry.toolsRemoved?.some(({ name }) => name === cloneAgentTool.name)) tool = undefined;
+          tool = entry.toolsAdded?.find(({ name }) => name === cloneAgentTool.name) ?? tool;
+        }
+        return [
+          {
+            role: "system",
+            content: systemPrompt,
+            ...(tool ? { toolsAdded: [tool] } : {}),
+            timestamp: 0,
+          },
+          ...transformed.filter((message) => message.role !== "system"),
+        ];
+      };
+    }
 
     // User text first, reminder after — the order Claude Code's attachment
     // renderer produces, where the reminder trails the message it is about.

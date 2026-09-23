@@ -30,6 +30,7 @@ import {
   type PrintModeRun,
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
+import { contextToolNames } from "./helpers/transcript-context.js";
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -101,7 +102,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
 
     const respond = (context: Context): FauxReply => {
       const text = firstUserText(context);
-      const names = (context.tools ?? []).map((t) => t.name);
+      const names = contextToolNames(context);
 
       // Leaf: no nested tools (it never opted in) — just answer.
       if (text.includes("Do the leaf work")) {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import test from "node:test";
 import { initTheme, Theme } from "@earendil-works/pi-coding-agent";
-import { Text, TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { Text, type TUI, TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
 import {
   CACHE_GAP_BUCKETS,
   deriveHistoryRange,
@@ -1993,7 +1993,7 @@ test("wide, narrow, and ANSI-styled renderings retain data within visible width"
 });
 
 test("focused history leaves the host component tree untouched", async () => {
-  const host = new TUI({ columns: 50, rows: 16, hideCursor() {}, write() {} } as never);
+  const host = new TuiMainScreen({ columns: 50, rows: 16, hideCursor() {}, write() {} } as never);
   const transcript = new Text("transcript", 0, 0);
   host.addChild(transcript);
   const originalChildren = [...host.children];
@@ -2034,7 +2034,7 @@ test("focused history leaves the host component tree untouched", async () => {
 
 test("history cancellation closes normally and removes its abort listener", async () => {
   const cancelled = new AbortController();
-  const host = new TUI({ columns: 40, rows: 10, hideCursor() {}, write() {} } as never);
+  const host = new TuiMainScreen({ columns: 40, rows: 10, hideCursor() {}, write() {} } as never);
   host.addChild(new Text("underlying cancellation content", 0, 0));
   const originalChildren = [...host.children];
 
