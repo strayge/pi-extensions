@@ -52,7 +52,10 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
       // resolve to; an unregistered path simply yields no extension (a failed load).
       if (this.opts.noExtensions) {
         loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
-        return;
+      }
+      for (const entry of this.opts.extensionFactories ?? []) {
+        entry.factory({});
+        loaderExtensionsRef.current.extensions.push({ path: `<inline:${entry.name}>`, tools: new Map() });
       }
       if (this.opts.extensionsOverride) {
         loaderExtensionsRef.current = this.opts.extensionsOverride(loaderExtensionsRef.current);
@@ -171,6 +174,7 @@ function createSession(finalText: string) {
       });
     }),
     abort: vi.fn(),
+    dispose: vi.fn(),
     steer: vi.fn(),
     // Stateful, so the active set reflects what the scope installer actually did
     // and `renarrow`'s no-op guard behaves as it does against real pi.
@@ -226,6 +230,39 @@ beforeEach(() => {
   vi.mocked(createNestedSubagentTools).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
+});
+
+describe("mandatory permission inheritance", () => {
+  function parent(attachment: Record<string, unknown>) {
+    return { events: { emit: (event: string, request: any) => {
+      if (event === "permission:present:v2") request.respond();
+      else if (event === "permission:attach:v2") request.respond(attachment);
+    } } } as any;
+  }
+
+  it.each([false, true])("retains required adapter with isolated=%s and releases/resumes its lease", async (isolated) => {
+    const { session } = createSession("GOVERNED");
+    createAgentSession.mockResolvedValue({ session });
+    const factory = vi.fn(); const verify = vi.fn(); const release = vi.fn(); const resumedRelease = vi.fn();
+    const resume = vi.fn(() => resumedRelease);
+    const parentCtx = { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "root" } };
+    await runAgent(parentCtx, "Explore", "work", { pi: parent({ factory, verify, release, resume }), isolated, extensions: false });
+    expect(factory).toHaveBeenCalledOnce();
+    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toContain("<inline:permission-policy-v2>");
+    expect(verify.mock.invocationCallOrder[0]).toBeLessThan(session.prompt.mock.invocationCallOrder[0]!);
+    expect(release).toHaveBeenCalledOnce();
+    await resumeAgent(session as any, "continue");
+    expect(resume).toHaveBeenCalledOnce(); expect(resumedRelease).toHaveBeenCalledOnce();
+  });
+
+  it("cannot prompt when required hooks did not bind and releases failed startup", async () => {
+    const { session } = createSession("UNREACHABLE");
+    createAgentSession.mockResolvedValue({ session });
+    const release = vi.fn();
+    const parentCtx = { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "root" } };
+    await expect(runAgent(parentCtx, "Explore", "work", { pi: parent({ factory: vi.fn(), verify: () => { throw new Error("required hooks missing"); }, release, resume: vi.fn() }) })).rejects.toThrow("required hooks missing");
+    expect(session.prompt).not.toHaveBeenCalled(); expect(session.dispose).toHaveBeenCalledOnce(); expect(release).toHaveBeenCalledOnce();
+  });
 });
 
 describe("agent-runner final output capture", () => {

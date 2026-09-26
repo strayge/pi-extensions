@@ -1,1114 +1,509 @@
-/**
- * Permission Mode extension
- *
- * Switchable, data-driven permission modes (cycle with shift+tab or /perm). A MODE
- * is a JSON bundle of a sandbox profile + an allow/ask/deny permission policy +
- * UI metadata, defined in `schema.ts` (built-in defaults) and overridable in
- * `permission-mode.json`. The four shipped modes:
- *
- *   Default - confirm bash/edit/write; approved in-project bash runs sandboxed
- *             (writable), approved out-of-project runs UNSANDBOXED.
- *   Plan    - planning mode. In-project bash runs sandboxed READ-ONLY; reads are
- *             free; only Markdown create/edit is allowed in-project. Out-of-project
- *             access prompts. A system prompt steers the model to write a plan file.
- *   Build   - in-project reads/writes/bash run without confirmation; bash runs
- *             sandboxed. Prompts on out-of-project access or privilege escalation;
- *             approved out-of-project commands run UNSANDBOXED.
- *   YOLO    - never prompts, never sandboxes; full user permissions.
- *
- * The OS sandbox (@anthropic-ai/sandbox-runtime) is the real enforcement for
- * bash. If it's unavailable the sandboxed modes fall back to PROMPTING for
- * in-project bash and the TUI indicator shows a warning.
- *
- * This entry file is wiring only — flags, commands, shortcuts, the tool_call
- * dispatcher, the input/skill handler, and lifecycle. The logic lives in sibling
- * modules:
- *   schema.ts       mode definition types + plan prompt (defaults: permission-mode.defaults.json)
- *   resolve.ts      surface resolution engine (allow/ask/deny)
- *   bash-enforce.ts bash gate + exec plan (sandbox composition)
- *   bash-parse.ts   tree-sitter command extraction + heuristic fallback
- *   config-load.ts  layered permission-mode.json loader
- *   approvals.ts    session-scoped "Allow for session" store
- *   file-approval.ts outside-project file scope model, prompt UI, and RPC fallback
- *   awareness.ts    sandbox-boundary system-prompt section (injected each turn)
- *   network.ts      live network session state (grants, denies, open toggle)
- *   paths.ts        out-of-project / protected-path predicates
- *   heuristics.ts   bash escape/privilege scan (tree-sitter fallback)
- *   sandbox.ts      SandboxController (runtime lifecycle, per-mode profile)
- *   status.ts       footer indicator   statusline-slot.ts  its placeable slots
- *   show-plan.ts    show_plan tool   plan-render.ts  its renderer
- *
- * Install (see README.md):
- *   pi install npm:@strayge/pi-permission-modes
- *   Linux also needs: bubblewrap, socat, ripgrep
- */
-
-import { Type } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CONFIG_DIR_NAME, createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  openSync,
+  lstatSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
-import { sandboxAwarenessPrompt } from "./awareness.ts";
-import { bashExecPlan, bashGate, bashPromptTitle, bashSubject } from "./bash-enforce.ts";
-import { analyzeBash } from "./bash-parse.ts";
+import { Type } from "@earendil-works/pi-ai";
 import {
-  isUnsafeDomain,
-  loadModeConfig,
-  loadStockDefaults,
-  persistModeDomains,
-  persistModeRule,
-  persistPermissionGrants,
-  persistProjectPermissionGrants,
-  persistProjectRule,
-  projectGrantCount,
-  stockDefaultsFile,
-} from "./config-load.ts";
-import type { PermState } from "./modes.ts";
-import { type NetAskResult, NetworkSession, isHostAllowed, normalizeDomain } from "./network.ts";
-import {
-  canonicalizePath,
-  isCanonicalTargetOutside,
-  isProtectedNormalizedWrite,
-  normalizePiTarget,
-  resolvePiReadTarget,
-} from "./paths.ts";
-import { promptOutsideFileApproval } from "./file-approval.ts";
-import {
-  ALLOW_ONCE,
-  ALLOW_SESSION,
-  DENY,
-  SessionApprovals,
-  askWithSession,
-} from "./approvals.ts";
-import {
-  aggregateBashDecision,
-  decide,
-  decideBashCommand,
-  decideBashText,
-  resolvePolicySurface,
-} from "./resolve.ts";
-import {
-  buildCommandRequirement,
-  buildFileRequirements,
-  evaluateRequirements,
-} from "./permission-requirements.ts";
-import { SandboxController } from "./sandbox.ts";
-import {
-  type PermissionGrant,
-  type PathGrantPermission,
-  type ModeDef,
-  PLAN_PROMPT_SENTINEL,
-  type PermissionModeConfig,
-  planModeSystemPrompt,
-  type Surface,
-  SURFACES,
-} from "./schema.ts";
-import { createShowPlanTool } from "./show-plan.ts";
-import { statusSlots, updateStatus } from "./status.ts";
-import { publishStatuslineItem } from "./statusline-slot.ts";
+  createBashToolDefinition,
+  createPowerShellToolDefinition,
+  getAgentDir,
+  getPackageDir,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { PermissionOwner } from "./approvals.ts";
+import { permissionAwareness } from "./awareness.ts";
+import { discoverShellAccess } from "./bash-parse.ts";
+import { defaultConfig, loadConfig } from "./config-load.ts";
+import { createDirectTools } from "./direct-tools.ts";
+import { approvalUI, networkUI } from "./file-approval.ts";
+import { createSearchTools } from "./filtered-search.ts";
+import { normalizeDomain } from "./network.ts";
+import { assertBinding, bindPath, modelPath } from "./paths.ts";
+import { activePiPackage, resolveCatalog, tightenCatalog } from "./policy.ts";
+import { PermissionStore, type SessionBinding } from "./permission-state.ts";
+import { runtime } from "./sandbox.ts";
+import { createStatus } from "./status.ts";
 
-/** Built-in file tools whose `input.path` is gated against the matching surface. */
-const FILE_TOOL_SURFACE: Record<string, Surface> = {
-  read: "read",
-  edit: "edit",
-  write: "write",
-  ls: "ls",
-  grep: "grep",
-  find: "find",
-};
-
-/** Optional-path file tools use the current working directory when omitted. */
-const OPTIONAL_PATH_FILE_TOOLS = new Set(["grep", "find", "ls"]);
-
-/** Tools with a dedicated branch in the dispatcher (not gated via the `tool` surface). */
-const BUILTIN_HANDLED = new Set([
-  "bash",
-  "read",
-  "edit",
-  "write",
-  "ls",
-  "grep",
-  "find",
-  "web_search",
-  "show_plan",
-  "request_network_access", // prompts on its own — gating it would double-prompt
-]);
-
-/** Our own tools that must never be hidden (show_plan is needed in Plan mode). */
-const NEVER_HIDE = new Set(["show_plan"]);
-
-const USER_DENIED_COMMAND_REASON =
-  "Command denied by the user; it was not executed. Do not retry this command or an equivalent command. " +
-  "Continue without it or report that permission was denied.";
-
-function userDeniedToolReason(toolName: string): string {
-  return toolName === "Agent"
-    ? "Agent launch denied by the user; no subagent was started."
-    : `Tool "${toolName}" denied by the user; it was not executed.`;
+interface Attachment {
+  owner: PermissionOwner;
+  release: () => void;
 }
-
-function bashRulePatterns(name: string, args: string[]): { narrow: string[]; broad: string[]; command: string } {
-  const command = [name, ...args].join(" ").trim();
-  const broad = [name, `${name} *`];
-  const sub = args[0];
-  if (!sub || sub.startsWith("-")) return { narrow: broad, broad, command };
-  return { narrow: [`${name} ${sub}`, `${name} ${sub} *`], broad, command };
+export interface PermissionBridgeRequest {
+  version: 2;
+  parentSessionId: string;
+  cancel(): void;
+  respond(attachment: {
+    factory: (pi: ExtensionAPI) => void;
+    verify(): void;
+    resume(cancel: () => void): () => void;
+    release(): void;
+  }): void;
+  reject(reason: string): void;
 }
+const retainedSymbol = Symbol.for("pi.permission-modes.reload.v2");
+const globals = globalThis as typeof globalThis & { [retainedSymbol]?: Map<string, PermissionOwner> };
+const retained = (globals[retainedSymbol] ??= new Map());
+const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 
-function projectLayerAllowsGlobal(mode: ModeDef, surfaces: Surface[], targets: string | string[]): boolean {
-  return [mode.projectOverlay, mode.trustedProjectPermission].every((layer) =>
-    !layer || surfaces.every((surface) => {
-      const decision = resolvePolicySurface({ ...mode, permission: layer, projectOverlay: undefined }, surface, targets);
-      return decision.action === undefined || decision.action === "allow";
-    }),
-  );
-}
-
-function bashGrantable(mode: ModeDef, command: string, scope: "global" | "project"): boolean {
-  if (scope === "project") return true;
-  return projectLayerAllowsGlobal(mode, ["bash"], command);
-}
-
-const isTrustedProject = (ctx: ExtensionContext): boolean =>
-  typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted();
-
-export default async function (pi: ExtensionAPI) {
-  // The engine starts on the shipped stock defaults (permission-mode.defaults.json);
-  // session_start reloads the merged config (stock + global full-authority +
-  // project trust-aware) from permission-mode.json.
-  let config: PermissionModeConfig = loadStockDefaults();
-  let modeName = config.defaultMode;
-  // True when the current mode was auto-picked as the headless-child safety
-  // fallback (no --perm flag, session entry, or forwarded env). The mode's
-  // POLICY fully applies, but its systemPrompt is not injected — a planning
-  // prompt steering a headless worker to write plan files and ask about shift+tab
-  // would misdirect it — and the fallback isn't exported to child processes
-  // as if it were an explicit choice (children re-derive their own fallback).
-  let fallbackMode = false;
-  // Set once from the first session_start. Only an identified in-process child
-  // that began from a forwarded mode, or an implicit safety fallback, follows
-  // later parent changes; a root selection is a startup snapshot.
-  let followsEnvironment: boolean | undefined;
-  const root = process.cwd();
-
-  const currentMode = (): ModeDef => config.modes[modeName] ?? config.modes[config.defaultMode];
-
-  /** Recognize pi-subagents' standalone marker, not prose that merely mentions it. */
-  const isActiveAgentChild = (ctx: ExtensionContext): boolean =>
-    /(?:^|\n)<active_agent name="[^\r\n]*"\/>(?=\n|$)/.test(ctx.getSystemPrompt());
-
-  const sandbox = new SandboxController();
-  // toolCallIds the user explicitly approved to run OUTSIDE the sandbox.
-  const approvedUnsandboxed = new Set<string>();
-  // "Allow for session" memory, keyed per-mode.
-  const approvals = new SessionApprovals();
-  // Live network state: session domain grants/denies and the open toggle. The
-  // sandbox-runtime proxy consults it (via net.decide) for every host outside
-  // the allowlist, so changes apply instantly — no sandbox re-init.
-  const net = new NetworkSession();
-  let notifiedProjectGrants = false;
-  // Statusline slots, so the two chips can be placed independently. The mode
-  // slot reuses the `perm` status key, which is what makes a statusline render
-  // the slot instead of also listing the key. Both ask for a placement rather
-  // than accepting the catch-all, where one item's color covers every entry and
-  // all four modes would look alike.
-  const publishModeSlot = publishStatuslineItem(pi, {
-    id: "perm",
-    defaultPlacement: { side: "left", order: 10 },
-  });
-  const publishNetworkSlot = publishStatuslineItem(pi, {
-    id: "perm-network",
-    defaultPlacement: { side: "left", order: 20 },
-  });
-  // Latest UI-capable context, for prompts that fire OUTSIDE an event handler
-  // (the network ask callback runs mid-bash, driven by the proxy).
-  let uiCtx: ExtensionContext | undefined;
-
-  /** Paint the footer chip and republish both slots from the same state. */
-  const refreshStatus = (ctx: ExtensionContext, mode: ModeDef = currentMode()): void => {
-    const slots = statusSlots(updateStatus(ctx, mode, sandbox, net.open));
-    publishModeSlot(slots.mode.text, slots.mode.color);
-    publishNetworkSlot(slots.network?.text, slots.network?.color);
+export default function permissionExtension(pi: ExtensionAPI, inherited?: Attachment): void {
+  let owner = inherited?.owner;
+  let retainedKey: string | undefined;
+  let ownerSessionId: string | undefined;
+  let ctx: ExtensionContext;
+  let startupError: string | undefined;
+  const status = createStatus(pi);
+  const getOwner = () => {
+    if (!owner) throw new Error(`Filesystem policy unavailable: ${startupError ?? "session has not started"}`);
+    return owner;
   };
-
-  /** Prompt the user about a blocked host (the connection waits meanwhile). */
-  const askNetHost = async (host: string, port: number | undefined): Promise<NetAskResult> => {
-    const ctx = uiCtx;
-    if (!ctx?.hasUI || currentMode().sandbox.askOnBlockedHost === false) return "dismiss";
-    const target = port !== undefined ? `${host}:${port}` : host;
-    const choice = await ctx.ui.select(`Network: bash wants to reach ${target} (not in the allowlist) — allow?`, [
-      "Allow for session",
-      "Allow forever",
-      "Deny",
-    ]);
-    if (choice === "Allow for session") return "allow-session";
-    if (choice === "Allow forever") {
-      try {
-        const file = persistModeDomains(getAgentDir(), modeName, [host]);
-        config = loadModeConfig(ctx.cwd, getAgentDir(), (m) => ctx.ui.notify(m, "warning"), isTrustedProject(ctx));
-        ctx.ui.notify(`permission-mode: always allow ${host} in ${currentMode().label} — saved to ${file}`, "info");
-      } catch (e) {
-        ctx.ui.notify(`permission-mode: could not save domain: ${e}`, "error");
-      }
-      return "allow-forever";
-    }
-    if (choice === "Deny") return "deny";
-    return "dismiss"; // dismissed prompt: deny this request, but don't remember
+  const showStatus = () => {
+    if (ctx) status(ctx, owner, startupError);
   };
-
-  /** Prompt to allow an `ask`, honoring session grants (a target list requires
-   * every entry to be granted; granting remembers all). Returns true to allow.
-   * When `onForever` is given, a fourth "Allow forever" option persists the rule. */
-  const promptAllow = (
-    ctx: ExtensionContext,
-    surface: Surface,
-    target: string | string[],
-    title: string,
-    onForever?: () => void | Promise<void>,
-  ): Promise<boolean> =>
-    askWithSession(
-      { hasUI: ctx.hasUI, select: (t, o) => ctx.ui.select(t, o) },
-      approvals,
-      modeName,
-      surface,
-      target,
-      title,
-      onForever,
-    );
-
-  /** "Allow forever": persist `<mode>.permission.<surface>.<key> = allow` to the
-   * global config and hot-reload so it applies now and in future sessions. */
-  const learnForever = (ctx: ExtensionContext, surface: Surface, key: string) => () => {
-    try {
-      const file = persistModeRule(getAgentDir(), modeName, surface, key, "allow");
-      config = loadModeConfig(ctx.cwd, getAgentDir(), (m) => ctx.ui.notify(m, "warning"), isTrustedProject(ctx));
-      ctx.ui.notify(`permission-mode: always allow ${surface} "${key}" in ${currentMode().label} — saved to ${file}`, "info");
-    } catch (e) {
-      ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
-    }
+  const context = () => ctx;
+  const key = () => JSON.stringify([ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile() ?? null]);
+  const agentDir = getAgentDir();
+  const resolution = { agentDir, home: homedir(), piPackage: activePiPackage() ?? getPackageDir() };
+  const requireRoot = () => {
+    if (inherited) throw new Error("Profile and revocation controls belong to the parent session");
   };
-
-  const localBash = createBashTool(root);
 
   pi.registerFlag("perm", {
-    description: `Start in permission mode: ${config.cycleOrder.join(" | ")}`,
+    description: "Filesystem profile (project, subproject, yolo, or a configured name)",
     type: "string",
-    default: "",
   });
   pi.registerFlag("no-sandbox", {
-    description: "Disable OS-level sandboxing for the sandboxed modes (heuristics + prompts only)",
+    description: "Disable optional sandbox use; required filesystem/network layers still block execution",
     type: "boolean",
     default: false,
   });
 
-  // Hide a mode's `hideTools` from the model (pre-exposure), restoring the rest.
-  const applyToolVisibility = () => {
-    const hide = new Set((currentMode().hideTools ?? []).filter((n) => !NEVER_HIDE.has(n)));
-    const all = pi.getAllTools().map((t) => t.name);
-    pi.setActiveTools(hide.size ? all.filter((n) => !hide.has(n)) : all);
-  };
-
-  /**
-   * Announcing is for switches the user made themselves: the footer carries the
-   * mode at all times, so a notice would be noise on every launch — the lifecycle
-   * handlers pass `announce: false`.
-   */
-  const setMode = async (
-    name: string,
-    ctx: ExtensionContext,
-    opts: { persist?: boolean; viaFallback?: boolean; announce?: boolean; forwardEnv?: boolean } = {},
-  ) => {
-    const { persist = true, viaFallback = false, announce = true, forwardEnv = true } = opts;
-    if (!config.modes[name]) return;
-    uiCtx = ctx;
-    modeName = name;
-    fallbackMode = viaFallback;
-    // Forward to child pi processes (e.g. subagents) via inherited env. The child
-    // adopts it on session_start unless an explicit --perm flag overrides. The
-    // implicit headless fallback is NOT forwarded: a child with no explicit mode
-    // derives the same safe fallback itself (and skips the systemPrompt too).
-    if (forwardEnv && !viaFallback) process.env.PI_PERMISSION_MODE = modeName;
-    const m = currentMode();
-    await sandbox.applyProfile(m.sandbox); // re-init runtime if the profile changed
-    applyToolVisibility();
-    refreshStatus(ctx, m);
-    if (announce) ctx.ui.notify(`Permission mode: ${m.label}`, "info");
-    if (persist) pi.appendEntry<PermState>("perm-mode", { mode: modeName });
-  };
-
-  /** Reapply a parent-selected environment mode at the next policy boundary. */
-  const reconcileModeFromEnvironment = async (ctx: ExtensionContext): Promise<void> => {
-    if (!followsEnvironment) return;
-    const requested = process.env.PI_PERMISSION_MODE;
-    if (!requested || !config.modes[requested]) return;
-    if (requested === modeName && !fallbackMode) return;
-    await setMode(requested, ctx, { persist: false, announce: false, forwardEnv: false });
-  };
-
-  /** The most restrictive built-in-style mode for a headless child without a
-   * forwarded mode: a read-only sandboxed mode if any, else the default. */
-  const safeChildMode = (): string => {
-    const ro = config.cycleOrder.find((n) => config.modes[n]?.sandbox.enabled && !config.modes[n]?.sandbox.writable);
-    const sandboxed = config.cycleOrder.find((n) => config.modes[n]?.sandbox.enabled);
-    return ro ?? sandboxed ?? config.defaultMode;
-  };
-
-  const cycle = async (ctx: ExtensionContext) => {
-    const order = config.cycleOrder;
-    const idx = order.indexOf(modeName);
-    await setMode(order[(idx + 1) % order.length], ctx);
-  };
-
-  /**
-   * Resolve which mode to start in:
-   *   1. explicit --perm flag, then 2. persisted session entry (resume),
-   *   3. PI_PERMISSION_MODE env (forwarded from a parent / user-set),
-   *   4. headless child with none of the above → most restrictive (never YOLO),
-   *      flagged as `fallback` (policy applies, systemPrompt is not injected),
-   *   5. the current/default mode.
-   */
-  type ModeSource = "flag" | "persisted" | "env" | "fallback" | "current";
-  const pickMode = (
-    ctx: ExtensionContext,
-    useFlag: boolean,
-    useEnvironment = true,
-  ): { name: string; fallback: boolean; source: ModeSource } => {
-    if (useFlag) {
-      const flag = String(pi.getFlag("perm") ?? "").toLowerCase();
-      if (config.modes[flag]) return { name: flag, fallback: false, source: "flag" };
-    }
-    let persisted: string | undefined;
-    for (const entry of ctx.sessionManager.getEntries()) {
-      if (entry.type === "custom" && entry.customType === "perm-mode") {
-        const data = entry.data as PermState | undefined;
-        if (data?.mode && config.modes[data.mode]) persisted = data.mode;
-      }
-    }
-    if (persisted) return { name: persisted, fallback: false, source: "persisted" };
-
-    if (useEnvironment) {
-      const env = process.env.PI_PERMISSION_MODE;
-      if (env && config.modes[env]) return { name: env, fallback: false, source: "env" };
-    }
-    if (!ctx.hasUI) return { name: safeChildMode(), fallback: true, source: "fallback" }; // headless child, no forwarded mode
-    return { name: modeName, fallback: false, source: "current" };
-  };
-
-  pi.registerShortcut("shift+tab", {
-    description: `Cycle permission mode (${config.cycleOrder.join(" -> ")})`,
-    handler: async (ctx) => cycle(ctx),
-  });
-  pi.registerCommand("perm", {
-    description: `Set or cycle permission mode: /perm [${config.cycleOrder.join("|")}|init [-p]|allow [-p|-g] [surface] <pattern>|clear-approvals]`,
-    handler: async (args, ctx) => {
-      const raw = args.trim();
-      const arg = raw.toLowerCase();
-      if (arg === "clear-approvals") {
-        approvals.clearAll();
-        return ctx.ui.notify("permission-mode: cleared session approvals", "info");
-      }
-      if (arg === "init" || arg === "init -p") {
-        // Scaffold an editable copy of the stock defaults at the global path.
-        const project = arg === "init -p";
-        const dest = project
-          ? path.join(ctx.cwd, CONFIG_DIR_NAME, "permission-mode.json")
-          : path.join(getAgentDir(), "permission-mode", "permission-mode.json");
-        if (existsSync(dest)) {
-          return ctx.ui.notify(`permission-mode: ${dest} already exists — edit it directly`, "warning");
-        }
-        try {
-          mkdirSync(path.dirname(dest), { recursive: true });
-          writeFileSync(
-            dest,
-            project
-              ? `${JSON.stringify({ $schema: "https://raw.githubusercontent.com/strayge/pi-extensions/main/extensions/pi-permission-modes/schemas/permission-mode.schema.json", modes: {} }, null, 2)}\n`
-              : readFileSync(stockDefaultsFile(), "utf-8"),
-          );
-          return ctx.ui.notify(`permission-mode: wrote ${dest} — edit it to customize your modes`, "info");
-        } catch (e) {
-          return ctx.ui.notify(`permission-mode: could not write ${dest}: ${e}`, "error");
-        }
-      }
-      if (arg.startsWith("allow ") || arg === "allow") {
-        const match = /^allow(?:\s+(-p|-g))*(?:\s+([\s\S]*))?$/i.exec(raw);
-        if (!match) return ctx.ui.notify("permission-mode: usage: /perm allow [-p|-g] [surface] <pattern>", "warning");
-        let project = false;
-        let global = false;
-        const flags = raw.match(/^allow(?:\s+(-p|-g))*/i)?.[0] ?? "allow";
-        for (const flag of flags.match(/-p|-g/gi) ?? []) {
-          if (flag.toLowerCase() === "-p") project = true;
-          if (flag.toLowerCase() === "-g") global = true;
-        }
-        const rest = (match[2] ?? "").trim().split(/\s+/).filter(Boolean);
-        const surface = rest.length > 1 && SURFACES.includes(rest[0] as Surface) ? (rest.shift() as Surface) : "bash";
-        const pattern = rest.join(" ").trim();
-        if (!pattern || (project && global)) {
-          return ctx.ui.notify("permission-mode: usage: /perm allow [-p|-g] [surface] <pattern>", "warning");
-        }
-        if (project && !isTrustedProject(ctx)) {
-          return ctx.ui.notify("permission-mode: project allows require a trusted project", "warning");
-        }
-        try {
-          const file = project
-            ? persistProjectRule(ctx.cwd, modeName, surface, pattern, "allow")
-            : persistModeRule(getAgentDir(), modeName, surface, pattern, "allow");
-          config = loadModeConfig(ctx.cwd, getAgentDir(), (m) => ctx.ui.notify(m, "warning"), isTrustedProject(ctx));
-          return ctx.ui.notify(`permission-mode: allowed ${surface} "${pattern}" — saved to ${file}`, "info");
-        } catch (e) {
-          return ctx.ui.notify(`permission-mode: could not save rule: ${e}`, "error");
-        }
-      }
-      if (config.modes[arg]) await setMode(arg, ctx);
-      else await cycle(ctx);
-    },
-  });
-  const networkEnforcing = () => currentMode().sandbox.enabled && sandbox.ready;
-
-  const toggleNetwork = async (ctx: ExtensionContext) => {
-    uiCtx = ctx;
-    if (!networkEnforcing()) {
-      return ctx.ui.notify("permission-mode: network is not filtered in this mode/state — nothing to toggle", "info");
-    }
-    net.open = !net.open;
-    refreshStatus(ctx);
-    ctx.ui.notify(
-      net.open
-        ? "Network: OPEN for this session — domain filtering disabled (alt+n or /net restrict to re-enable)"
-        : "Network: filtered — domain allowlist active",
-      net.open ? "warning" : "info",
-    );
-  };
-
-  pi.registerShortcut("alt+n", {
-    description: "Toggle network filtering for this session (filtered <-> open)",
-    handler: toggleNetwork,
-  });
-
-  pi.registerCommand("net", {
-    description: "Network sandbox: /net [status|allow <domain…>|open|restrict|reset]",
-    handler: async (args, ctx) => {
-      uiCtx = ctx;
-      const m = currentMode();
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      const sub = (parts[0] ?? "status").toLowerCase();
-      if (sub === "open") {
-        if (!net.open) return toggleNetwork(ctx);
-        return ctx.ui.notify("permission-mode: network is already open for this session", "info");
-      }
-      if (sub === "restrict") {
-        if (net.open) return toggleNetwork(ctx);
-        return ctx.ui.notify("permission-mode: network filtering is already active", "info");
-      }
-      if (sub === "reset") {
-        net.clear();
-        refreshStatus(ctx, m);
-        return ctx.ui.notify("permission-mode: cleared session network grants/denies; filtering restored", "info");
-      }
-      if (sub === "allow") {
-        const domains = [...new Set(parts.slice(1).map(normalizeDomain).filter((d): d is string => d !== undefined))];
-        const safe = domains.filter((d) => !isUnsafeDomain(d));
-        if (safe.length === 0) {
-          return ctx.ui.notify("permission-mode: usage: /net allow <domain> [domain…] — concrete hosts or *.sub wildcards", "warning");
-        }
-        net.grant(safe);
-        const dropped = domains.length - safe.length;
-        return ctx.ui.notify(
-          `permission-mode: allowed for this session: ${safe.join(", ")}${dropped ? ` (${dropped} overly-broad pattern(s) rejected)` : ""}`,
-          "info",
+  const [read, edit, write] = createDirectTools(getOwner, process.cwd());
+  pi.registerTool(read);
+  pi.registerTool(edit);
+  pi.registerTool(write);
+  const [find, grep, ls] = createSearchTools(getOwner, process.cwd());
+  pi.registerTool(find);
+  pi.registerTool(grep);
+  pi.registerTool(ls);
+  const bash = createBashToolDefinition(process.cwd());
+  const powershell = createPowerShellToolDefinition(process.cwd());
+  for (const shell of [bash, powershell]) {
+    pi.registerTool({
+      ...shell,
+      execute: async (id, params, signal, update, toolCtx) => {
+        const active = getOwner();
+        const cwd = toolCtx.cwd;
+        const accesses = shell.name === "bash" ? await discoverShellAccess(params.command, cwd) : [];
+        // No command starts until every reliable operand and redirection has passed preflight.
+        for (const request of accesses) await active.authorize([request.path], request.access, request.source, signal);
+        return active.run(
+          [modelPath(".", cwd)],
+          "read",
+          "Shell working directory",
+          signal,
+          async (snapshot, targets) => {
+            for (const request of accesses) {
+              const result = await active.authorize([request.path], request.access, request.source, signal);
+              active.check(snapshot.revision);
+              for (const target of result.targets) assertBinding(target);
+            }
+            const family = {
+              id: active.id,
+              network: () => active.network.snapshot(),
+              reportEnforcement: (error?: string) => { active.enforcementError = error; showStatus(); },
+              decideHost: (host: string, port?: number) =>
+                active.reason ? Promise.resolve(false) : active.network.decide(host, port, active.askNetwork),
+            };
+            const operations = runtime.operations(
+              snapshot,
+              family,
+              () => {
+                active.check(snapshot.revision);
+                for (const target of targets) assertBinding(target);
+              },
+              pi.getFlag("no-sandbox") === true,
+            );
+            const tool =
+              shell.name === "bash"
+                ? createBashToolDefinition(cwd, { operations })
+                : createPowerShellToolDefinition(cwd, {
+                    operations: {
+                      exec: async (command, executionCwd, options) => {
+                        const interpreter = "/usr/bin/pwsh";
+                        if (!existsSync(interpreter))
+                          throw new Error(
+                            "Contained PowerShell is unavailable: /usr/bin/pwsh is required; no unsandboxed fallback",
+                          );
+                        return operations.exec(
+                          `${quote(interpreter)} -NoLogo -NonInteractive -Command ${quote(command)}`,
+                          executionCwd,
+                          options,
+                        );
+                      },
+                    },
+                  });
+            try {
+              return await tool.execute(id, params, signal, update, toolCtx);
+            } finally {
+              showStatus();
+            }
+          },
         );
-      }
-      // status (default)
-      const state = !networkEnforcing()
-        ? "OPEN — nothing filters in this mode/state"
-        : net.open
-          ? "OPEN for this session (/net restrict or alt+n to re-enable filtering)"
-          : "filtered (alt+n or /net open to disable)";
-      return ctx.ui.notify(
-        [
-          `Network (${m.label}): ${state}`,
-          `Mode allowlist: ${m.sandbox.network?.allowedDomains?.join(", ") || "(none)"}`,
-          `Session grants: ${net.grants().join(", ") || "(none)"}`,
-          `Session denies: ${net.denies().join(", ") || "(none)"}`,
-        ].join("\n"),
-        "info",
-      );
-    },
-  });
+      },
+    });
+  }
 
-  pi.registerCommand("sandbox", {
-    description: "Show the active mode's sandbox status and configuration",
-    handler: async (_args, ctx) => {
-      const m = currentMode();
-      if (!m.sandbox.enabled) {
-        return ctx.ui.notify(`${m.label}: sandbox disabled for this mode (bash runs unsandboxed)`, "info");
-      }
-      if (sandbox.disabled) return ctx.ui.notify("Sandbox disabled via --no-sandbox", "info");
-      if (!sandbox.ready) return ctx.ui.notify(`Sandbox unavailable: ${sandbox.warn ?? "unknown"}`, "warning");
-      const c = sandbox.effectiveConfig(m.sandbox);
-      ctx.ui.notify(
-        [
-          `Sandbox: ACTIVE for ${m.label} (${m.sandbox.writable ? "project-writable" : "read-only"})`,
-          "",
-          `Network: ${net.open ? "OPEN for this session (alt+n)" : "filtered (alt+n)"}`,
-          `Network allowed: ${c.network?.allowedDomains?.join(", ") || "(none)"}`,
-          `Session grants: ${net.grants().join(", ") || "(none)"}`,
-          `Deny read:  ${c.filesystem?.denyRead?.join(", ") || "(none)"}`,
-          `Allow write: ${c.filesystem?.allowWrite?.join(", ") || "(none)"}`,
-          `Deny write:  ${c.filesystem?.denyWrite?.join(", ") || "(none)"}`,
-        ].join("\n"),
-        "info",
-      );
-    },
-  });
-
-  // Replace built-in bash so the sandbox can wrap it. Sandboxing is recomputed at
-  // run time from the active mode's profile: disabled (YOLO), approved escapes,
-  // and the degraded fallback run unsandboxed; non-writable modes run read-only.
   pi.registerTool({
-    ...localBash,
-    async execute(id, params, signal, onUpdate, _ctx) {
-      const approved = approvedUnsandboxed.delete(id); // user granted an escape
-      const m = currentMode();
-      const plan = bashExecPlan(m.sandbox.enabled, m.sandbox.writable, sandbox.ready, approved);
-      const ops = plan.sandboxed ? sandbox.bashOps({ readOnly: plan.readOnly }) : null;
-      if (!ops) return localBash.execute(id, params, signal, onUpdate);
-      const sandboxed = createBashTool(root, { operations: ops });
-      return sandboxed.execute(id, params, signal, onUpdate);
+    name: "request_directory_access",
+    label: "Directory access",
+    description:
+      "Request R/O or R/W directory authority from the parent user. Directory grants never bypass path rules.",
+    parameters: Type.Object({
+      directory: Type.String(),
+      access: Type.Union([Type.Literal("read"), Type.Literal("write")]),
+      reason: Type.String(),
+    }),
+    async execute(_id, params, signal, _update, toolCtx) {
+      const active = getOwner();
+      await active.requestDirectory(modelPath(params.directory, toolCtx.cwd), params.access, params.reason, signal);
+      showStatus();
+      return {
+        content: [{ type: "text", text: "Directory request completed; separate path rules still apply." }],
+        details: undefined,
+      };
     },
   });
-
-  // Plan Mode helper: render a written plan file to the user (display-only).
-  pi.registerTool(await createShowPlanTool(root));
-
-  // Model-initiated network grants: ask the user to allow domains outside the
-  // sandbox allowlist (batch-capable, so one prompt covers an install that
-  // needs several hosts). Grants land in the session state the ask callback
-  // reads — no sandbox re-init. Available in every mode; when nothing filters
-  // (YOLO, degraded, /net open) it says so instead of prompting.
+  pi.registerTool({
+    name: "request_path_exception",
+    label: "Path-rule exception",
+    description: "Request explicit exceptions for asking path rules. Hard denies cannot be approved away.",
+    parameters: Type.Object({
+      path: Type.String(),
+      access: Type.Union([Type.Literal("read"), Type.Literal("write")]),
+      reason: Type.String(),
+    }),
+    async execute(_id, params, signal, _update, toolCtx) {
+      await getOwner().authorize([modelPath(params.path, toolCtx.cwd)], params.access, params.reason, signal);
+      showStatus();
+      return { content: [{ type: "text", text: "Path authorization completed." }], details: undefined };
+    },
+  });
   pi.registerTool({
     name: "request_network_access",
-    label: "Request network access",
+    label: "Network access",
     description:
-      "Ask the user to allow bash network access to one or more domains outside the sandbox allowlist. " +
-      "Use it when a blocked host stops you (downloads, installs, API troubleshooting), or to get every needed " +
-      "domain approved up front before a command that hits several hosts. Accepts exact hosts (api.example.com) " +
-      "and subdomain wildcards (*.example.com).",
-    parameters: Type.Object({
-      domains: Type.Array(Type.String({ description: "Domain or subdomain wildcard, e.g. api.example.com or *.example.com" }), {
-        description: "The domains to request access to",
-      }),
-      reason: Type.String({ description: "One short line: why access is needed" }),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
-      const { domains = [], reason = "" } = params as { domains?: string[]; reason?: string };
-      const m = currentMode();
-      if (!m.sandbox.enabled || !sandbox.ready || net.open) {
-        return text("Network is not filtered right now — no grant needed, just run the command.");
+      "Request permission for hostnames reached by governed subprocesses. Explicit denied domains remain denied.",
+    parameters: Type.Object({ domains: Type.Array(Type.String()), reason: Type.String() }),
+    async execute(_id, params, signal) {
+      const active = getOwner();
+      for (const raw of params.domains) {
+        signal?.throwIfAborted();
+        const domain = normalizeDomain(raw);
+        if (!domain || domain.startsWith("*."))
+          throw new Error("Tool requests require an exact hostname; use /net allow for wildcard policy");
+        if (!(await active.network.decide(domain, undefined, active.askNetwork)))
+          throw new Error(`Network access denied: ${domain}`);
       }
-      const normalized = [...new Set(domains.map(normalizeDomain).filter((d): d is string => d !== undefined))];
-      const rejected = normalized.filter(isUnsafeDomain);
-      const modeList = m.sandbox.network?.allowedDomains ?? [];
-      const covered = (d: string) =>
-        modeList.includes(d) || net.grants().includes(d) || (!d.startsWith("*.") && (isHostAllowed(d, modeList) || net.isGranted(d)));
-      const need = normalized.filter((d) => !isUnsafeDomain(d) && !covered(d));
-      const rejectedNote = rejected.length ? ` Rejected as overly broad: ${rejected.join(", ")}.` : "";
-      if (need.length === 0) {
-        return text(
-          rejected.length && normalized.length === rejected.length
-            ? `No grantable domains.${rejectedNote} Use a concrete host or a *.sub wildcard.`
-            : `Already allowed — just run the command.${rejectedNote}`,
-        );
-      }
-      const pctx = ctx ?? uiCtx;
-      if (!pctx?.hasUI) return text("Denied: no interactive user available to approve network access.");
-      const choice = await pctx.ui.select(
-        `Model requests network access to ${need.join(", ")} — ${reason.trim() || "no reason given"}. Allow?`,
-        ["Allow for session", "Allow forever", "Deny"],
-      );
-      if (choice !== "Allow for session" && choice !== "Allow forever") {
-        return text(
-          `Denied by the user: ${need.join(", ")}. Don't retry these hosts — work within the allowlist or ask the user how to proceed.${rejectedNote}`,
-        );
-      }
-      net.grant(need);
-      let saved = "";
-      if (choice === "Allow forever") {
-        try {
-          const file = persistModeDomains(getAgentDir(), modeName, need);
-          config = loadModeConfig(pctx.cwd, getAgentDir(), (msg) => pctx.ui.notify(msg, "warning"), isTrustedProject(pctx));
-          saved = ` (saved permanently for ${currentMode().label})`;
-          pctx.ui.notify(`permission-mode: always allow ${need.join(", ")} in ${currentMode().label} — saved to ${file}`, "info");
-        } catch (e) {
-          pctx.ui.notify(`permission-mode: could not save domains: ${e}`, "error");
-        }
-      }
-      return text(`Granted${saved}: ${need.join(", ")}. Retry the blocked command now.${rejectedNote}`);
+      showStatus();
+      return { content: [{ type: "text", text: "Network access approved." }], details: undefined };
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
-    uiCtx = ctx;
-    config = loadModeConfig(
-      ctx.cwd,
-      getAgentDir(),
-      (m) => (ctx.hasUI ? ctx.ui.notify(m, "warning") : console.error(m)),
-      isTrustedProject(ctx),
-    );
-    if (!notifiedProjectGrants && isTrustedProject(ctx) && !isActiveAgentChild(ctx)) {
-      const grants = projectGrantCount(ctx.cwd, getAgentDir());
-      if (grants > 0) {
-        notifiedProjectGrants = true;
-        if (ctx.hasUI) ctx.ui.notify(`permission-mode: honoring ${grants} project grants from ${CONFIG_DIR_NAME}/permission-mode.json`, "info");
-      }
-    }
-    if (!config.modes[modeName]) modeName = config.defaultMode;
-    // Resolve the start mode BEFORE init so the sandbox initializes with the
-    // right profile, then setMode reconciles status (applyProfile is a no-op).
-    const picked = pickMode(ctx, true);
-    if (followsEnvironment === undefined) {
-      followsEnvironment = picked.source === "fallback" || (picked.source === "env" && isActiveAgentChild(ctx));
-    }
-    modeName = picked.name;
-    await sandbox.init({
-      cwd: ctx.cwd,
-      noSandbox: pi.getFlag("no-sandbox") === true,
-      hasUI: ctx.hasUI,
-      notify: (m) => (ctx.hasUI ? ctx.ui.notify(m, "warning") : console.warn(m)),
-      profile: currentMode().sandbox,
-      // Live network gate: the proxy consults session state for every host
-      // outside the allowlist; unknown hosts prompt via askNetHost.
-      askHost: (host, port) => net.decide(host, port, askNetHost),
-      drainBlockedHosts: () => net.drainBlocked(),
-    });
-    await setMode(picked.name, ctx, {
-      persist: false,
-      viaFallback: picked.fallback,
-      announce: false,
-      forwardEnv: picked.source !== "env",
-    });
-  });
-  pi.on("session_tree", async (_event, ctx) => {
-    uiCtx = ctx;
-    // A root session restores branch-persisted modes but never adopts a value
-    // changed by an in-process child. Environment followers keep tracking the
-    // parent across tree navigation.
-    const picked = pickMode(ctx, false, followsEnvironment === true);
-    await setMode(picked.name, ctx, {
-      persist: false,
-      viaFallback: picked.fallback,
-      announce: false,
-      forwardEnv: picked.source !== "env",
-    });
-  });
-  pi.on("session_shutdown", async () => {
-    approvals.clearAll(); // session-scoped grants don't outlive the session
-    net.clear(); // network grants/denies and the open toggle are session-scoped too
-    await sandbox.reset();
-  });
-
-  // Drop any unconsumed escape grant once the tool call resolves.
-  pi.on("tool_execution_end", async (event) => {
-    approvedUnsandboxed.delete(event.toolCallId);
-  });
-
-  // Inject the sandbox-awareness section and the active mode's system prompt
-  // (if any). The handler runs each turn and reads the live mode + sandbox
-  // state, so it auto-updates when the mode changes. The "@plan" sentinel
-  // resolves to the date-stamped Plan-mode prompt. A mode picked as the
-  // implicit headless fallback keeps the FACTUAL awareness section (boundary
-  // knowledge helps a worker avoid failing commands) but skips the mode's
-  // STEERING systemPrompt, which would misdirect a headless worker.
-  pi.on("before_agent_start", async (event, ctx) => {
-    await reconcileModeFromEnvironment(ctx);
-    applyToolVisibility(); // keep hidden tools hidden as the tool set evolves
-    const m = currentMode();
-    const parts: string[] = [];
-    const effectiveFilesystem = sandbox.effectiveConfig(m.sandbox).filesystem;
-    const awarenessMode = {
-      ...m,
-      sandbox: {
-        ...m.sandbox,
-        allowWrite: effectiveFilesystem?.allowWrite,
-        denyWrite: effectiveFilesystem?.denyWrite,
-        denyRead: effectiveFilesystem?.denyRead,
-      },
-    };
-    const aware = sandboxAwarenessPrompt(awarenessMode, {
-      active: sandbox.ready && !sandbox.disabled,
-      reason: sandbox.disabled ? "disabled via --no-sandbox" : sandbox.warn,
-      networkOpen: net.open,
-      sessionDomains: net.grants(),
-    });
-    if (aware) parts.push(aware);
-    const sp = m.systemPrompt;
-    if (sp && !fallbackMode) {
-      parts.push(sp === PLAN_PROMPT_SENTINEL ? planModeSystemPrompt(new Date().toISOString().slice(0, 10)) : sp);
-    }
-    if (parts.length === 0) return undefined;
-    return { systemPrompt: [event.systemPrompt, ...parts].join("\n\n") };
-  });
-
-  // Skill gating: skills aren't tools — they're invoked via `/skill:<name>` text,
-  // so intercept the input before expansion and resolve the `skill` surface.
-  pi.on("input", async (event, ctx) => {
-    await reconcileModeFromEnvironment(ctx);
-    const match = /^\/skill:([\w-]+)/.exec(event.text.trim());
-    if (!match) return undefined;
-    const name = match[1];
-    const action = decide(currentMode(), "skill", name);
-    if (action === "deny") {
-      if (ctx.hasUI) ctx.ui.notify(`Skill "${name}" blocked in ${currentMode().label}`, "warning");
-      return { action: "handled" as const };
-    }
-    if (
-      action === "ask" &&
-      !(await promptAllow(ctx, "skill", name, `Skill "${name}" — first use in ${currentMode().label}; allow?`, learnForever(ctx, "skill", name)))
-    ) {
-      return { action: "handled" as const };
-    }
-    return undefined; // allow → continue to expansion
-  });
-
-  pi.on("tool_call", async (event, ctx) => {
-    uiCtx = ctx;
-    await reconcileModeFromEnvironment(ctx);
-    const { toolName } = event;
-    const m = currentMode();
-    // `input` is a discriminated union across tools; view it loosely (custom
-    // tools surface as Record<string, unknown> anyway) and guard each field.
-    const input = event.input as Record<string, unknown>;
-    const inPath = typeof input.path === "string" ? input.path : undefined;
-    // Pi's grep/find/ls tools pass `path || "."` to resolveToCwd; required-path
-    // tools remain untouched when their schema input is absent or invalid.
-    const filePath = inPath ?? (OPTIONAL_PATH_FILE_TOOLS.has(toolName) ? "." : undefined);
-    // Direct file tools execute relative to the current session context. Keep
-    // normalization, boundary checks, and protected-write checks on that same
-    // cwd; `root` remains the startup cwd used by Bash and its sandbox routing.
-    const toolCwd = ctx.cwd;
-    const normalizedFileTarget = FILE_TOOL_SURFACE[toolName] && filePath !== undefined
-      ? normalizePiTarget(filePath, toolCwd)
-      : undefined;
-
-    // Hard backstop: never write to protected paths (file tools aren't sandboxed),
-    // unless the mode explicitly trusts everything (YOLO). This initial snapshot
-    // is bound to authorization and later revalidated immediately before Pi sees
-    // the rewritten path.
-    if (
-      !m.bypassProtectedPaths &&
-      (toolName === "edit" || toolName === "write") &&
-      inPath !== undefined &&
-      normalizedFileTarget &&
-      isProtectedNormalizedWrite(toolCwd, normalizedFileTarget)
-    ) {
-      if (ctx.hasUI) ctx.ui.notify(`Blocked write to protected path: ${inPath}`, "warning");
-      return { block: true, reason: `Path "${inPath}" is protected` };
-    }
-
-    // Bash.
-    if (toolName === "bash") {
-      const command = String(input.command ?? "");
-      const analysis = await analyzeBash(command, root);
-      const entries = analysis.commands.length > 0
-        ? analysis.commands.map((candidate) => {
-            const patterns = bashRulePatterns(candidate.name, candidate.args);
-            const assignmentPrefix = candidate.assignments?.map((assignment) => assignment.source).join(" ");
-            return {
-              ...patterns,
-              displayCommand: [assignmentPrefix, patterns.command].filter(Boolean).join(" "),
-              name: candidate.name || "environment assignment",
-              args: candidate.args,
-              decision: decideBashCommand(
-                m,
-                candidate.name,
-                candidate.args,
-                candidate.assignments?.map((assignment) => assignment.value),
-              ),
-            };
-          })
-        : [{
-            ...bashRulePatterns(command, []),
-            displayCommand: command,
-            name: "bash",
-            args: [],
-            decision: decideBashText(m, command),
-          }];
-      const denied = entries.find((entry) => aggregateBashDecision(entry.decision) === "deny");
-      if (denied) return { block: true, reason: `bash command blocked by ${m.label}` };
-
-      const trusted = isTrustedProject(ctx);
-      const grants = (entry: (typeof entries)[number]): PermissionGrant[] => [
-        ...(bashGrantable(m, entry.command, "global") ? m.permissionGrants ?? [] : []),
-        ...(trusted ? m.trustedProjectPermissionGrants ?? [] : []),
-        ...approvals.grants(modeName),
-      ];
-      const hasBashGrant = (entry: (typeof entries)[number]): boolean => {
-        const requirement = buildCommandRequirement(entry.command, entry.decision.bashAction);
-        return requirement ? evaluateRequirements([requirement], grants(entry)).pending.length === 0 : true;
-      };
-
-      for (const entry of entries) {
-        if (entry.decision.pathAction !== "ask") continue;
-        if (!ctx.hasUI) return { block: true, reason: USER_DENIED_COMMAND_REASON };
-        const choice = await ctx.ui.select(`Path policy requires confirmation\n\nCommand: ${entry.displayCommand}`, [ALLOW_ONCE, DENY]);
-        if (choice !== ALLOW_ONCE) return { block: true, reason: USER_DENIED_COMMAND_REASON };
-      }
-
-      const parserSafeguard = analysis.unparsed || analysis.usedFallback || analysis.dynamic;
-      const safeguardNeeded = !m.bypassProtectedPaths && Boolean(
-        analysis.outsideReason || parserSafeguard || (m.sandbox.enabled && !sandbox.ready),
-      );
-      if (safeguardNeeded) {
-        const subject = bashSubject([...new Set(entries.map((entry) => entry.name))]);
-        const baseGate = bashGate("allow", analysis.outsideReason, m.sandbox.enabled, sandbox.ready, subject);
-        const qualifier = analysis.unparsed
-          ? "script could not be fully parsed"
-          : analysis.usedFallback
-            ? "parser unavailable"
-            : analysis.dynamic
-              ? "dynamically interpreted command"
-              : undefined;
-        const title = baseGate.title || `Allow ${subject}?${analysis.outsideReason ? ` (${analysis.outsideReason})` : ""}`;
-        if (!ctx.hasUI) return { block: true, reason: baseGate.reason || "bash safeguard requires approval" };
-        const choice = await ctx.ui.select(
-          bashPromptTitle(qualifier ? `${title} (${qualifier})` : title, entries.map((entry) => entry.displayCommand)),
-          [ALLOW_ONCE, DENY],
-        );
-        if (choice !== ALLOW_ONCE) return { block: true, reason: USER_DENIED_COMMAND_REASON };
-        if (analysis.outsideReason) approvedUnsandboxed.add(event.toolCallId);
-      }
-
-      const grantable = !analysis.outsideReason && !analysis.unparsed && !analysis.usedFallback && !analysis.dynamic;
-      for (const entry of entries) {
-        if (entry.decision.bashAction !== "ask" || hasBashGrant(entry)) continue;
-        const gate = bashGate("ask", undefined, m.sandbox.enabled, true, bashSubject([entry.name]));
-        const patterns = bashRulePatterns(entry.name, entry.args);
-        if (!grantable) {
-          if (!ctx.hasUI) return { block: true, reason: gate.reason };
-          const choice = await ctx.ui.select(bashPromptTitle(gate.title, [entry.displayCommand]), [ALLOW_ONCE, DENY]);
-          if (choice !== ALLOW_ONCE) return { block: true, reason: USER_DENIED_COMMAND_REASON };
-          continue;
-        }
-
-        const projectEligible = trusted;
-        const globalEligible = bashGrantable(m, entry.command, "global");
-        const persistentChoices: Array<{ label: string; project: boolean; grants: PermissionGrant[] }> = [];
-        const addChoices = (pair: string[], project: boolean, prefix: string) => {
-          const candidateGrants = pair.map((pattern) => ({ permission: "bash" as const, pattern }));
-          const identity = `${project ? "project" : "global"}:${pair.join("\u0000")}`;
-          if (persistentChoices.some((candidate) => `${candidate.project ? "project" : "global"}:${candidate.grants.map((grant) => grant.permission === "bash" ? grant.pattern : "").join("\u0000")}` === identity)) return;
-          persistentChoices.push({ label: `${prefix}: ${pair[1] ?? pair[0]}`, project, grants: candidateGrants });
-        };
-        if (projectEligible) addChoices(patterns.narrow, true, "Remember for this project");
-        if (globalEligible) addChoices(patterns.narrow, false, "Remember globally");
-        if (patterns.broad.join("\u0000") !== patterns.narrow.join("\u0000")) {
-          if (projectEligible) addChoices(patterns.broad, true, "Remember for this project");
-          if (globalEligible) addChoices(patterns.broad, false, "Remember globally");
-        }
-        if (!ctx.hasUI) return { block: true, reason: gate.reason };
-        const choice = await ctx.ui.select(
-          bashPromptTitle(gate.title, [entry.displayCommand]),
-          [ALLOW_ONCE, ALLOW_SESSION, ...persistentChoices.map((candidate) => candidate.label), DENY],
-        );
-        if (choice === ALLOW_SESSION) {
-          for (const pattern of patterns.narrow) approvals.rememberGrant(modeName, { permission: "bash", pattern });
-          continue;
-        }
-        const selected = persistentChoices.find((candidate) => candidate.label === choice);
-        if (!selected) {
-          if (choice !== ALLOW_ONCE) return { block: true, reason: USER_DENIED_COMMAND_REASON };
-          continue;
-        }
-        try {
-          const file = selected.project
-            ? persistProjectPermissionGrants(ctx.cwd, modeName, selected.grants)
-            : persistPermissionGrants(getAgentDir(), modeName, selected.grants);
-          for (const grant of selected.grants) approvals.rememberGrant(modeName, grant);
-          config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), trusted);
-          ctx.ui.notify(`permission-mode: remembered Bash grant — saved to ${file}`, "info");
-        } catch (error) {
-          ctx.ui.notify(`permission-mode: could not save Bash grant: ${error}`, "error");
-          return { block: true, reason: gate.reason };
-        }
-      }
-      return undefined;
-    }
-
-    // File tools (read/edit/write/ls/grep/find).
-    const surface = FILE_TOOL_SURFACE[toolName];
-    if (surface && filePath !== undefined) {
-      const requestedTarget = normalizedFileTarget!;
-      const target = toolName === "read" ? resolvePiReadTarget(filePath, toolCwd) : requestedTarget;
-      const readFallbackUsed =
-        target.displayTarget !== requestedTarget.displayTarget || target.canonicalTarget !== requestedTarget.canonicalTarget;
-      const globalPolicyTargets = [
-        ...new Set([
-          requestedTarget.displayTarget,
-          requestedTarget.canonicalTarget,
-          target.displayTarget,
-          target.canonicalTarget,
-        ]),
-      ];
-      const outside = isCanonicalTargetOutside(toolCwd, target.canonicalTarget);
-      const requestedOutside = isCanonicalTargetOutside(toolCwd, requestedTarget.canonicalTarget);
-      const requirements = buildFileRequirements(
-        m,
-        surface as Exclude<PathGrantPermission, "path" | "external_directory">,
-        target,
-        outside,
-      );
-      const requestedRequirements = readFallbackUsed
-        ? buildFileRequirements(
-            m,
-            surface as Exclude<PathGrantPermission, "path" | "external_directory">,
-            requestedTarget,
-            requestedOutside,
-          )
-        : [];
-      const trusted = isTrustedProject(ctx);
-      // A fallback target is the one Pi will execute. Check the original
-      // spelling for denies too, but bind any resulting approval to the actual
-      // candidate so a grant cannot authorize a different path.
-      const requestedPolicy = readFallbackUsed
-        ? evaluateRequirements(requestedRequirements, [])
-        : { denied: [], pending: [] };
-      const denied = evaluateRequirements([...requirements, ...requestedRequirements], []).denied;
-      if (requestedPolicy.denied.length > 0 || denied.length > 0) {
-        if ((surface === "edit" || surface === "write") && !m.sandbox.writable) {
-          if (ctx.hasUI) ctx.ui.notify(`${m.label} allows editing Markdown files only: ${filePath}`, "warning");
-          return { block: true, reason: `${m.label} allows editing Markdown files only` };
-        }
-        return { block: true, reason: `Path "${filePath}" is blocked by ${m.label}` };
-      }
-      const pendingPermissions = new Set<PathGrantPermission>(
-        requestedPolicy.pending.flatMap((pending) => pending.kind === "path" ? [pending.permission] : []),
-      );
-      const boundRequirements = requirements.map((requirement) =>
-        requirement.kind === "path"
-          ? {
-              ...requirement,
-              displayTarget: filePath,
-              ...(pendingPermissions.has(requirement.permission) ? { action: "ask" as const } : {}),
-            }
-          : requirement,
-      );
-      for (const permission of pendingPermissions) {
-        if (!boundRequirements.some((requirement) => requirement.kind === "path" && requirement.permission === permission)) {
-          boundRequirements.push({
-            kind: "path",
-            permission,
-            displayTarget: filePath,
-            canonicalTarget: target.canonicalTarget,
-            action: "ask",
-          });
-        }
-      }
-      const grantsFor = (permission: PathGrantPermission): PermissionGrant[] => {
-        const globalEligible = projectLayerAllowsGlobal(m, [permission], globalPolicyTargets);
-        return [
-          ...(globalEligible ? m.permissionGrants ?? [] : []),
-          ...(trusted ? m.trustedProjectPermissionGrants ?? [] : []),
-          ...approvals.grants(modeName),
+  pi.registerCommand("perm", {
+    description: "Inspect/select filesystem profiles; grant, revoke, clear, init, or reset permission state",
+    handler: async (args, commandCtx) => {
+      ctx = commandCtx;
+      requireRoot();
+      const [action, ...rest] = args.trim().split(/\s+/);
+      if (action === "reset" || action === "init") {
+        if (!ctx.hasUI) throw new Error("Permission setup requires user acknowledgement in the UI");
+        if (
+          !(await ctx.ui.confirm(
+            "Initialize permission policy v2?",
+            "This is a clean schema break: command/per-tool grants and Plan Mode are not migrated. Existing global/project policy and state files are backed up. New defaults use project filesystem access and restricted networking.",
+          ))
+        )
+          return;
+        const resetting = owner;
+        resetting?.block("Policy reset is draining governed work; /reload required");
+        await resetting?.drain();
+        if (resetting) await runtime.shutdown(resetting.id);
+        if (owner !== resetting) throw new Error("Parent policy changed during reset; retry explicitly");
+        const directory = path.join(agentDir, "permission-mode");
+        mkdirSync(directory, { recursive: true, mode: 0o700 });
+        if (bindPath(directory).canonical !== directory) throw new Error("Permission setup does not follow directory symlinks");
+        chmodSync(directory, 0o700);
+        const files = [
+          path.join(directory, "permission-mode.json"),
+          path.join(directory, "state-v2.json"),
+          path.join(ctx.cwd, ".pi", "permission-mode.json"),
         ];
-      };
-      const pendingRequirements = boundRequirements.flatMap((requirement) => {
-        if (requirement.kind !== "path") return [];
-        return evaluateRequirements([requirement], grantsFor(requirement.permission)).pending;
-      });
-      for (const pending of pendingRequirements) {
-        if (pending.kind !== "path") continue;
-        const permission = pending.permission;
-        const projectEligible = trusted;
-        const globalEligible = projectLayerAllowsGlobal(m, [permission], globalPolicyTargets);
-        const prompt = await promptOutsideFileApproval(ctx, {
-          toolName,
-          permission,
-          requested: pending.displayTarget,
-          canonicalTarget: pending.canonicalTarget,
-          cwd: ctx.cwd,
-          projectEligible,
-          globalEligible,
-        });
-        if (prompt.decision === "deny") return { block: true, reason: `Path "${filePath}" was not approved` };
-        if (prompt.decision === "once") continue;
-        const grant: PermissionGrant = { permission, scope: prompt.scope };
-        if (prompt.decision === "session") {
-          approvals.rememberGrant(modeName, grant);
-          continue;
+        for (const file of files) {
+          const binding = bindPath(file);
+          if (binding.canonical !== file || (!binding.missing.length && !lstatSync(file).isFile())) throw new Error(`Permission reset will not copy or replace a symlink or special file: ${file}`);
         }
+        const suffix = `.backup-${randomUUID()}`;
+        const lock = path.join(directory, ".authority.lock");
+        const lockFd = openSync(lock, "wx", 0o600);
         try {
-          if (prompt.decision === "project") {
-            if (!projectEligible) return { block: true, reason: `Path "${filePath}" was not approved` };
-            persistProjectPermissionGrants(ctx.cwd, modeName, [grant]);
-          } else {
-            if (!globalEligible) return { block: true, reason: `Path "${filePath}" was not approved` };
-            persistPermissionGrants(getAgentDir(), modeName, [grant]);
-          }
-          config = loadModeConfig(ctx.cwd, getAgentDir(), (msg) => ctx.ui.notify(msg, "warning"), isTrustedProject(ctx));
-          approvals.rememberGrant(modeName, grant);
+        const previous = files.map((file) => (existsSync(file) ? readFileSync(file) : undefined));
+        const temporary = path.join(directory, `.config-${randomUUID()}.tmp`);
+        try {
+          for (let i = 0; i < files.length; i++) if (previous[i]) copyFileSync(files[i]!, files[i]! + suffix, 1);
+          writeFileSync(temporary, `${JSON.stringify(defaultConfig(agentDir, homedir()), null, 2)}\n`, {
+            mode: 0o600,
+            flag: "wx",
+          });
+          renameSync(temporary, files[0]!);
+          for (const file of files.slice(1)) if (existsSync(file)) rmSync(file);
+          chmodSync(directory, 0o700);
         } catch (error) {
-          ctx.ui.notify(`permission-mode: could not save permission grant: ${error}`, "error");
-          return { block: true, reason: `Path "${filePath}" was not approved` };
+          for (let i = 0; i < files.length; i++) {
+            if (previous[i]) writeFileSync(files[i]!, previous[i]!);
+            else if (existsSync(files[i]!)) rmSync(files[i]!);
+          }
+          if (existsSync(temporary)) rmSync(temporary);
+          throw error;
         }
-      }
-      if (surface === "edit" || surface === "write") {
-        // Prompts and persistence can yield while an initially absent component
-        // is replaced by a symlink. Re-resolve the frozen absolute target itself,
-        // never the model's spelling, so a changed spelling cannot gain authority.
-        const finalCanonicalTarget = canonicalizePath(target.canonicalTarget);
-        const finalTarget = {
-          displayTarget: target.canonicalTarget,
-          canonicalTarget: finalCanonicalTarget,
-        };
-        const finalTargetProtected = isProtectedNormalizedWrite(toolCwd, finalTarget);
-        if (finalCanonicalTarget !== target.canonicalTarget) {
-          const message = `Blocked ${toolName}: authorized path changed before execution: ${target.canonicalTarget} now resolves to ${finalCanonicalTarget}`;
-          if (ctx.hasUI) ctx.ui.notify(message, "warning");
-          return { block: true, reason: `Path "${filePath}" changed after authorization; refusing ${toolName}` };
+        if (resetting) {
+          resetting.resetPending = true;
+          resetting.block("User reset policy; /reload required");
         }
-        // Defense in depth on the final filesystem snapshot. The equality check
-        // above is intentionally separate: a changed target is never authorized,
-        // even when both old and new paths are otherwise permitted.
-        if (!m.bypassProtectedPaths && finalTargetProtected) {
-          if (ctx.hasUI) ctx.ui.notify(`Blocked write to protected path: ${target.canonicalTarget}`, "warning");
-          return { block: true, reason: `Path "${filePath}" is protected` };
-        }
+        } finally { closeSync(lockFd); rmSync(lock); }
+        ctx.ui.notify("Version 2 policy initialized. Run /reload. Old files are preserved as .backup-*.", "info");
+        return;
       }
-      // Pi documents tool-call input as mutable and executes this same object.
-      // Freeze execution to the canonical target that all approvals authorized.
-      input.path = target.canonicalTarget;
-      return undefined;
-    }
+      const active = getOwner();
+      if (!action || action === "status" || action === "grants") ctx.ui.notify(permissionAwareness(active), "info");
+      else if (action === "clear") active.revoke();
+      else if (action === "revoke") {
+        if (!rest[0]) throw new Error("Usage: /perm revoke <approval-id>");
+        active.revoke(rest[0]);
+      } else if (action === "grant") {
+        const access = rest.shift();
+        if (access !== "read" && access !== "write") throw new Error("Usage: /perm grant read|write <directory>");
+        await active.requestDirectory(modelPath(rest.join(" "), ctx.cwd), access, "User directory request");
+      } else if (action === "allow")
+        throw new Error("Command-pattern approvals were removed. Use /perm grant read|write <directory>.");
+      else active.select(action);
+      showStatus();
+    },
+  });
+  pi.registerCommand("net", {
+    description: "Inspect/toggle networking; /net allow <domain> or /net deny <domain>",
+    handler: async (args, commandCtx) => {
+      ctx = commandCtx;
+      requireRoot();
+      const active = getOwner();
+      const [action, ...domains] = args.trim().split(/\s+/);
+      if (!action) ctx.ui.notify(JSON.stringify(active.network.snapshot(), null, 2), "info");
+      else if (action === "open" || action === "restricted" || action === "toggle")
+        active.network.change({
+          restricted: action === "toggle" ? !active.network.snapshot().restricted : action === "restricted",
+        });
+      else if (action === "allow" || action === "deny") {
+        const normalized = domains.map((d) => {
+          const domain = normalizeDomain(d);
+          if (!domain) throw new Error(`Invalid domain: ${d}`);
+          return domain;
+        });
+        if (action === "allow") active.network.grant(normalized);
+        else
+          active.network.change({
+            deniedDomains: [...new Set([...active.network.snapshot().deniedDomains, ...normalized])],
+          });
+      } else throw new Error("Usage: /net [open|restricted|toggle|allow <domain>|deny <domain>]");
+      showStatus();
+    },
+  });
+  pi.registerShortcut("shift+tab", {
+    description: "Cycle filesystem profiles",
+    handler: async (_ctx) => {
+      requireRoot();
+      const active = getOwner();
+      const order = active.config.cycleOrder;
+      active.select(order[(order.indexOf(active.snapshot().mode) + 1) % order.length]!);
+      showStatus();
+    },
+  });
+  pi.registerShortcut("alt+n", {
+    description: "Toggle subprocess network policy",
+    handler: async () => {
+      requireRoot();
+      const active = getOwner();
+      active.network.change({ restricted: !active.network.snapshot().restricted });
+      showStatus();
+    },
+  });
 
-    // web_search.
-    if (toolName === "web_search") {
-      const action = decide(m, "web_search", String(input.query ?? "(empty)"));
-      if (action === "deny") return { block: true, reason: `web search blocked by ${m.label}` };
-      // Session approval is surface-wide ("allow web search this session").
-      if (action === "ask" && !(await promptAllow(ctx, "web_search", "*", "Allow web search?"))) {
-        return { block: true, reason: "web search blocked" };
+  const stopBridge = pi.events.on("permission:attach:v2", (raw: unknown) => {
+    const request = raw as PermissionBridgeRequest;
+    if (!ctx || request.version !== 2 || request.parentSessionId !== ctx.sessionManager.getSessionId()) return;
+    try {
+      const active = getOwner();
+      const release = active.attachChild(request.cancel);
+      let bound = false;
+      request.respond({
+        factory: (childPi) => {
+          permissionExtension(childPi, { owner: active, release });
+          childPi.on("session_start", () => {
+            active.snapshot();
+            bound = true;
+          });
+        },
+        verify: () => {
+          active.snapshot();
+          if (!bound) throw new Error("Required child permission hooks did not bind");
+        },
+        resume: (cancel) => active.attachChild(cancel),
+        release,
+      });
+    } catch (error) {
+      request.reject(String(error));
+    }
+  });
+  const stopPresence = pi.events.on("permission:present:v2", (raw: unknown) => {
+    const request = raw as { parentSessionId: string; respond(): void };
+    if (ctx && request.parentSessionId === ctx.sessionManager.getSessionId()) request.respond();
+  });
+
+  pi.on("session_start", async (event, newCtx) => {
+    ctx = newCtx;
+    ownerSessionId = ctx.sessionManager.getSessionId();
+    if (inherited) {
+      owner = inherited.owner;
+      owner.snapshot();
+      showStatus();
+      return;
+    }
+    try {
+      const prior = event.reason === "reload" ? retained.get(key()) : undefined;
+      const loaded = loadConfig(agentDir, prior?.root ?? ctx.cwd, homedir());
+      if (prior && !prior.resetPending) {
+        owner = prior;
+        prior.ask = approvalUI(context);
+        prior.askNetwork = networkUI(context, () => prior.approvalSignal);
+        await prior.reload(loaded.global, loaded.project, resolution);
+      } else {
+        const rootPath = bindPath(path.resolve(ctx.cwd));
+        const sessionFile = ctx.sessionManager.getSessionFile();
+        const binding: SessionBinding | undefined = sessionFile
+          ? {
+              id: ctx.sessionManager.getSessionId(),
+              file: bindPath(path.resolve(sessionFile)).canonical,
+              cwd: rootPath.canonical,
+            }
+          : undefined;
+        const store = new PermissionStore(agentDir);
+        const restored = store.load(binding, rootPath.canonical);
+        const previous = restored.session?.catalog ?? restored.project.catalog;
+        const root = prior?.rootIdentity ??
+          restored.session?.catalog.root ?? { family: randomUUID(), binding: rootPath };
+        const global = resolveCatalog(loaded.global, root, resolution, previous?.base ?? previous);
+        const catalog = tightenCatalog(global, loaded.project, resolution, previous);
+        const grants = [
+          ...(restored.session?.grants.filter((g) => g.lifetime === "session") ?? []),
+          ...restored.project.grants,
+        ];
+        const exceptions = [
+          ...(restored.session?.exceptions.filter((e) => e.lifetime === "session") ?? []),
+          ...restored.project.exceptions,
+        ];
+        owner = new PermissionOwner(catalog, {
+          store,
+          restored: restored.session,
+          grants,
+          exceptions,
+          ask: approvalUI(context),
+          askNetwork: networkUI(context, () => owner?.approvalSignal),
+        });
       }
-      return undefined;
+      const flag = pi.getFlag("perm");
+      if (typeof flag === "string" && flag) getOwner().select(flag);
+      startupError = undefined;
+      retainedKey = key();
+      retained.set(retainedKey, owner);
+    } catch (error) {
+      startupError = String(error);
+      owner?.block(startupError);
+      ctx.ui.notify(
+        `${startupError}\nGoverned operations are blocked. Use /perm reset for legacy policy, or repair the configuration and /reload.`,
+        "error",
+      );
     }
-
-    // Custom / extension tools (incl. any MCP-as-tool): gate by tool name. An
-    // unknown tool prompts first-use (allow once/session/forever/deny).
-    if (!BUILTIN_HANDLED.has(toolName)) {
-      const action = decide(m, "tool", toolName);
-      if (action === "deny") return { block: true, reason: `Tool "${toolName}" blocked by ${m.label}` };
-      if (
-        action === "ask" &&
-        !(await promptAllow(ctx, "tool", toolName, `Tool "${toolName}" — first use in ${m.label}; allow?`, learnForever(ctx, "tool", toolName)))
-      ) {
-        return {
-          block: true,
-          reason: ctx.hasUI
-            ? userDeniedToolReason(toolName)
-            : `Tool "${toolName}" requires approval, but no interactive user is available.`,
-        };
+    showStatus();
+  });
+  pi.on("before_agent_start", () => ({
+    systemPrompt: undefined,
+    message: {
+      customType: "permission-scope",
+      content: owner ? permissionAwareness(owner) : `Filesystem policy unavailable: ${startupError}`,
+      display: false,
+    },
+  }));
+  pi.on("tool_call", (event) => {
+    if (["read", "write", "edit", "grep", "find", "ls", "bash", "powershell"].includes(event.toolName)) {
+      try {
+        getOwner().snapshot();
+      } catch (error) {
+        return { block: true, reason: String(error) };
       }
     }
-
     return undefined;
+  });
+  pi.on("user_bash", () => ({
+    operations: {
+      exec: async (command, cwd, options) => {
+        const active = getOwner();
+        const accesses = await discoverShellAccess(command, cwd);
+        for (const request of accesses)
+          await active.authorize([request.path], request.access, request.source, options.signal);
+        return active.run([path.resolve(cwd)], "read", "User shell", options.signal, async (snapshot) => {
+          const family = {
+            id: active.id,
+            network: () => active.network.snapshot(),
+            reportEnforcement: (error?: string) => { active.enforcementError = error; showStatus(); },
+            decideHost: (host: string, port?: number) =>
+              active.reason ? Promise.resolve(false) : active.network.decide(host, port, active.askNetwork),
+          };
+          return runtime
+            .operations(snapshot, family, () => active.check(snapshot.revision), pi.getFlag("no-sandbox") === true)
+            .exec(command, cwd, options);
+        });
+      },
+    },
+  }));
+  pi.on("session_shutdown", async (event) => {
+    stopBridge();
+    // Keep a lightweight tombstone so a stale parent context cannot launch an ungoverned child.
+    const sessionId = ownerSessionId;
+    stopPresence();
+    if (sessionId)
+      pi.events.on("permission:present:v2", (raw: unknown) => {
+        const request = raw as { parentSessionId: string; respond(): void };
+        if (request.parentSessionId === sessionId) request.respond();
+      });
+    if (inherited) {
+      inherited.release();
+      return;
+    }
+    if (!owner) return;
+    if (event.reason !== "reload" && retainedKey) retained.delete(retainedKey);
+    owner.block("Session is shutting down");
+    await owner.drain();
+    await runtime.shutdown(owner.id);
   });
 }

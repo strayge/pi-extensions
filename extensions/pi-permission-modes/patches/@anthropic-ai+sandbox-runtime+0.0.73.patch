@@ -1,60 +1,144 @@
-diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
-index c3b6bd3..c65ba23 100644
---- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
-+++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
-@@ -1,5 +1,6 @@
- import { quote } from '../utils/shell-quote.js';
- import { spawn } from 'child_process';
-+import * as fs from 'fs';
- import * as path from 'path';
- import { logForDebugging } from '../utils/debug.js';
- import { whichSync } from '../utils/which.js';
-@@ -22,13 +23,24 @@ export function macGetMandatoryDenyPatterns(allowGitConfig = false) {
-         denyPaths.push(path.resolve(cwd, dirName));
-         denyPaths.push(`**/${dirName}/**`);
+diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-manager.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-manager.js
+--- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-manager.js
++++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-manager.js
+@@ -1168,6 +1168,7 @@
+     // its `disabled` (defaulting to false) wins outright. A global
+     // disabled=true must not silently discard a per-call tightening that
+     // omits the new key.
++    const explicitPolicy = customConfig?.filesystem?.explicitPolicy;
+     const fsDisabled = customConfig?.filesystem !== undefined
+         ? (customConfig.filesystem.disabled ?? false)
+         : (config?.filesystem.disabled ?? false);
+@@ -1198,7 +1199,8 @@
+             config?.filesystem.allowWrite ??
+             []);
+         writeConfig = {
+-            allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
++            allowOnly: [...(explicitPolicy ? [] : getDefaultWritePaths()), ...userAllowWrite],
++            explicitPolicy,
+             denyWithinAllow: stripWriteGlobs(customConfig?.filesystem?.denyWrite ??
+                 config?.filesystem.denyWrite ??
+                 []),
+@@ -1236,6 +1238,7 @@
+         readConfig = {
+             denyOnly: expandedDenyRead,
+             allowWithinDeny: expandedAllowRead,
++            explicitPolicy,
+         };
      }
--    // Git hooks are always blocked for security
--    denyPaths.push(path.resolve(cwd, '.git/hooks'));
--    denyPaths.push('**/.git/hooks/**');
--    // Git config - conditionally blocked based on allowGitConfig setting
--    if (!allowGitConfig) {
--        denyPaths.push(path.resolve(cwd, '.git/config'));
--        denyPaths.push('**/.git/config');
-+    const rootGitPath = path.resolve(cwd, '.git');
-+    let rootGitIsFile = false;
-+    try {
-+        const stat = fs.lstatSync(rootGitPath);
-+        rootGitIsFile = stat.isFile() && stat.size > 0;
-+    }
-+    catch {
-+        // An absent .git still gets the mandatory patterns so it cannot be created later.
-+    }
-+    // A gitfile's resolved common metadata is intentionally writable. Normal
-+    // clones retain both root and nested-repository hook/config protection.
-+    if (!rootGitIsFile) {
-+        denyPaths.push(path.resolve(rootGitPath, 'hooks'));
-+        denyPaths.push('**/.git/hooks/**');
-+        if (!allowGitConfig) {
-+            denyPaths.push(path.resolve(rootGitPath, 'config'));
-+            denyPaths.push('**/.git/config');
+     // Check if network config is specified - this determines if we need network restrictions
+@@ -1243,8 +1246,8 @@
+     // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
+     // 2. OR config has network.allowedDomains defined (even if empty array = block all)
+     // An empty allowedDomains array means "no domains allowed" = block all network access
+-    const hasNetworkConfig = customConfig?.network?.allowedDomains !== undefined ||
+-        config?.network?.allowedDomains !== undefined;
++    const hasNetworkConfig = customConfig?.network?.disabled !== true &&
++        (customConfig?.network?.allowedDomains !== undefined || config?.network?.allowedDomains !== undefined);
+     // Network RESTRICTION is needed whenever network config is specified
+     // This includes empty allowedDomains which means "block all network"
+     const needsNetworkRestriction = hasNetworkConfig;
+diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/linux-sandbox-utils.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/linux-sandbox-utils.js
+--- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/linux-sandbox-utils.js
++++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/linux-sandbox-utils.js
+@@ -858,8 +858,8 @@
+             candidatePath === allowedPath);
+         // Deny writes within allowed paths (user-specified + mandatory denies)
+         const denyPaths = [
+-            ...(writeConfig.denyWithinAllow || []),
+-            ...(await linuxGetMandatoryDenyPaths(ripgrepConfig, mandatoryDenySearchDepth, allowGitConfig, abortSignal)),
++            ...(writeConfig.explicitPolicy ? [] : writeConfig.denyWithinAllow || []),
++            ...(writeConfig.explicitPolicy ? [] : await linuxGetMandatoryDenyPaths(ripgrepConfig, mandatoryDenySearchDepth, allowGitConfig, abortSignal)),
+         ];
+         // Duplicate deny entries must be collapsed: a duplicate
+         // --ro-bind /dev/null <dest> hits a char device on the second pass and
+@@ -1154,7 +1154,7 @@
+     //
+     // Skipped when readConfig is undefined (filesystem.disabled): no read
+     // policy means no implicit read denies either.
+-    if (readConfig && fs.existsSync('/etc/ssh/ssh_config.d')) {
++    if (readConfig && !readConfig.explicitPolicy && fs.existsSync('/etc/ssh/ssh_config.d')) {
+         readDenyPaths.push('/etc/ssh/ssh_config.d');
+     }
+     // Normalize then sort shallow-first so tmpfs over ancestor dirs lands before
+@@ -1285,6 +1285,23 @@
+     if (maskedFileStoreDir !== undefined) {
+         args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir);
+     }
++    // Ancestor pins precede private /dev and /proc, so a root pin cannot expose host facilities.
++    for (const guard of writeConfig?.explicitPolicy?.guards ?? []) args.push('--bind', guard, guard);
++    if (writeConfig?.explicitPolicy) {
++        const sources = writeConfig.explicitPolicy.sourceFds;
++        if (!sources) throw new Error('Explicit filesystem policy requires pinned source descriptors');
++        for (let i = 0; i < args.length; i++) {
++            if (args[i] !== '--bind' && args[i] !== '--ro-bind') continue;
++            const source = args[i + 1];
++            if (sources[source] !== undefined) {
++                args[i] += '-fd';
++                args[i + 1] = String(sources[source]);
++            } else if (!(i === 0 && source === '/') && source !== '/dev/null' && source !== maskedFileStoreDir) {
++                throw new Error(`Explicit policy has no frozen binding for host mount: ${source}`);
++            }
++            i += 2;
 +        }
-     }
-     return [...new Set(denyPaths)];
- }
-diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js
-index 32831bf..d1fa878 100644
---- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js
-+++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js
-@@ -29,11 +29,7 @@ export const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'];
-  * instead we block specific paths within .git (hooks and config).
-  */
- export function getDangerousDirectories() {
--    return [
--        ...DANGEROUS_DIRECTORIES.filter(d => d !== '.git'),
--        '.claude/commands',
--        '.claude/agents',
--    ];
-+    return DANGEROUS_DIRECTORIES.filter(d => d !== '.git');
++    }
+     return args;
  }
  /**
-  * Normalizes a path for case-insensitive comparison.
+@@ -1511,6 +1528,20 @@
+             // --ro-bind / / leaves /proc read-only and those writes EROFS.
+             bwrapArgs.push('--unshare-user', '--bind', '/proc', '/proc');
+         }
++        // Explicit restrictions remain final even after private /dev and /proc setup.
++        if (writeConfig?.explicitPolicy) {
++            const policy = writeConfig.explicitPolicy;
++            for (const rule of policy.rules) {
++                if (rule.read) {
++                    if (rule.directory) bwrapArgs.push('--tmpfs', rule.path, '--remount-ro', rule.path);
++                    else bwrapArgs.push('--ro-bind', '/dev/null', rule.path);
++                } else if (rule.write) {
++                    const fd = policy.sourceFds?.[rule.path];
++                    if (fd === undefined) throw new Error(`Missing frozen rule binding: ${rule.path}`);
++                    bwrapArgs.push('--ro-bind-fd', String(fd), rule.path);
++                }
++            }
++        }
+         // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
+         // by creating a nested user namespace. This requires the host to permit
+         // capability-bearing unprivileged user namespaces (the same requirement
+diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
+--- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
++++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
+@@ -432,7 +432,7 @@
+     // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
+     const denyPaths = [
+         ...(config.denyWithinAllow || []),
+-        ...macGetMandatoryDenyPatterns(allowGitConfig),
++        ...(config.explicitPolicy ? [] : macGetMandatoryDenyPatterns(allowGitConfig)),
+     ];
+     const denyFilters = new Set();
+     for (const pathPattern of denyPaths) {
+@@ -727,6 +727,23 @@
+         profile.push('  (regex #"^/dev/ttys")');
+         profile.push(')');
+     }
++    if (writeConfig?.explicitPolicy) {
++        const policy = writeConfig.explicitPolicy;
++        // This opt-in policy replaces broad runtime defaults, including PTY allow-backs.
++        profile.push('(deny file-read* file-write* (subpath "/"))');
++        for (const grant of policy.grants) {
++            const filter = `(${grant.directory ? 'subpath' : 'literal'} ${JSON.stringify(grant.path)})`;
++            profile.push(`(allow file-read* ${grant.write ? 'file-write* ' : ''}${filter})`);
++        }
++        profile.push('(allow file-read-metadata (vnode-type DIRECTORY))');
++        for (const device of ['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom', '/dev/tty']) {
++            profile.push(`(allow file-read* file-write* (literal ${JSON.stringify(device)}))`);
++        }
++        for (const guard of policy.guards) profile.push(`(deny file-write-unlink file-write-create (literal ${JSON.stringify(guard)}))`);
++        for (const rule of policy.rules) {
++            profile.push(`(deny ${rule.read ? 'file-read* ' : ''}file-write* (${rule.directory ? 'subpath' : 'literal'} ${JSON.stringify(rule.path)}))`);
++        }
++    }
+     return profile.join('\n');
+ }
+ /**
