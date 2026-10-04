@@ -282,6 +282,15 @@ function projectSessionRow(value: Record<string, unknown>): Record<string, unkno
   if (value.type === "model_change") {
     return { ...base, provider: value.provider, modelId: value.modelId };
   }
+  if (value.type === "usage") {
+    return {
+      ...base,
+      provider: value.provider,
+      model: value.model,
+      usage: projectUsage(value.usage),
+      contentHash: contentHash({ type: value.type, kind: value.kind }),
+    };
+  }
   if (value.type === "message") {
     const message = object(value.message);
     if (message?.role !== "assistant") return base;
@@ -722,7 +731,11 @@ function sessionEndTimestamp(entries: Record<string, unknown>[], signal?: AbortS
       const message = object(entry.message);
       hasUsage = message?.role === "assistant" && normalizeUsage(message.usage) !== undefined;
       at = timestamp(message?.timestamp) ?? timestamp(entry.timestamp);
-    } else if (entry.type === "compaction" || entry.type === "branch_summary") {
+    } else if (
+      entry.type === "usage" ||
+      entry.type === "compaction" ||
+      entry.type === "branch_summary"
+    ) {
       hasUsage = normalizeUsage(entry.usage) !== undefined;
       at = timestamp(entry.timestamp);
     }
@@ -929,6 +942,24 @@ function normalizePersistedSession(
       const route = entryId ? routes.get(entryId) : undefined;
       provider = route?.[0];
       model = route?.[1];
+      content = entry.contentHash;
+      callTimestamp = timestamp(entry.timestamp);
+      fidelity = callTimestamp === undefined ? "missing" : "entry";
+    } else if (entry.type === "usage") {
+      usage = normalizeUsage(entry.usage);
+      if (entry.usage !== undefined && !usage) {
+        warning(
+          warnings,
+          "invalid-usage",
+          "Usage-bearing call has invalid usage",
+          session.path,
+          undefined,
+          timestamp(entry.timestamp),
+        );
+        continue;
+      }
+      provider = typeof entry.provider === "string" ? entry.provider : undefined;
+      model = typeof entry.model === "string" ? entry.model : undefined;
       content = entry.contentHash;
       callTimestamp = timestamp(entry.timestamp);
       fidelity = callTimestamp === undefined ? "missing" : "entry";

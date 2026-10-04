@@ -60,6 +60,26 @@ function assistant(
   };
 }
 
+function standaloneUsage(
+  id: string,
+  parentId: string | null,
+  kind = "cache_warm",
+  provider = "provider-b",
+  model = "model-b",
+  at = NOW - 500,
+) {
+  return {
+    type: "usage",
+    id,
+    parentId,
+    timestamp: new Date(at).toISOString(),
+    kind,
+    provider,
+    model,
+    usage: usage(),
+  };
+}
+
 function header(id: string, parentSession?: string) {
   return {
     type: "session",
@@ -229,6 +249,57 @@ test("merges active unflushed entries, custom sessions, branch-safe billed calls
     { id: "agent-record", timestamps: [NOW - 500] },
     { id: "agent-untimestamped", timestamps: [] },
   ]);
+});
+
+test("accounts active standalone usage without changing the inherited model route", async (t) => {
+  const root = await workspace(t);
+  const route = {
+    type: "model_change",
+    id: "route-a",
+    parentId: null,
+    timestamp: new Date(NOW - 2_000).toISOString(),
+    provider: "provider-a",
+    modelId: "model-a",
+  };
+  const warm = standaloneUsage(
+    "warm",
+    "route-a",
+    "cache_warm",
+    "provider-b",
+    "model-b",
+    NOW - 1_000,
+  );
+  const other = standaloneUsage(
+    "other",
+    "route-a",
+    "background",
+    "provider-b",
+    "model-b",
+    NOW - 500,
+  );
+  const result = await loadHistory(context(manager({ dir: root, entries: [route, warm, other] })), {
+    now: NOW,
+    outputRoot: join(root, "outputs"),
+    listAll: async () => [],
+  });
+
+  assert.deepEqual(
+    result.calls.map((call) => [call.entryId, call.provider, call.model]),
+    [
+      ["warm", "provider-b", "model-b"],
+      ["other", "provider-b", "model-b"],
+    ],
+  );
+  assert.notEqual(result.calls[0]?.contentHash, result.calls[1]?.contentHash);
+  assert.deepEqual(deriveHistoryRange(result, 60_000).overview.totals, {
+    input: 20,
+    output: 4,
+    cacheRead: 6,
+    cacheWrite: 8,
+    total: 38,
+    cost: 0.74,
+    calls: 2,
+  });
 });
 
 test("canonical path merging and JSONL parsing warn for malformed interior and stable partial tails", async (t) => {
@@ -765,6 +836,53 @@ test("does not deduplicate entry IDs across broken or cyclic lineages", async (t
   assert.equal(result.calls.length, 3);
   assert.ok(result.warnings.some((item) => item.code === "cyclic-lineage"));
   assert.ok(result.warnings.some((item) => item.code === "broken-lineage"));
+});
+
+test("accounts persisted standalone usage, copied lineage entries, and invalid records", async (t) => {
+  const root = await workspace(t);
+  const original = join(root, "original-usage.jsonl");
+  const fork = join(root, "fork-usage.jsonl");
+  const invalid = join(root, "invalid-usage.jsonl");
+  const route = {
+    type: "model_change",
+    id: "route-a",
+    parentId: null,
+    timestamp: new Date(NOW - 2_000).toISOString(),
+    provider: "provider-a",
+    modelId: "model-a",
+  };
+  const warm = standaloneUsage("warm", "route-a", "cache_warm", "provider-b", "model-b");
+  await writeJsonl(original, [header("original-usage"), route, warm]);
+  await writeJsonl(fork, [header("fork-usage", original), route, warm]);
+  await writeJsonl(invalid, [
+    header("invalid-usage"),
+    {
+      ...standaloneUsage("bad", null),
+      usage: { ...usage(), input: -1 },
+    },
+    standaloneUsage("unattributed", null, "cache_warm", "", ""),
+  ]);
+
+  const result = await loadHistory(context(manager({ dir: root })), {
+    now: NOW,
+    outputRoot: join(root, "outputs"),
+    listAll: async () => [info(fork), info(original), info(invalid)],
+  });
+
+  assert.equal(result.calls.filter((call) => call.entryId === "warm").length, 1);
+  assert.equal(result.calls[0]?.provider, "provider-b");
+  assert.equal(result.calls[0]?.model, "model-b");
+  assert.deepEqual(deriveHistoryRange(result, 60_000).overview.totals, {
+    input: 10,
+    output: 2,
+    cacheRead: 3,
+    cacheWrite: 4,
+    total: 19,
+    cost: 0.37,
+    calls: 1,
+  });
+  assert.equal(result.warnings.filter((item) => item.code === "invalid-usage").length, 1);
+  assert.equal(result.warnings.filter((item) => item.code === "unattributable-call").length, 1);
 });
 
 test("warns when usage-bearing persisted calls have no exact inherited route", async (t) => {

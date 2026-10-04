@@ -40,7 +40,7 @@ export function collectUsage(ctx: ExtensionContext): UsageTotals {
       add(totals, (entry.message as { usage?: UsageLike }).usage);
       continue;
     }
-    if (entry.type === "branch_summary" || entry.type === "compaction") {
+    if (entry.type === "usage" || entry.type === "branch_summary" || entry.type === "compaction") {
       add(totals, (entry as { usage?: UsageLike }).usage);
     }
   }
