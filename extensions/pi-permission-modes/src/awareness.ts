@@ -26,6 +26,6 @@ export function permissionAwareness(owner: PermissionOwner): string {
     `Process mode: ${snapshot.processMode ?? "compatible"}. ${snapshot.processMode === "strict" ? "Confined subprocesses are retired with their command." : "Detached subprocesses remain sandboxed but cleanup is best-effort; they may outlive commands and retain their original filesystem snapshot."}`,
     "Governed shells require an OS sandbox unless filesystem access and networking are both unrestricted. Dynamic scripts remain sandboxed. A restricted descendant may prevent renaming/removing its ancestors while ordinary sibling contents remain writable. Commands are never automatically retried after a permission failure.",
     `Network: ${network.restricted ? "restricted" : "open"}; allowed=${network.allowedDomains.join(", ")}; denied=${network.deniedDomains.join(", ")}. Proxied processes use live policy for new connections. Established connections and already-launched open-network processes keep their access until exit.`,
-    "Children share this root's live authority; a different cwd is not a grant. Trusted custom tools/extensions, including their own processes and network clients, are outside these checks.",
+    "Validated starting-worktree Git metadata receives automatic R/W access, subject to explicit path rules; its live boundary is not retargeted by Gitfile edits or reload. Children share this root's live authority; a different cwd is not a grant. Trusted custom tools/extensions, including their own processes and network clients, are outside these checks.",
   ].join("\n");
 }

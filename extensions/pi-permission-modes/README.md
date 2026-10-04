@@ -12,7 +12,7 @@ Scoped filesystem profiles, canonical file/tree rules, session/project/global gr
 
 On macOS, `/var/folders` resolves to `/private/var/folders` and includes OS-managed temporary files and caches beyond the current project. Default R/W access remains subject to macOS account permissions and explicit path rules. Existing policies with explicit filesystem definitions retain their configured scope; the additional default does not widen them automatically.
 
-Names have no special authority. The built-ins and custom profiles use the same editable version-3 schema. Profiles provide baseline access; custom rules and grants can override it at more-specific canonical boundaries. R/W includes reads, creation, edits, deletion, and supported renames. Ordinary `.git`, `.env`, `node_modules`, and IDE files have no extra protections.
+Names have no special authority. The built-ins and custom profiles use the same editable version-3 schema. Scoped profiles also receive automatic R/W access to validated Git metadata when the frozen starting directory is inside a linked worktree. Profiles provide baseline access; custom rules and grants can override it at more-specific canonical boundaries. R/W includes reads, creation, edits, deletion, and supported renames. Ordinary `.git`, `.env`, `node_modules`, and IDE files have no extra protections.
 
 ## Process lifecycle
 
@@ -131,6 +131,16 @@ Only existing baseline entries are included. Project `vendor` links and separate
 
 Sandbox infrastructure additionally uses private process/device facilities, network proxy sockets, and the exact bundled Linux seccomp launcher. macOS also permits directory metadata, symlink inspection, and opening the root directory for dyld (not recursive root reads). Those are execution facilities, not grants to arbitrary host file contents.
 
+## Linked Git worktrees
+
+Starting inside a linked worktree automatically adds R/W access to its validated common Git metadata directory, without a command or approval prompt. This tree includes the current worktree's administrative directory. The main checkout's working files and its enclosing directory are not granted.
+
+Discovery walks upward from the frozen starting directory to the nearest `.git` marker. It requires a regular Gitfile pointing into a `worktrees/<name>` layout, a matching `commondir`, a reciprocal `gitdir` backlink to that Gitfile, valid HEAD files, and regular repository configuration plus object/reference directories. Symlinked metadata entries, incomplete layouts, submodule Gitfiles, malformed pointers, and metadata paths the sandbox cannot represent do not create automatic access; ordinary permission enforcement remains active. Discovery does not execute Git or load repository configuration.
+
+**This intentionally trusts validated worktree metadata by default.** Layout checks are not proof that a repository is trustworthy. R/W access includes shared objects, refs, hooks, configuration, and other worktrees' administrative data. Existing explicit ask/deny rules still apply; configure a tree rule for the common Git directory to require approval or deny access. No hidden metadata restrictions are added.
+
+The automatically discovered directory is pinned for the live owner, including profile changes and `/reload`; editing a Gitfile cannot retarget it or add new automatic authority. Fresh root initialization rediscovers it rather than restoring it as a saved approval. Children inherit the root's access, but launching them with another cwd does not discover or grant that cwd's metadata. Other repository layouts still use ordinary explicit grants.
+
 ## Enforcement and lifecycle
 
 | Filesystem | Network | Shell execution |
@@ -146,7 +156,7 @@ After successful initialization, required-layer failure blocks execution. There 
 
 Bash parsing discovers reliable static paths and redirections before execution. Recognized options separate values from file operands; descriptor duplication and literal heredoc bodies are not file paths. Conditional `cd` tracks successful and failed branches separately, while subshell cwd changes stay local. Ambiguous options, dynamic scripts, physical/unknown cwd changes, and unknown syntax remain subject to the OS boundary, not command-identity prompts. Commands are never automatically retried after execution failures.
 
-One root owner publishes immutable filesystem snapshots; new operations use its current revision. Children—including isolated, extension-filtered, and nested children—attach to the same owner over the shared event bus. Resumed and reopened children reacquire an owner lease and see current grants; a retired owner cannot be resumed. Alternate cwd/worktrees do not become implicit grants. Approval dialogs route to the root UI. Reload/shutdown abort active direct/search/shell operations and descendants, then drain their leases before replacing runtime state. Late network answers cannot grant access after retirement or a failed reload; ordinary filesystem switches do not invalidate independent network approvals.
+One root owner publishes immutable filesystem snapshots; new operations use its current revision. Children—including isolated, extension-filtered, and nested children—attach to the same owner over the shared event bus. Resumed and reopened children reacquire an owner lease and see current grants; a retired owner cannot be resumed. Alternate child cwd/worktrees do not become implicit grants; only the frozen root's validated starting-worktree metadata is discovered automatically. Approval dialogs route to the root UI. Reload/shutdown abort active direct/search/shell operations and descendants, then drain their leases before replacing runtime state. Late network answers cannot grant access after retirement or a failed reload; ordinary filesystem switches do not invalidate independent network approvals.
 
 A shell operation owns its original process group until foreground exit, cancellation, or timeout, and attempts to retire that group before releasing its lease, even on successful exit. Strict confined execution additionally prevents detached descendants from surviving cleanup; compatible execution uses bounded output handling and best-effort cleanup as described under **Process lifecycle**. The operation lease tracks the command, not surviving compatible-mode daemons.
 

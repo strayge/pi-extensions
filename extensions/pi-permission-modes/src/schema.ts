@@ -91,7 +91,7 @@ export interface RuleException {
 }
 
 export interface ResourceGrant {
-  /** Host-runtime resources are rediscovered instead of becoming saved authority. */
+  /** Automatically discovered resources never become saved authority. */
   runtime?: true;
   definition?: string;
   binding: PermissionBinding;
@@ -105,6 +105,8 @@ export interface ResolvedProfile {
 }
 
 export interface ResolvedCatalog {
+  /** Live discovery pins survive reloads even when no profile is scoped. */
+  worktreeGrants?: ResourceGrant[];
   root: RootIdentity;
   config: PermissionModeConfig;
   profiles: Record<string, ResolvedProfile>;

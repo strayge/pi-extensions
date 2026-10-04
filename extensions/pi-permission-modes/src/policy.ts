@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { macExecutableFiles } from "./macos.ts";
+import { automaticWorktreeGrants } from "./worktree.ts";
 import { assertBinding, bindFile, bindPath, configPath, resolvePermissionBinding, within } from "./paths.ts";
 import type {
   PermissionModeConfig,
@@ -189,6 +190,10 @@ export function resolveCatalog(
   previous?: ResolvedCatalog,
 ): ResolvedCatalog {
   assertBinding(root.binding);
+  const worktreeGrants = previous
+    ? previous.worktreeGrants ?? []
+    : automaticWorktreeGrants(root.binding);
+  for (const grant of worktreeGrants) resolvePermissionBinding(grant.binding);
   const profiles: Record<string, ResolvedProfile> = Object.create(null);
   for (const [name, mode] of Object.entries(config.modes)) {
     const prior = previous?.profiles[name];
@@ -207,6 +212,7 @@ export function resolveCatalog(
       }
       return resource;
     });
+    grants.push(...worktreeGrants);
     for (const [access, values] of [
       ["read", mode.filesystem.readOnly],
       ["write", mode.filesystem.readWrite],
@@ -250,7 +256,7 @@ export function resolveCatalog(
       return { ...rule, id: randomUUID(), definition: key, blocked: String(error) };
     }
   });
-  return freeze({ root, config: structuredClone(config), profiles, rules });
+  return freeze({ root, config: structuredClone(config), profiles, rules, worktreeGrants });
 }
 
 export function validateCatalog(catalog: ResolvedCatalog): void {

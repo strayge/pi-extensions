@@ -29,6 +29,7 @@ interface Document { version: 4; sessions: Record<string, SavedState>; projects:
 /** Runtime identities are rediscovered; private authority persists validated names instead. */
 function key(value: unknown, context?: ResolutionContext): string {
   return JSON.stringify(value, (field, item) => {
+    if (field === "worktreeGrants") return undefined;
     if (field === "identity" && item && typeof item.type === "string") return { type: item.type };
     if (field === "grants" && Array.isArray(item))
       return item.filter((grant) => !grant?.runtime && !(context && typeof grant?.definition === "string" && isRuntimeResource(grant, context)));
