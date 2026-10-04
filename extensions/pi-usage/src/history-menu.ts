@@ -482,6 +482,7 @@ function quotaCapacityLine(capacity: QuotaBucketHistory["capacity"]): string | u
 function quotaBucketLines(
   bucket: QuotaBucketHistory,
   width: number,
+  range: HistoryRangeLabel,
   title?: string,
   theme?: HistoryTheme,
 ): string[] {
@@ -537,6 +538,34 @@ function quotaBucketLines(
       unstyledTitle = unstyledTitle.slice(prefixLength);
       return styled([{ text: prefix, tone: "dim" }, { text: line.slice(prefixLength) }], theme);
     });
+  if (bucket.modelEstimates?.length) {
+    const indent = width > 2 ? "  " : "";
+    const rows: Part[] = [
+      { text: `Historical ${range} model averages · API-equivalent dollars`, tone: "dim" },
+    ];
+    for (const estimate of bucket.modelEstimates) {
+      const capacityCost =
+        estimate.estimated100PercentCost === undefined
+          ? "—"
+          : money(estimate.estimated100PercentCost);
+      rows.push(
+        {
+          text: `${sanitizeArtifactLabel(estimate.model)}: recorded ${money(estimate.recordedCost)} · weekly 100% ${capacityCost === "—" ? "insufficient data" : `≈ ${capacityCost}`}`,
+        },
+        {
+          text: `sample ${money(estimate.sampleCost)} / ${decimal(estimate.observedConsumedPercent)} pp · ${number(estimate.intervals)} ${estimate.intervals === 1 ? "interval" : "intervals"} (≤15m)`,
+          tone: "dim",
+        },
+      );
+    }
+    for (const row of rows) {
+      lines.push(
+        ...wrapText(row.text, width - visibleWidth(indent))
+          .filter((line) => visibleWidth(line) > 0)
+          .map((line) => styled([{ text: `${indent}${line}`, tone: row.tone }], theme)),
+      );
+    }
+  }
   for (const warning of new Set([
     ...bucket.capacityWarnings,
     ...(bucket.capacity?.warnings ?? []),
@@ -592,7 +621,12 @@ function visibleQuotaBucket(bucket: QuotaBucketHistory): boolean {
   )
     return true;
 
-  return quotaCapacityLine(bucket.capacity) !== undefined;
+  return (
+    quotaCapacityLine(bucket.capacity) !== undefined ||
+    bucket.modelEstimates?.some(
+      (estimate) => usableRawNumber("usd", estimate.recordedCost) && estimate.recordedCost > 0,
+    ) === true
+  );
 }
 
 function isMainCodexBucket(bucket: QuotaBucketHistory): boolean {
@@ -614,7 +648,12 @@ function quotaPresentationProviders(view: HistoryRangeView): QuotaProviderHistor
   });
 }
 
-function quotasLines(view: HistoryRangeView, width: number, theme?: HistoryTheme): string[] {
+function quotasLines(
+  view: HistoryRangeView,
+  width: number,
+  range: HistoryRangeLabel,
+  theme?: HistoryTheme,
+): string[] {
   const providers = quotaPresentationProviders(view);
   if (providers.length === 0) {
     return ["No quota observations in range", ...warningLines(view, "Quotas", theme)];
@@ -635,7 +674,7 @@ function quotasLines(view: HistoryRangeView, width: number, theme?: HistoryTheme
       const titles = quotaBucketTitles(identity.buckets);
       for (const [bucketIndex, bucket] of identity.buckets.entries()) {
         if (bucketIndex > 0) lines.push("");
-        lines.push(...quotaBucketLines(bucket, width, titles[bucketIndex], theme));
+        lines.push(...quotaBucketLines(bucket, width, range, titles[bucketIndex], theme));
       }
     }
   }
@@ -652,7 +691,7 @@ function contentLines(
 ): string[] {
   if (state.tab === "Models") return modelsLines(view, width, theme);
   if (state.tab === "Cache") return cacheLines(view, width, theme);
-  return quotasLines(view, width, theme);
+  return quotasLines(view, width, state.range, theme);
 }
 
 function wrappedContentLines(

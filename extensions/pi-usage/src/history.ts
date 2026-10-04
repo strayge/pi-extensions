@@ -8,6 +8,7 @@ import {
   type SessionInfo,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { isCodexProvider } from "./providers/codex.ts";
 import { SNAPSHOT_ENTRY_TYPE } from "./snapshot.ts";
 import type {
   UsageBucket,
@@ -53,6 +54,8 @@ export interface NormalizedCall {
   provider: string;
   model: string;
   timestamp?: number;
+  /** Persistence time bounds ongoing requests when the embedded timestamp is their start. */
+  completedAt?: number;
   timestampFidelity: TimestampFidelity;
   preciseTimestamp: boolean;
   usage: NormalizedUsage;
@@ -978,12 +981,16 @@ function normalizePersistedSession(
       );
       continue;
     }
+    const persistedAt = timestamp(entry.timestamp);
     const call: NormalizedCall = {
       key: `${session.source.id}:${entryId ?? index}`,
       entryId,
       provider,
       model,
       timestamp: callTimestamp,
+      ...(callTimestamp !== undefined && persistedAt !== undefined && persistedAt >= callTimestamp
+        ? { completedAt: persistedAt }
+        : {}),
       timestampFidelity: fidelity,
       preciseTimestamp: fidelity !== "missing",
       usage,
@@ -1063,6 +1070,7 @@ function normalizeOutput(
       provider: message.provider,
       model: message.model,
       timestamp: embedded ?? outer,
+      ...(outer !== undefined && outer >= (embedded ?? outer) ? { completedAt: outer } : {}),
       timestampFidelity: fidelity,
       preciseTimestamp: fidelity === "embedded",
       usage,
@@ -1580,6 +1588,15 @@ export interface CapacityEstimate {
   warnings: string[];
 }
 
+export interface ModelQuotaEstimate {
+  model: string;
+  recordedCost: number;
+  sampleCost: number;
+  observedConsumedPercent: number;
+  intervals: number;
+  estimated100PercentCost?: number;
+}
+
 export interface QuotaBucketHistory extends QuotaMovement {
   id: string;
   label: string;
@@ -1590,6 +1607,7 @@ export interface QuotaBucketHistory extends QuotaMovement {
   current?: QuotaObservation;
   capacity?: CapacityEstimate;
   capacityWarnings: string[];
+  modelEstimates?: ModelQuotaEstimate[];
 }
 
 export interface QuotaIdentityHistory {
@@ -1840,6 +1858,182 @@ function identityKey(identity: UsageSnapshotIdentity): string {
   return `${identity.kind}\0${identity.id}`;
 }
 
+const MODEL_QUOTA_INTERVAL_MS = 15 * 60_000;
+const MODEL_QUOTA_MIN_SHARE = 0.95;
+
+/** Join adjacent samples so whole-request prices and quota movement cover the same work. */
+function estimateModelQuotas(
+  observations: Array<QuotaObservation & { percentage: number }>,
+  calls: NormalizedCall[],
+  since: number,
+  now: number,
+  correlated: boolean,
+): ModelQuotaEstimate[] {
+  const rows = new Map<string, ModelQuotaEstimate>();
+  for (const call of calls) {
+    if (call.timestamp === undefined || call.timestamp < since || call.timestamp > now) continue;
+    let row = rows.get(call.model);
+    if (!row) {
+      row = {
+        model: call.model,
+        recordedCost: 0,
+        sampleCost: 0,
+        observedConsumedPercent: 0,
+        intervals: 0,
+      };
+      rows.set(call.model, row);
+    }
+    row.recordedCost += call.usage.cost.total;
+  }
+  const result = [...rows.values()].sort(
+    (a, b) => b.recordedCost - a.recordedCost || a.model.localeCompare(b.model),
+  );
+  if (
+    !correlated ||
+    calls.some(
+      (call) =>
+        call.timestamp === undefined && (call.usage.totalTokens > 0 || call.usage.cost.total > 0),
+    )
+  ) {
+    return result;
+  }
+
+  const activity = calls.filter(
+    (call): call is NormalizedCall & { timestamp: number } =>
+      call.timestamp !== undefined &&
+      call.timestamp <= now &&
+      (call.timestamp >= since || (call.completedAt ?? call.timestamp) > since) &&
+      (call.usage.totalTokens > 0 || call.usage.cost.total > 0),
+  );
+  const callsBetween = (begin: number, end: number) =>
+    activity.filter(
+      (call) =>
+        call.timestamp < end &&
+        (call.timestamp >= begin || (call.completedAt ?? call.timestamp) > begin),
+    );
+  const epochs: Array<typeof observations> = [];
+  let peak = 0;
+  for (const observation of observations) {
+    if (
+      observation.capturedAt < since ||
+      observation.capturedAt > now ||
+      observation.percentage < 0 ||
+      observation.percentage > 100
+    ) {
+      continue;
+    }
+    const epoch = epochs.at(-1);
+    const previous = epoch?.at(-1);
+    if (
+      !epoch ||
+      previous?.raw.resetsAt !== observation.raw.resetsAt ||
+      observation.percentage < peak * 0.5
+    ) {
+      epochs.push([observation]);
+      peak = observation.percentage;
+    } else {
+      epoch.push(observation);
+      peak = Math.max(peak, observation.percentage);
+    }
+  }
+
+  let run:
+    | { model: string; begin: number; end: number; consumption: number; intervals: number }
+    | undefined;
+  const finishRun = () => {
+    const period = run;
+    run = undefined;
+    if (!period) return;
+    const row = rows.get(period.model);
+    if (!row) return;
+    const periodCalls = callsBetween(period.begin, period.end);
+    const targetCalls = periodCalls.filter((call) => call.model === period.model);
+    if (
+      targetCalls.some(
+        (call) =>
+          call.timestamp < period.begin || (call.completedAt ?? call.timestamp) > period.end,
+      )
+    ) {
+      return;
+    }
+    const sampleCost = targetCalls.reduce((sum, call) => sum + call.usage.cost.total, 0);
+    const totalCost = periodCalls.reduce((sum, call) => sum + call.usage.cost.total, 0);
+    if (totalCost <= 0 || sampleCost / totalCost < MODEL_QUOTA_MIN_SHARE) return;
+    row.sampleCost += sampleCost;
+    row.observedConsumedPercent += period.consumption;
+    row.intervals += period.intervals;
+  };
+  for (const epoch of epochs) {
+    const first = epoch[0];
+    if (!first) continue;
+    peak = first.percentage;
+    for (let start = 0; start < epoch.length - 1; ) {
+      const begin = epoch[start];
+      if (!begin) break;
+      let end = start + 1;
+      while (
+        end + 1 < epoch.length &&
+        (epoch[end + 1]?.capturedAt ?? Infinity) <= begin.capturedAt + MODEL_QUOTA_INTERVAL_MS
+      ) {
+        end += 1;
+      }
+      const finish = epoch[end];
+      if (!finish) break;
+      const intervalCalls = callsBetween(begin.capturedAt, finish.capturedAt);
+      let consumption = 0;
+      for (let index = start + 1; index <= end; index += 1) {
+        const current = epoch[index];
+        if (!current) continue;
+        consumption += Math.max(0, current.percentage - peak);
+        peak = Math.max(peak, current.percentage);
+      }
+      start = end;
+      if (
+        finish.capturedAt - begin.capturedAt > MODEL_QUOTA_INTERVAL_MS ||
+        intervalCalls.length === 0 ||
+        intervalCalls.some(
+          (call) =>
+            !call.preciseTimestamp || (call.usage.totalTokens > 0 && call.usage.cost.total <= 0),
+        )
+      ) {
+        finishRun();
+        continue;
+      }
+      const costs = new Map<string, number>();
+      for (const call of intervalCalls) {
+        costs.set(call.model, (costs.get(call.model) ?? 0) + call.usage.cost.total);
+      }
+      const totalCost = [...costs.values()].reduce((sum, cost) => sum + cost, 0);
+      const dominant = [...costs].sort((a, b) => b[1] - a[1])[0];
+      if (!dominant || totalCost <= 0 || dominant[1] / totalCost < MODEL_QUOTA_MIN_SHARE) {
+        finishRun();
+        continue;
+      }
+      if (run && (run.model !== dominant[0] || run.end !== begin.capturedAt)) finishRun();
+      if (!run) {
+        run = {
+          model: dominant[0],
+          begin: begin.capturedAt,
+          end: finish.capturedAt,
+          consumption,
+          intervals: 1,
+        };
+      } else {
+        run.end = finish.capturedAt;
+        run.consumption += consumption;
+        run.intervals += 1;
+      }
+    }
+    finishRun();
+  }
+  for (const row of result) {
+    if (row.observedConsumedPercent > 0 && row.sampleCost > 0) {
+      row.estimated100PercentCost = (row.sampleCost * 100) / row.observedConsumedPercent;
+    }
+  }
+  return result;
+}
+
 function aggregateQuotas(
   history: LoadedHistory,
   since: number,
@@ -1934,20 +2128,27 @@ function aggregateQuotas(
     const first = matchingCalls[0]?.timestamp;
     const last = matchingCalls.at(-1)?.timestamp;
     if (first === undefined || last === undefined) continue;
-    const overlappingIdentities = new Set(
-      relevantIdentities
-        .filter(
-          (group) =>
-            group.providerId === provider.providerId &&
-            group.capturedAt.some(
-              (capturedAt) =>
-                capturedAt >= first - HISTORY_BOUNDARY_TOLERANCE_MS &&
-                capturedAt <= last + HISTORY_BOUNDARY_TOLERANCE_MS,
-            ),
-        )
-        .map((group) => identityKey(group.identity)),
-    );
+    const identityKeysThrough = (activityEnd: number) =>
+      new Set(
+        relevantIdentities
+          .filter(
+            (group) =>
+              group.providerId === provider.providerId &&
+              group.capturedAt.some(
+                (capturedAt) =>
+                  capturedAt >= first - HISTORY_BOUNDARY_TOLERANCE_MS &&
+                  capturedAt <= activityEnd + HISTORY_BOUNDARY_TOLERANCE_MS,
+              ),
+          )
+          .map((group) => identityKey(group.identity)),
+      );
+    const overlappingIdentities = identityKeysThrough(last);
     const ambiguous = overlappingIdentities.size !== 1;
+    const modelActivityEnd = matchingCalls.reduce(
+      (end, call) => Math.max(end, call.completedAt ?? call.timestamp),
+      last,
+    );
+    const modelCorrelated = identityKeysThrough(modelActivityEnd).size === 1;
     for (const identity of provider.identities) {
       for (const bucket of identity.buckets) {
         const group = relevant.find(
@@ -1961,6 +2162,21 @@ function aggregateQuotas(
           (item): item is QuotaObservation & { percentage: number } =>
             item.percentage !== undefined,
         );
+        if (
+          isCodexProvider(provider.providerId) &&
+          bucket.latest.windowMinutes === 10_080 &&
+          (bucket.latest.groupId === undefined
+            ? bucket.id === "codex" || bucket.id.startsWith("codex:")
+            : bucket.latest.groupId === "codex")
+        ) {
+          bucket.modelEstimates = estimateModelQuotas(
+            capacityObservations,
+            history.calls.filter((call) => call.provider === provider.providerId),
+            since,
+            history.now,
+            modelCorrelated,
+          );
+        }
         const trimmed = trimBucketSeries(capacityObservations, first, last);
         bucket.capacityWarnings.push(...trimmed.warnings);
         if (ambiguous) {

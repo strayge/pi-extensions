@@ -333,6 +333,29 @@ quota window keeps an otherwise valid estimate but labels it a lower bound.
 These are empirical 100%-equivalents, not provider billing rules or guaranteed
 future capacity.
 
+Main Codex weekly buckets also show per-model historical averages for the
+**selected range**, in API-equivalent dollars, without replacing the aggregate
+estimate. Each row includes the model's full recorded cost in that range and
+supporting sample cost, quota percentage points, and qualifying interval count:
+
+```text
+model weekly 100% cost = sample recorded cost × 100 / sample quota consumption (pp)
+```
+
+Samples use only active measurement windows of up to 15 minutes where that exact
+provider/model accounts for at least 95% of recorded dollar cost. Active windows
+with zero quota movement still contribute sample cost; quota movement in windows
+without Pi activity is ignored. This assumes Pi's prices are approximately right
+and small helper-model activity can be ignored. Unsupported estimates show
+`insufficient data`, not a permanent model value or a subscription billing price.
+Reset-crossing gaps, missing prices, imprecise timing, and ambiguous account
+correlation are excluded. Adjacent samples dominated by the same model are
+combined for calibration, with dollar costs counted once and the 95% threshold
+checked again for the combined period. Dominant-model requests must fit entirely
+within that period, so whole-request costs are never paired with partial quota
+movement. Supporting cost and quota cover qualifying samples, not necessarily
+all activity in the selected range.
+
 Historical coverage is deliberately not claimed to be complete. Snapshot
 sampling is irregular and active-session-driven, so peaks, resets, and
 consumption can be missed. Account quota can include usage by clients outside

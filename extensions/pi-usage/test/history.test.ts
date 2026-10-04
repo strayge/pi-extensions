@@ -2097,3 +2097,355 @@ test("live quota values remain separate from observed history and include new bu
   assert.equal(extra?.observations.length, 0);
   assert.equal(extra?.capacity, undefined);
 });
+
+function codexWeeklySnapshot(
+  id: string,
+  minutesAgo: number,
+  used: number,
+  extra: Partial<UsageBucket> = {},
+): UsageSnapshot {
+  return quotaSnapshot({
+    id,
+    at: NOW - minutesAgo * 60_000,
+    provider: "openai-codex",
+    bucket: percentBucket(used, {
+      id: "codex:primary",
+      groupId: "codex",
+      windowMinutes: 10_080,
+      resetsAt: NOW / 1000 + 604_800,
+      ...extra,
+    }),
+  });
+}
+
+function codexModelCall(key: string, minutesAgo: number, cost: number, model = "sol") {
+  return normalizedCall({
+    key,
+    at: NOW - minutesAgo * 60_000,
+    provider: "openai-codex",
+    model,
+    output: 100,
+    cost,
+  });
+}
+
+function codexModelRows(history: LoadedHistory, durationMs = 60 * 60_000) {
+  return (
+    deriveHistoryRange(history, durationMs)
+      .quotas.providers.find((provider) => provider.providerId === "openai-codex")
+      ?.identities[0]?.buckets.find((bucket) => bucket.id === "codex:primary")?.modelEstimates ?? []
+  );
+}
+
+test("model quota averages tolerate 5% helper cost and retain zero-movement interval costs", () => {
+  const history = loaded(
+    [
+      codexModelCall("sol-a", 44, 9.5),
+      {
+        ...codexModelCall("luna-a", 42, 0.5, "luna"),
+        usage: { ...usage(1_000_000), cost: { ...usage().cost, total: 0.5 } },
+      },
+      codexModelCall("sol-b", 29, 19.5),
+      codexModelCall("luna-b", 28, 0.5, "luna"),
+      codexModelCall("sol-flat", 14, 1),
+      normalizedCall({ key: "other-provider", at: NOW - 25 * 60_000, cost: 100 }),
+    ],
+    [
+      codexWeeklySnapshot("start", 45, 10),
+      codexWeeklySnapshot("flat-a", 40, 10),
+      codexWeeklySnapshot("increase-a", 35, 12),
+      codexWeeklySnapshot("end-a", 30, 12),
+      codexWeeklySnapshot("flat-b", 25, 12),
+      codexWeeklySnapshot("increase-b", 20, 15),
+      codexWeeklySnapshot("end-b", 15, 15),
+      codexWeeklySnapshot("flat-c", 10, 15),
+      codexWeeklySnapshot("end", 0, 15),
+    ],
+  );
+  const rows = codexModelRows(history);
+  assert.deepEqual(
+    rows.find((row) => row.model === "sol"),
+    {
+      model: "sol",
+      recordedCost: 30,
+      sampleCost: 30,
+      observedConsumedPercent: 5,
+      intervals: 3,
+      estimated100PercentCost: 600,
+    },
+  );
+  assert.equal(rows.find((row) => row.model === "luna")?.recordedCost, 1);
+  assert.equal(rows.find((row) => row.model === "luna")?.estimated100PercentCost, undefined);
+});
+
+test("model quota averages use only the selected history range", () => {
+  const history = loaded(
+    [codexModelCall("old", 2 * 1440 - 1, 100), codexModelCall("recent", 44, 5)],
+    [
+      codexWeeklySnapshot("old-start", 2 * 1440, 10),
+      codexWeeklySnapshot("old-end", 2 * 1440 - 15, 20),
+      codexWeeklySnapshot("recent-start", 45, 20),
+      codexWeeklySnapshot("recent-end", 30, 22),
+    ],
+  );
+  const recent = codexModelRows(history, 24 * 60 * 60_000)[0];
+  const week = codexModelRows(history, 7 * 24 * 60 * 60_000)[0];
+  assert.equal(recent?.recordedCost, 5);
+  assert.equal(recent?.estimated100PercentCost, 250);
+  assert.equal(week?.recordedCost, 105);
+  assert.equal(week?.estimated100PercentCost, 875);
+});
+
+test("model quota averages ignore idle movement without ignoring ongoing requests", () => {
+  const call = { ...codexModelCall("ongoing", 44, 2), completedAt: NOW - 31 * 60_000 };
+  const history = loaded(
+    [call],
+    [
+      codexWeeklySnapshot("idle-start", 60, 0),
+      codexWeeklySnapshot("idle-increase", 55, 1),
+      codexWeeklySnapshot("start", 45, 1),
+      codexWeeklySnapshot("active-flat", 40, 1),
+      codexWeeklySnapshot("active-increase", 35, 2),
+      codexWeeklySnapshot("end", 30, 2),
+    ],
+  );
+  const row = codexModelRows(history)[0];
+  assert.equal(row?.sampleCost, 2);
+  assert.equal(row?.observedConsumedPercent, 1);
+  assert.equal(row?.estimated100PercentCost, 200);
+});
+
+test("model quota averages never pair whole request costs with partial eligible consumption", () => {
+  const long = { ...codexModelCall("long", 44, 9), completedAt: NOW - 60_000 };
+  const cases = [
+    {
+      calls: [{ ...codexModelCall("gap-request", 59, 4), completedAt: NOW - 60_000 }],
+      snapshots: [
+        codexWeeklySnapshot("start", 60, 0),
+        codexWeeklySnapshot("first", 45, 1),
+        codexWeeklySnapshot("gap", 15, 3),
+        codexWeeklySnapshot("end", 0, 4),
+      ],
+    },
+    {
+      calls: [long, codexModelCall("helper", 43, 1, "luna"), codexModelCall("short", 14, 3)],
+      snapshots: [
+        codexWeeklySnapshot("start", 45, 0),
+        codexWeeklySnapshot("mixed", 30, 1),
+        codexWeeklySnapshot("second", 15, 2),
+        codexWeeklySnapshot("end", 0, 3),
+      ],
+    },
+  ];
+  for (const scenario of cases) {
+    const row = codexModelRows(loaded(scenario.calls, scenario.snapshots)).find(
+      (item) => item.model === "sol",
+    );
+    assert.ok(row);
+    assert.equal(row.sampleCost, 0);
+    assert.equal(row.observedConsumedPercent, 0);
+    assert.equal(row.estimated100PercentCost, undefined);
+  }
+});
+
+test("model quota averages do not attribute reset-crossing movement or costs", () => {
+  const reset = NOW / 1000 + 2 * 604_800;
+  const history = loaded(
+    [
+      codexModelCall("first", 59, 2),
+      codexModelCall("crossing", 44, 9),
+      codexModelCall("second", 29, 3),
+    ],
+    [
+      codexWeeklySnapshot("old-start", 60, 10),
+      codexWeeklySnapshot("old-end", 45, 12),
+      codexWeeklySnapshot("new-start", 30, 3, { resetsAt: reset }),
+      codexWeeklySnapshot("new-end", 15, 6, { resetsAt: reset }),
+    ],
+  );
+  const row = codexModelRows(history)[0];
+  assert.equal(row?.recordedCost, 14);
+  assert.equal(row?.sampleCost, 5);
+  assert.equal(row?.observedConsumedPercent, 5);
+  assert.equal(row?.estimated100PercentCost, 100);
+});
+
+test("model quota averages leave unsupported samples insufficient rather than inventing capacity", () => {
+  const baseline = loaded(
+    [codexModelCall("sol", 14, 9)],
+    [codexWeeklySnapshot("start", 15, 10), codexWeeklySnapshot("end", 0, 12)],
+  );
+  const firstSnapshot = baseline.snapshots[0];
+  assert.ok(firstSnapshot);
+  const cases = [
+    { ...baseline, calls: [...baseline.calls, codexModelCall("helper", 13, 1, "luna")] },
+    { ...baseline, calls: [...baseline.calls, codexModelCall("unpriced", 13, 0, "luna")] },
+    { ...baseline, calls: baseline.calls.map((call) => ({ ...call, preciseTimestamp: false })) },
+    {
+      ...baseline,
+      snapshots: loaded(
+        [],
+        [codexWeeklySnapshot("start", 30, 10), codexWeeklySnapshot("end", 0, 12)],
+      ).snapshots,
+    },
+    {
+      ...baseline,
+      snapshots: loaded(
+        [],
+        [codexWeeklySnapshot("start", 15, 10), codexWeeklySnapshot("end", 0, 10)],
+      ).snapshots,
+    },
+    {
+      ...baseline,
+      snapshots: [
+        ...baseline.snapshots,
+        {
+          ...firstSnapshot,
+          snapshot: {
+            ...firstSnapshot.snapshot,
+            observationId: "other-account",
+            identity: { kind: "account" as const, id: "account-b" },
+          },
+        },
+      ],
+    },
+  ];
+  for (const history of cases) {
+    const row = codexModelRows(history).find((item) => item.model === "sol");
+    assert.equal(row?.recordedCost, 9);
+    assert.equal(row?.estimated100PercentCost, undefined);
+  }
+});
+
+test("historical loading preserves request completion bounds for model quota activity", async (t) => {
+  const root = await workspace(t);
+  const request = assistant("bounded", null, "openai-codex", "sol", NOW - 20 * 60_000);
+  request.timestamp = new Date(NOW - 60_000).toISOString();
+  const history = await loadHistory(context(manager({ dir: root, entries: [request] })), {
+    now: NOW,
+    listAll: async () => [],
+    outputRoot: join(root, "no-outputs"),
+  });
+  assert.equal(history.calls[0]?.timestamp, NOW - 20 * 60_000);
+  assert.equal(history.calls[0]?.completedAt, NOW - 60_000);
+});
+
+test("a request at a measurement boundary cannot explain quota consumed before it started", () => {
+  const call = { ...codexModelCall("boundary", 15, 1), completedAt: NOW - 60_000 };
+  const row = codexModelRows(
+    loaded(
+      [call],
+      [
+        codexWeeklySnapshot("idle", 30, 0),
+        codexWeeklySnapshot("boundary", 15, 10),
+        codexWeeklySnapshot("end", 0, 11),
+      ],
+    ),
+  )[0];
+  assert.equal(row?.sampleCost, 1);
+  assert.equal(row?.observedConsumedPercent, 1);
+  assert.equal(row?.estimated100PercentCost, 100);
+});
+
+test("model account correlation follows request completion without changing aggregate correlation", () => {
+  const other = codexWeeklySnapshot("account-b", 5, 50);
+  other.identity = { kind: "account", id: "account-b" };
+  const call = { ...codexModelCall("bounded", 44, 9), completedAt: NOW - 31 * 60_000 };
+  const history = loaded(
+    [call],
+    [
+      codexWeeklySnapshot("account-a-start", 45, 0),
+      codexWeeklySnapshot("account-a-end", 30, 1),
+      other,
+    ],
+  );
+  const bucket = deriveHistoryRange(history, 60 * 60_000).quotas.providers[0]?.identities.find(
+    (identity) => identity.identity.id === "account-a",
+  )?.buckets[0];
+  assert.equal(bucket?.modelEstimates?.[0]?.estimated100PercentCost, undefined);
+  assert.equal(bucket?.capacity?.estimated100PercentCost, 900);
+});
+
+test("adjacent dominant samples align whole long-request costs with their full quota movement", () => {
+  const call = { ...codexModelCall("long", 44, 9), completedAt: NOW - 60_000 };
+  const row = codexModelRows(
+    loaded(
+      [
+        call,
+        codexModelCall("helper-a", 43, 0.1, "luna"),
+        codexModelCall("helper-b", 28, 0.1, "luna"),
+      ],
+      [
+        codexWeeklySnapshot("start", 45, 0),
+        codexWeeklySnapshot("first", 30, 1),
+        codexWeeklySnapshot("second", 15, 2),
+        codexWeeklySnapshot("end", 0, 3),
+      ],
+    ),
+  ).find((item) => item.model === "sol");
+  assert.equal(row?.sampleCost, 9);
+  assert.equal(row?.observedConsumedPercent, 3);
+  assert.equal(row?.intervals, 3);
+  assert.equal(row?.estimated100PercentCost, 300);
+});
+
+test("merged calibration rechecks model dominance without counting overlapping costs repeatedly", () => {
+  const call = { ...codexModelCall("long", 44, 9), completedAt: NOW - 60_000 };
+  const row = codexModelRows(
+    loaded(
+      [
+        call,
+        codexModelCall("helper-a", 43, 0.4, "luna"),
+        codexModelCall("helper-b", 28, 0.4, "luna"),
+        codexModelCall("helper-c", 13, 0.4, "luna"),
+      ],
+      [
+        codexWeeklySnapshot("start", 45, 0),
+        codexWeeklySnapshot("first", 30, 1),
+        codexWeeklySnapshot("second", 15, 2),
+        codexWeeklySnapshot("end", 0, 3),
+      ],
+    ),
+  ).find((item) => item.model === "sol");
+  assert.equal(row?.recordedCost, 9);
+  assert.equal(row?.sampleCost, 0);
+  assert.equal(row?.estimated100PercentCost, undefined);
+});
+
+test("point calls at the selected range start are valid calibration activity", () => {
+  const row = codexModelRows(
+    loaded(
+      [codexModelCall("at-since", 60, 1)],
+      [codexWeeklySnapshot("start", 60, 0), codexWeeklySnapshot("end", 45, 1)],
+    ),
+  )[0];
+  assert.equal(row?.recordedCost, 1);
+  assert.equal(row?.sampleCost, 1);
+  assert.equal(row?.observedConsumedPercent, 1);
+  assert.equal(row?.estimated100PercentCost, 100);
+});
+
+test("model dollar calibration supports OpenAI aliases but only main weekly Codex quotas", () => {
+  const cases = [
+    { provider: "openai", extra: {}, supported: true },
+    { provider: "openai-codex", extra: { windowMinutes: 300 }, supported: false },
+    { provider: "openai-codex", extra: { groupId: "spark" }, supported: false },
+    { provider: "provider-a", extra: {}, supported: false },
+  ];
+  for (const options of cases) {
+    const call = { ...codexModelCall("call", 14, 1), provider: options.provider };
+    const snapshots = [
+      codexWeeklySnapshot("start", 15, 10, options.extra),
+      codexWeeklySnapshot("end", 0, 12, options.extra),
+    ];
+    for (const snapshot of snapshots) snapshot.report.providerId = options.provider;
+    const bucket = deriveHistoryRange(loaded([call], snapshots), 60 * 60_000).quotas.providers.find(
+      (provider) => provider.providerId === options.provider,
+    )?.identities[0]?.buckets[0];
+    if (options.supported) {
+      assert.equal(bucket?.modelEstimates?.[0]?.estimated100PercentCost, 50);
+    } else {
+      assert.equal(bucket?.modelEstimates, undefined);
+    }
+  }
+});

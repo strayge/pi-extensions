@@ -557,6 +557,129 @@ test("Quotas compact names, aligned percentages, details, and indented warnings"
   );
 });
 
+test("Quotas add selected-range model dollar averages without replacing aggregate capacity", () => {
+  const history = fixture();
+  const view = deriveHistoryRange(history, HISTORY_RANGES[0].durationMs);
+  const provider = view.quotas.providers[0];
+  const identity = provider?.identities[0];
+  const bucket = identity?.buckets[0];
+  assert.ok(provider && identity && bucket);
+  provider.providerId = "openai-codex";
+  provider.providerName = "OpenAI Codex";
+  provider.identities = [identity];
+  bucket.latest = { ...bucket.latest, groupId: "codex", windowMinutes: 10_080 };
+  bucket.capacity = {
+    observedConsumedPercent: 20,
+    estimated100PercentTokens: 1_000,
+    estimated100PercentCost: 200,
+    lowerBound: false,
+    warnings: [],
+  };
+  bucket.modelEstimates = [
+    {
+      model: "gpt-supported",
+      recordedCost: 48,
+      sampleCost: 12.6,
+      observedConsumedPercent: 10.5,
+      intervals: 4,
+      estimated100PercentCost: 120,
+    },
+    {
+      model: "gpt-insufficient",
+      recordedCost: 3,
+      sampleCost: 1,
+      observedConsumedPercent: 0,
+      intervals: 1,
+    },
+  ];
+
+  const state = { ...createHistoryMenuState(), tab: "Quotas" as const };
+  for (const range of ["1d", "7d"] as const) {
+    const output = renderUsageHistory(history, { ...state, range }, 120, 100, {
+      view,
+      padToHeight: false,
+    }).lines.join("\n");
+    assert.match(output, /Weekly: 20% consumed · 100% ≈ \$200\.00/);
+    assert.ok(output.includes(`Historical ${range} model averages · API-equivalent dollars`));
+    assert.match(output, /gpt-supported: recorded \$48\.00 · weekly 100% ≈ \$120\.00/);
+    assert.match(output, /sample \$12\.60 \/ 10\.5 pp · 4 intervals \(≤15m\)/);
+    assert.match(output, /gpt-insufficient: recorded \$3\.00 · weekly 100% insufficient data/);
+    assert.match(output, /sample \$1\.00 \/ 0 pp · 1 interval \(≤15m\)\n/);
+    assert.equal(output.match(/Historical .* model averages/g)?.length, 1);
+    assert.doesNotMatch(output, /identity-[abc]|lifetime|permanent/i);
+  }
+  for (const tab of ["Models", "Cache"] as const) {
+    const output = renderUsageHistory(history, { ...state, tab }, 120, 100, { view }).lines.join(
+      "\n",
+    );
+    assert.doesNotMatch(output, /model averages|API-equivalent|gpt-supported|insufficient data/);
+  }
+
+  bucket.capacity = undefined;
+  bucket.current = undefined;
+  bucket.historicalBoundary = undefined;
+  bucket.latest = { ...bucket.latest, used: 0, remaining: 100 };
+  bucket.latestPercentage = 0;
+  bucket.observedPeak = 0;
+  bucket.observedConsumption = 0;
+  bucket.observations = [];
+  const zeroQuota = renderUsageHistory(history, state, 120, 100, { view }).lines.join("\n");
+  assert.match(zeroQuota, /gpt-insufficient: recorded \$3\.00 · weekly 100% insufficient data/);
+});
+
+test("per-model quota rows sanitize model IDs and stay width-safe with real theme", () => {
+  const history = fixture();
+  const view = deriveHistoryRange(history, HISTORY_RANGES[0].durationMs);
+  const provider = view.quotas.providers[0];
+  const identity = provider?.identities[0];
+  const bucket = identity?.buckets[0];
+  assert.ok(provider && identity && bucket);
+  provider.providerId = "openai";
+  provider.identities = [identity];
+  bucket.latest = { ...bucket.latest, groupId: "codex", windowMinutes: 10_080 };
+  bucket.modelEstimates = [
+    {
+      model: `模型👩‍💻\x1b[31mRED\x1b[0m\x1b]8;;https://evil.invalid\x07LINK\x1b]8;;\x07\r\n\t${"x".repeat(200)}`,
+      recordedCost: 10,
+      sampleCost: 2,
+      observedConsumedPercent: 0.5,
+      intervals: 2,
+      estimated100PercentCost: 400,
+    },
+    {
+      model: "gpt-no-samples",
+      recordedCost: 0,
+      sampleCost: 0,
+      observedConsumedPercent: 0,
+      intervals: 0,
+    },
+  ];
+  const colors = new Proxy<Record<string, string>>(
+    { accent: "#88ccff", dim: "#777777" },
+    { get: (target, key: string) => target[key] ?? "#ffffff" },
+  );
+  const theme = new Theme(colors as never, colors as never, "truecolor");
+  const state = { ...createHistoryMenuState(), tab: "Quotas" as const };
+  for (const width of [1, 2, 3, 10, 24, 80, 120]) {
+    const options = { view, padToHeight: false };
+    const plain = renderUsageHistory(history, state, width, 10_000, options).lines;
+    const themed = renderUsageHistory(history, state, width, 10_000, { ...options, theme }).lines;
+    assert.deepEqual(themed.map(stripAnsi), plain, `model rows differ at width ${width}`);
+    assert.ok(plain.every((line) => visibleWidth(line) <= width));
+    assert.ok(themed.every((line) => visibleWidth(line) <= width));
+    const output = plain.join("\n");
+    for (const forbidden of ["\x1b", "https://evil", "\r", "\t"])
+      assert.equal(output.includes(forbidden), false);
+    assert.doesNotMatch(output, /x{100}|identity-[abc]/);
+    if (width === 120) {
+      assert.match(output, /weekly 100% ≈\s+\$400\.00/);
+      assert.match(output, /sample \$2\.00 \/ 0\.5 pp · 2 intervals \(≤15m\)/);
+      assert.match(output, /gpt-no-samples: recorded \$0\.00 · weekly 100% insufficient data/);
+      assert.match(output, /sample \$0\.00 \/ 0 pp · 0 intervals \(≤15m\)/);
+    }
+  }
+});
+
 test("Quotas present every visible identity with anonymous account numbering", () => {
   const history = fixture();
   const view = deriveHistoryRange(history, HISTORY_RANGES[0].durationMs);
