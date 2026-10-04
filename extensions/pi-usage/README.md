@@ -1,8 +1,8 @@
 # pi-usage
 
 Provider usage for [pi](https://github.com/earendil-works/pi): how much of the
-current account's quota is left, in the statusline and behind one `/usage`
-command.
+current account's quota is left, in the statusline and behind `/usage`.
+`/speed` separately reports historical model-request speed without live queries.
 
 Supports OpenAI ChatGPT subscription windows for `/login openai` (`openai`)
 and legacy `openai-codex` sessions, OpenRouter API-key spend limits, and OpenCode
@@ -27,9 +27,10 @@ pi -e ./src/index.ts
 | Command | Effect |
 | --- | --- |
 | `/usage` | Show current usage, historical usage, refresh, saved-reset, and display actions |
+| `/speed [range]` | Show one historical model-speed table; select a range when omitted |
 
-The command takes no arguments — history, refresh, and display options are menu
-actions, not flags.
+`/usage` takes no arguments — history, refresh, and display options are menu
+actions, not flags. `/speed` accepts `1d`, `2d`, `3d`, `5d`, `7d`, or `14d`.
 
 ## What it reports
 
@@ -364,6 +365,77 @@ Recorded cost may be zero because historical pricing is partial; the extension
 does not invent prices. Temporary subagent output can be disabled, removed, or
 not yet flushed, arbitrary custom session directories are not globally
 discoverable, and ephemeral compaction work is absent from `.output`.
+
+## Historical model speed
+
+Run `/speed` to select a range, or use `/speed 7d` directly. A single table groups
+requests by exact provider/model, requested thinking level, and explicit versus
+inferred effort. `*` marks effort inferred from the nearest ancestor
+`thinking_level_change` on that request's branch. Explicit message metadata wins;
+unknown effort stays unknown. Explicit and inferred groups are never merged.
+
+The table shows observed sample counts (`N now/prev`), selected-period median
+effective output tokens/second, median whole-request seconds, and **Trend**.
+Up/Down and PageUp/PageDown scroll; Left/Right reveals columns on narrow terminals;
+Escape closes. UI-capable non-terminal clients receive the same table in a dialog.
+Nothing is posted into model context.
+
+The report reuses historical usage discovery and deduplication across **all
+discoverable project histories**, not just the current project: Pi's default
+session listing, active in-memory entries and its discoverable custom session
+directory, plus temporary subagent outputs. Arbitrary custom roots are not globally
+discoverable. Loading and reporting makes no live quota/auth or model request,
+and records no new telemetry, snapshot, or database entry. Existing `/usage`
+statusline refresh behavior is unchanged.
+
+### Measurements and comparisons
+
+Elapsed time is available only for persisted assistant messages with valid
+embedded message-start and later session-entry timestamps. It approximates the
+**whole model request**, including network/provider latency and persistence-time
+extension-handler overhead, but excluding subsequent tool execution. It is not
+time-to-first-token or intrinsic generation-phase speed. Output tokens already
+include reasoning tokens; the rate is `output / elapsed seconds`. The table takes
+medians of per-request rates and durations, not a ratio of summed tokens and time.
+
+Only successful `stop` and `toolUse` responses with positive finite elapsed time
+and output tokens contribute to observations or comparison cohorts. `length`,
+`error`, `aborted`, and unknown stop reasons are excluded as unsuccessful.
+Standalone usage, compaction, and branch-summary accounting entries are ignored,
+not counted as missing assistant timings. Output transcript flush times never
+supply elapsed time, even when an embedded start timestamp survives.
+
+Every range ends at the history load's fixed time and is compared with the
+**immediately preceding equal-length period**. Calls are assigned by their retained
+start timestamp (entry/flush fallback only for coverage); the shared boundary
+belongs to the selected period only. `14d` requires 28 days of discoverable
+history; `30d` is not offered because its baseline exceeds the loader's 30-day
+history horizon.
+
+Within each table row, comparable cohorts also match:
+
+- approximate context (`input + cacheRead + cacheWrite`): `<16k`, `16–64k`,
+  `64–128k`, `≥128k`;
+- output size: `<500`, `500–2k`, `2–8k`, `≥8k`;
+- response stop/type (`stop` versus `toolUse`).
+
+Here `k` means 1,000 tokens. Each cohort needs **at least 10 observed requests in
+each period**. Its percentage change is
+`(current median rate / previous median rate - 1) × 100`.
+Trend shows that percentage for one eligible cohort, or the minimum…maximum
+percentage changes and cohort count for several; it never averages them into one
+aggregate. Without an eligible cohort it says `insufficient`, even if the row's
+overall sample counts are large. Row counts include all observed requests, not
+only matched cohorts.
+
+Changes are descriptive observations, not higher/lower/stable verdicts,
+statistical confidence claims, controlled benchmarks, or model recommendations.
+Coarse bins cannot control workload, cache effects, provider routing/load,
+reasoning mix, or network changes. The coverage line counts selected-period,
+attributed, timestamped assistant usage records: observed, unsuccessful, untimed,
+and no usable output. Malformed usage or unresolvable routes may be absent from
+those counts and produce warnings; undated warnings are explicitly unscoped.
+Discovery, missing/unflushed files, and ambiguous deduplication limit completeness.
 
 ## Usage snapshots
 

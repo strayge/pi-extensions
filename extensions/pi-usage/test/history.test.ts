@@ -16,6 +16,7 @@ import {
   CACHE_GAP_BUCKETS,
   callsInRange,
   deriveHistoryRange,
+  fingerprintCall,
   type LoadedHistory,
   loadHistory,
   type NormalizedCall,
@@ -2448,4 +2449,148 @@ test("model dollar calibration supports OpenAI aliases but only main weekly Code
       assert.equal(bucket?.modelEstimates, undefined);
     }
   }
+});
+
+test("retains request timing and branch-relative effort in active and disk history without changing dedup", async (t) => {
+  const root = await workspace(t);
+  const change = (id: string, parentId: string | null, thinkingLevel: string) => ({
+    type: "thinking_level_change",
+    id,
+    parentId,
+    thinkingLevel,
+  });
+  const timed = (id: string, parentId: string | null, effort?: string) => {
+    const entry = assistant(id, parentId);
+    entry.timestamp = new Date(NOW - 500).toISOString();
+    if (effort) (entry.message as Record<string, unknown>).thinkingLevel = effort;
+    return entry;
+  };
+  const entries = [
+    change("low", null, "low"),
+    change("high", "low", "high"),
+    timed("branch-low", "low"),
+    timed("branch-high", "high"),
+    timed("explicit", "high", "max"),
+    timed("missing", "absent"),
+    { type: "custom", id: "cycle-a", parentId: "cycle-b" },
+    { type: "custom", id: "cycle-b", parentId: "cycle-a" },
+    timed("cyclic", "cycle-a"),
+    standaloneUsage("warm", "branch-low"),
+    {
+      type: "compaction",
+      id: "compact-speed",
+      parentId: "branch-low",
+      timestamp: NOW,
+      usage: usage(),
+      summary: "summary",
+    },
+    {
+      type: "branch_summary",
+      id: "summary-speed",
+      parentId: "branch-high",
+      timestamp: NOW,
+      usage: usage(),
+      summary: "summary",
+    },
+  ];
+  const disk = join(root, "root.jsonl");
+  const fork = join(root, "fork.jsonl");
+  await writeJsonl(disk, [header("disk-root"), ...entries]);
+  await writeJsonl(fork, [header("fork-root", disk), ...entries]);
+  const outputRoot = join(root, "outputs");
+  const explicit = entries.find((entry) => entry.id === "explicit") as ReturnType<typeof assistant>;
+  await writeJsonl(join(outputRoot, "cwd", "disk-root", "tasks", "agent.output"), [
+    { timestamp: NOW, message: explicit.message },
+  ]);
+  for (const active of [true, false]) {
+    const result = await loadHistory(
+      context(
+        manager({
+          dir: root,
+          ...(active ? { file: disk, header: header("disk-root"), entries } : {}),
+        }),
+      ),
+      {
+        now: NOW,
+        outputRoot,
+        listAll: async () => [info(disk), info(fork)],
+      },
+    );
+    assert.equal(result.calls.length, 8);
+    const calls = new Map(result.calls.map((call) => [call.entryId, call]));
+    assert.deepEqual(
+      ["branch-low", "branch-high", "explicit", "missing", "cyclic"].map((id) => {
+        const call = calls.get(id);
+        return [call?.kind, call?.durationMs, call?.thinkingLevel, call?.thinkingLevelInferred];
+      }),
+      [
+        ["assistant", 500, "low", true],
+        ["assistant", 500, "high", true],
+        ["assistant", 500, "max", false],
+        ["assistant", 500, undefined, false],
+        ["assistant", 500, undefined, false],
+      ],
+    );
+    assert.deepEqual(
+      ["warm", "compact-speed", "summary-speed"].map((id) => [
+        calls.get(id)?.kind,
+        calls.get(id)?.durationMs,
+      ]),
+      [
+        ["usage", undefined],
+        ["compaction", undefined],
+        ["branch_summary", undefined],
+      ],
+    );
+    const retained = calls.get("explicit");
+    assert.ok(retained);
+    assert.equal(
+      fingerprintCall(retained),
+      fingerprintCall({
+        ...retained,
+        durationMs: 999,
+        thinkingLevel: "low",
+        thinkingLevelInferred: true,
+        kind: "usage",
+      }),
+    );
+  }
+});
+
+test("missing or invalid request endpoints and output flush timestamps never become elapsed time", async (t) => {
+  const root = await workspace(t);
+  const entries = [
+    assistant("equal", null),
+    assistant("negative", null),
+    assistant("missing-start", null),
+    assistant("missing-end", null),
+  ];
+  entries[1].timestamp = new Date(NOW - 2_000).toISOString();
+  delete (entries[2].message as Record<string, unknown>).timestamp;
+  entries[3].timestamp = "invalid";
+  const output = assistant("output", null);
+  (output.message as Record<string, unknown>).thinkingLevel = "high";
+  const outputRoot = join(root, "outputs");
+  await writeJsonl(join(outputRoot, "cwd", "output-root", "tasks", "agent.output"), [
+    { timestamp: NOW, message: output.message },
+    { timestamp: NOW, message: { ...output.message, timestamp: undefined } },
+  ]);
+  const result = await loadHistory(context(manager({ dir: root, entries })), {
+    now: NOW,
+    outputRoot,
+    listAll: async () => [],
+  });
+  assert.equal(result.calls.length, 6);
+  assert.ok(
+    result.calls.every((call) => call.kind === "assistant" && call.durationMs === undefined),
+  );
+  assert.deepEqual(
+    result.calls
+      .filter((call) => call.source.kind === "output")
+      .map((call) => [call.timestampFidelity, call.thinkingLevel]),
+    [
+      ["embedded", "high"],
+      ["flush", "high"],
+    ],
+  );
 });

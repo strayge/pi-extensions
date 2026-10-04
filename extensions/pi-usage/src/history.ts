@@ -60,6 +60,11 @@ export interface NormalizedCall {
   preciseTimestamp: boolean;
   usage: NormalizedUsage;
   stopReason?: string;
+  kind?: "assistant" | "usage" | "compaction" | "branch_summary";
+  /** Approximate whole request: embedded message start to persisted entry end. */
+  durationMs?: number;
+  thinkingLevel?: string;
+  thinkingLevelInferred?: boolean;
   /** Canonical content digest retained only for persisted/transcript deduplication. */
   contentHash?: string;
   /** Test/input compatibility; disk loading always projects this to contentHash. */
@@ -221,6 +226,10 @@ function timestamp(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function thinkingLevel(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
 function object(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -285,6 +294,9 @@ function projectSessionRow(value: Record<string, unknown>): Record<string, unkno
   if (value.type === "model_change") {
     return { ...base, provider: value.provider, modelId: value.modelId };
   }
+  if (value.type === "thinking_level_change") {
+    return { ...base, thinkingLevel: thinkingLevel(value.thinkingLevel) };
+  }
   if (value.type === "usage") {
     return {
       ...base,
@@ -306,6 +318,7 @@ function projectSessionRow(value: Record<string, unknown>): Record<string, unkno
         timestamp: message.timestamp,
         usage: message.usage === undefined ? undefined : projectUsage(message.usage),
         stopReason: message.stopReason,
+        thinkingLevel: thinkingLevel(message.thinkingLevel),
         ...(message.usage === undefined ? {} : { contentHash: contentHash(message.content) }),
       },
     };
@@ -357,6 +370,7 @@ function projectOutputRow(value: Record<string, unknown>): Record<string, unknow
       timestamp: message.timestamp,
       usage: message.usage === undefined ? undefined : projectUsage(message.usage),
       stopReason: message.stopReason,
+      thinkingLevel: thinkingLevel(message.thinkingLevel),
       contentHash: contentHash(message.content),
     },
   };
@@ -865,6 +879,28 @@ function normalizePersistedSession(
   for (const entry of session.entries) {
     if (typeof entry.id === "string") entriesById.set(entry.id, entry);
   }
+  const thinkingByEntryId = new Map<string, string | undefined>();
+  const inheritedThinking = (parentId: unknown): string | undefined => {
+    const visited = new Set<string>();
+    let level: string | undefined;
+    while (typeof parentId === "string" && !visited.has(parentId)) {
+      checkAbort(signal);
+      if (thinkingByEntryId.has(parentId)) {
+        level = thinkingByEntryId.get(parentId);
+        break;
+      }
+      visited.add(parentId);
+      const parent = entriesById.get(parentId);
+      if (!parent) break;
+      if (parent.type === "thinking_level_change") {
+        level = thinkingLevel(parent.thinkingLevel);
+        break;
+      }
+      parentId = parent.parentId;
+    }
+    for (const id of visited) thinkingByEntryId.set(id, level);
+    return level;
+  };
   const callsByEntryId = new Map<string, NormalizedCall>();
   for (let index = 0; index < session.entries.length; index += 1) {
     checkAbort(signal);
@@ -906,6 +942,10 @@ function normalizePersistedSession(
     let stopReason: string | undefined;
     let callTimestamp: number | undefined;
     let fidelity: TimestampFidelity = "entry";
+    let kind: NormalizedCall["kind"];
+    let durationMs: number | undefined;
+    let effort: string | undefined;
+    let effortInferred = false;
     if (entry.type === "message") {
       const message = object(entry.message);
       if (message?.role !== "assistant") continue;
@@ -925,11 +965,23 @@ function normalizePersistedSession(
       model = typeof message.model === "string" ? message.model : undefined;
       content = message.contentHash;
       stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+      kind = "assistant";
       const embedded = timestamp(message.timestamp);
+      const end = timestamp(entry.timestamp);
+      if (embedded !== undefined && embedded >= 0 && end !== undefined && end > embedded) {
+        const elapsed = end - embedded;
+        if (Number.isFinite(elapsed)) durationMs = elapsed;
+      }
+      effort = thinkingLevel(message.thinkingLevel);
+      if (effort === undefined) {
+        effort = inheritedThinking(entry.parentId);
+        effortInferred = effort !== undefined;
+      }
       callTimestamp = embedded ?? timestamp(entry.timestamp);
       fidelity =
         embedded === undefined ? (callTimestamp === undefined ? "missing" : "entry") : "embedded";
     } else if (entry.type === "compaction" || entry.type === "branch_summary") {
+      kind = entry.type;
       usage = normalizeUsage(entry.usage);
       if (entry.usage !== undefined && !usage) {
         warning(
@@ -949,6 +1001,7 @@ function normalizePersistedSession(
       callTimestamp = timestamp(entry.timestamp);
       fidelity = callTimestamp === undefined ? "missing" : "entry";
     } else if (entry.type === "usage") {
+      kind = "usage";
       usage = normalizeUsage(entry.usage);
       if (entry.usage !== undefined && !usage) {
         warning(
@@ -995,6 +1048,10 @@ function normalizePersistedSession(
       preciseTimestamp: fidelity !== "missing",
       usage,
       stopReason,
+      kind,
+      durationMs,
+      thinkingLevel: effort,
+      thinkingLevelInferred: effortInferred,
       contentHash: typeof content === "string" ? content : undefined,
       source: session.source,
       conversationId: session.source.id,
@@ -1074,6 +1131,9 @@ function normalizeOutput(
       timestampFidelity: fidelity,
       preciseTimestamp: fidelity === "embedded",
       usage,
+      kind: "assistant",
+      thinkingLevel: thinkingLevel(message.thinkingLevel),
+      thinkingLevelInferred: false,
       stopReason: typeof message.stopReason === "string" ? message.stopReason : undefined,
       contentHash: typeof message.contentHash === "string" ? message.contentHash : undefined,
       source: transcript.source,
