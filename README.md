@@ -2,6 +2,8 @@
 
 Extensions for the [pi](https://github.com/earendil-works/pi) coding agent.
 
+All extensions require pi >=1.0.2.
+
 ## vendor/
 
 `vendor/docs` and `vendor/examples` are expected to be **symlinks** into the

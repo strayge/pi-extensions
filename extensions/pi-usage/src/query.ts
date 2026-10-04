@@ -4,6 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { abortError, errorMessage, fingerprintResolvedAuth, redactUsageError } from "./core.ts";
 import {
   enrichCodexResetCreditExpirations,
+  isCodexProvider,
   normalizeCodexBackendPayload,
 } from "./providers/codex.ts";
 import { normalizeOpenCodeGoUsagePayload } from "./providers/opencode-go.ts";
@@ -38,45 +39,52 @@ const MAX_ERROR_BODY_BYTES = 4 * 1024;
 
 export const AUTH_FINGERPRINT_SALT = randomBytes(32);
 
-export const SUPPORTED_ADAPTERS: readonly UsageProviderAdapter[] = [
-  {
-    id: "openai-codex",
-    displayName: "OpenAI Codex",
-    semantics: {
-      kind: "consumer-subscription",
-      label: "ChatGPT subscription limits",
-    },
-    async query(auth, signal, timeoutMs) {
-      const deadline = Date.now() + timeoutMs;
-      const payload = await fetchProviderJson(
-        CODEX_USAGE_URL,
+const CODEX_ADAPTER: UsageProviderAdapter = {
+  id: "openai-codex",
+  displayName: "OpenAI Codex",
+  semantics: {
+    kind: "consumer-subscription",
+    label: "ChatGPT subscription limits",
+  },
+  async query(auth, signal, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    const payload = await fetchProviderJson(
+      CODEX_USAGE_URL,
+      auth,
+      signal,
+      timeoutMs,
+      "Codex usage endpoint",
+    );
+    const report = {
+      ...normalizeCodexBackendPayload(payload as CodexBackendPayload, Date.now()),
+      providerId: this.id,
+      providerName: this.displayName,
+    };
+    if (signal.aborted) throw abortError();
+    const resetCredits = report.metrics.find((metric) => metric.id === "reset-credits");
+    if (typeof resetCredits?.value !== "number" || resetCredits.value <= 0) return report;
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return report;
+    try {
+      const details = await fetchProviderJson(
+        CODEX_RESET_CREDITS_URL,
         auth,
         signal,
-        timeoutMs,
-        "Codex usage endpoint",
+        remainingMs,
+        "Codex reset-credit endpoint",
       );
-      const report = normalizeCodexBackendPayload(payload as CodexBackendPayload, Date.now());
-      if (signal.aborted) throw abortError();
-      const resetCredits = report.metrics.find((metric) => metric.id === "reset-credits");
-      if (typeof resetCredits?.value !== "number" || resetCredits.value <= 0) return report;
-
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) return report;
-      try {
-        const details = await fetchProviderJson(
-          CODEX_RESET_CREDITS_URL,
-          auth,
-          signal,
-          remainingMs,
-          "Codex reset-credit endpoint",
-        );
-        return enrichCodexResetCreditExpirations(report, details as CodexResetCreditsPayload);
-      } catch (error) {
-        if (signal.aborted) throw isAbortError(error) ? error : abortError();
-        return report;
-      }
-    },
+      return enrichCodexResetCreditExpirations(report, details as CodexResetCreditsPayload);
+    } catch (error) {
+      if (signal.aborted) throw isAbortError(error) ? error : abortError();
+      return report;
+    }
   },
+};
+
+export const SUPPORTED_ADAPTERS: readonly UsageProviderAdapter[] = [
+  { ...CODEX_ADAPTER, id: "openai", displayName: "OpenAI" },
+  CODEX_ADAPTER,
   {
     id: "openrouter",
     displayName: "OpenRouter",
@@ -145,24 +153,39 @@ export async function resolveUsageAuth(
     if (authorizationFrom(result)) modelAuth = result;
   }
   if (typeof registry.getProviderAuth !== "function") {
-    throw new Error("pi-usage requires Pi 0.81.0 or newer to validate resolved provider auth.");
+    throw new Error("pi-usage requires Pi 1.0.2 or newer to validate resolved provider auth.");
   }
   const providerResult = await registry.getProviderAuth(adapter.id);
   if (
-    providerResult?.auth.baseUrl &&
-    !hasOfficialUrlOrigin(providerResult.auth.baseUrl, adapter.id)
+    (modelAuth?.baseUrl && !hasOfficialUrlOrigin(modelAuth.baseUrl, adapter.id)) ||
+    (providerResult?.auth.baseUrl && !hasOfficialUrlOrigin(providerResult.auth.baseUrl, adapter.id))
   ) {
     throw new Error(
       `${adapter.displayName} usage cannot send a proxy-resolved credential to the official usage endpoint.`,
     );
+  }
+  // The OpenAI provider accepts both API keys and ChatGPT subscriptions. Only
+  // its resolved OAuth credential belongs at the ChatGPT usage endpoint.
+  if (adapter.id === "openai") {
+    if (providerResult?.source !== "OAuth" || !providerResult.auth.apiKey) return undefined;
+    // Provider headers can override both registry views without changing the
+    // OAuth source label; the underlying token remains the authority.
+    const oauthAuthorization = `Bearer ${providerResult.auth.apiKey}`;
+    if (authorizationFrom(providerResult.auth) !== oauthAuthorization) {
+      throw new Error("OpenAI usage cannot send overridden provider authorization to ChatGPT.");
+    }
+    if (modelAuth && authorizationFrom(modelAuth) !== oauthAuthorization) {
+      throw new Error("OpenAI usage cannot send overridden model authorization to ChatGPT.");
+    }
   }
   const auth = modelAuth ?? providerResult?.auth;
   if (!auth) return undefined;
   const authorization = authorizationFrom(auth);
   if (!authorization) return undefined;
   const headers: Record<string, string> = { Authorization: authorization };
-  const accountId =
-    adapter.id === "openai-codex" ? codexAccountIdFromAuthorization(authorization) : undefined;
+  const accountId = isCodexProvider(adapter.id)
+    ? codexAccountIdFromAuthorization(authorization)
+    : undefined;
   if (accountId) headers[CODEX_ACCOUNT_HEADER] = accountId;
   const secrets = [
     auth.apiKey,
@@ -203,7 +226,10 @@ export async function redeemCodexResetCredit(
   signal: AbortSignal,
   timeoutMs: number,
 ): Promise<CodexResetCreditRedemption> {
-  if (auth.model.provider !== "openai-codex" || !hasOfficialOrigin(auth.model, "openai-codex")) {
+  if (
+    !isCodexProvider(auth.model.provider) ||
+    !hasOfficialOrigin(auth.model, auth.model.provider)
+  ) {
     throw new Error("A reset can only be used with official OpenAI Codex authorization.");
   }
   if (!redeemRequestId) throw new Error("A reset redemption requires an idempotency key.");
@@ -364,6 +390,7 @@ async function readBoundedResponse(
 type RequestAuth = {
   apiKey?: string;
   headers?: Record<string, string | null>;
+  baseUrl?: string;
 };
 
 type UsageAuthRegistry = {
@@ -372,7 +399,8 @@ type UsageAuthRegistry = {
   ): Promise<({ ok: true } & RequestAuth) | { ok: false; error: string }>;
   getProviderAuth?(providerId: string): Promise<
     | {
-        auth: RequestAuth & { baseUrl?: string };
+        auth: RequestAuth;
+        source?: string;
       }
     | undefined
   >;
@@ -431,6 +459,7 @@ function hasOfficialOrigin(model: PiModel, providerId: string): boolean {
 
 function hasOfficialUrlOrigin(value: string, providerId: string): boolean {
   const expected = {
+    openai: "https://api.openai.com",
     "openai-codex": "https://chatgpt.com",
     openrouter: "https://openrouter.ai",
     "opencode-go": "https://opencode.ai",

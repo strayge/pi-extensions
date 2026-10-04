@@ -379,4 +379,11 @@ test("Codex adapter preserves windows, credits, and model-specific statusline bu
     formatUsageStatusline(report, sparkModel, presetConfig("legacy")),
     "codex spark 90% 5h",
   );
+  const openaiReport = { ...report, providerId: "openai", providerName: "OpenAI" };
+  assert.match(formatUsageReport(openaiReport, "current"), /OpenAI Usage · Current/);
+  assert.doesNotMatch(formatUsageReport(openaiReport, "current"), /GPT-5\.3 Codex Spark/);
+  assert.equal(
+    formatUsageStatusline(openaiReport, { ...sparkModel, provider: "openai" }),
+    "codex spark [█░░░░░░░] 10%",
+  );
 });

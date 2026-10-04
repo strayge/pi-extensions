@@ -101,7 +101,7 @@ describe("toolDescriptionMode", () => {
     expect(desc).toContain("very thorough");
   });
 
-  it("compact mode swaps in the short description with one-line type list", () => {
+  it("compact mode swaps in the short description with one-line type list", async () => {
     const tools = setup({ toolDescriptionMode: "compact" });
     const desc: string = tools.get("Agent").description;
     expect(desc).toContain("Launch an autonomous agent");
@@ -111,8 +111,16 @@ describe("toolDescriptionMode", () => {
     expect(desc).toContain("- general-purpose:");
     expect(desc).toContain("- Explore: Fast read-only search agent for locating code. (Tools:");
     expect(desc).not.toContain("very thorough");
-    // The point of the feature: materially smaller than the full version.
-    expect(desc.length).toBeLessThan(1600);
+    // Compare with the current full description rather than a stale absolute
+    // threshold as the available agent list evolves.
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ toolDescriptionMode: "full" }));
+    const second = makePi();
+    subagentsExtension(second.pi);
+    try {
+      expect(desc.length).toBeLessThan(second.tools.get("Agent").description.length);
+    } finally {
+      await second.handlers.get("session_shutdown")?.({}, { hasUI: false, ui: {} } as any);
+    }
   });
 
   it("invalid mode in the settings file is dropped — full description", () => {

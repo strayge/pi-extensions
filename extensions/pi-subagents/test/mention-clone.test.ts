@@ -48,6 +48,7 @@ beforeEach(() => {
   inMemory.mockReturnValue({ kind: "in-memory-session-manager", appendMessage: vi.fn() } as any);
   buildSessionContext.mockReset();
   buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "high", model: null } as any);
+  cloneExecuteTool.mockReset();
 });
 
 /** The main session's context — the one the spawn must be attributed to. */
@@ -57,6 +58,7 @@ function mainCtx(overrides: Record<string, unknown> = {}) {
     model: { id: "main-model" },
     thinkingLevel: "high",
     modelRegistry: { runtime: { kind: "runtime" } },
+    ui: { marker: "root-ui" },
     getSystemPrompt: vi.fn(() => "the live system prompt"),
     sessionManager: {
       getEntries: vi.fn(() => [{ type: "message" }] as any[]),
@@ -97,6 +99,8 @@ function visibleTools(opts: any): any[] {
  * the tools Pi would really expose reach it, so a clone built with an allowlist
  * that hides its own tool prompts a model with nothing to call.
  */
+const cloneExecuteTool = vi.fn();
+
 function cloneSession(turn?: (tool: any) => Promise<void> | void) {
   const session = {
     agent: { transformContext: undefined },
@@ -120,7 +124,11 @@ function cloneSession(turn?: (tool: any) => Promise<void> | void) {
 /** What the model does when it plays along: one Agent call. */
 const callsAgent = (params: Record<string, unknown> = { subagent_type: "Explore", prompt: "go" }) =>
   async (tool: any) => {
-    await tool.execute("clone-tool-call-1", params, undefined, undefined, { cwd: "/fork" });
+    await tool.execute("clone-tool-call-1", params, undefined, undefined, {
+      cwd: "/fork",
+      tools: [tool],
+      executeTool: cloneExecuteTool,
+    });
   };
 
 const opts = (over: Record<string, unknown> = {}) => ({
@@ -309,18 +317,30 @@ describe("cloning the conversation", () => {
 });
 
 describe("attributing the spawn to the real session", () => {
-  it("runs the real Agent handler with the MAIN context, not the fork's", async () => {
-    // The handler reads cwd, model and sessionManager.getSessionId() off this
-    // to place the .output transcript and rootSessionId. The clone's own
-    // context would file both under a session that is about to be discarded.
+  it("keeps root attribution while forwarding the clone tool pipeline", async () => {
+    // The handler reads cwd, model, sessionManager and ui from this context to
+    // place the .output transcript and rootSessionId. Nested calls must still
+    // belong to the invoking clone, not to the root session.
     const tool = agentTool();
-    const o = opts({ agentTool: tool });
+    const rootTools = [{ name: "root-only" }];
+    const rootExecuteTool = vi.fn();
+    const o = opts({ ctx: mainCtx({ tools: rootTools, executeTool: rootExecuteTool }), agentTool: tool });
     cloneSession(callsAgent());
 
     await runMentionClone(o);
 
     expect(tool.execute).toHaveBeenCalledTimes(1);
-    expect(tool.execute.mock.calls[0][4]).toBe(o.ctx);
+    const forwarded = tool.execute.mock.calls[0][4];
+    expect(forwarded).not.toBe(o.ctx);
+    expect(forwarded.cwd).toBe(o.ctx.cwd);
+    expect(forwarded.model).toBe(o.ctx.model);
+    expect(forwarded.sessionManager).toBe(o.ctx.sessionManager);
+    expect(forwarded.ui).toBe(o.ctx.ui);
+    expect(forwarded.tools).toHaveLength(1);
+    expect(forwarded.tools[0].name).toBe("Agent");
+    expect(forwarded.tools).not.toBe(rootTools);
+    expect(forwarded.executeTool).toBe(cloneExecuteTool);
+    expect(forwarded.executeTool).not.toBe(rootExecuteTool);
   });
 
   it("passes no tool-call id, since the real session issued none", async () => {

@@ -40,13 +40,13 @@
     "test": "node --test --experimental-strip-types test/*.test.ts"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": ">=1.0.2",
+    "@earendil-works/pi-tui": ">=1.0.2"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.6",
-    "@earendil-works/pi-coding-agent": "0.87.1",
-    "@earendil-works/pi-tui": "0.87.1",
+    "@earendil-works/pi-coding-agent": "1.0.2",
+    "@earendil-works/pi-tui": "1.0.2",
     "@types/node": "26.1.1",
     "typescript": "7.0.2"
   }

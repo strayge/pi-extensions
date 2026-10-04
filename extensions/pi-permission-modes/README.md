@@ -27,7 +27,7 @@ To opt into strict mode, add `"processMode": "strict"` to the user-owned version
 
 ## Setup and state compatibility
 
-Install this package normally with Pi. On Linux, install bubblewrap (with FD bind-mount support), socat, and ripgrep using your system package manager. On macOS, scoped access requires APFS and Apple's `/usr/bin/sandbox-exec`; search uses Homebrew ripgrep (`brew install ripgrep`). No bubblewrap or socat is needed on macOS. The runtime dependency is pinned and patched by `patch-package` during installation.
+Install this package normally with pi >=1.0.2. On Linux, install bubblewrap (with FD bind-mount support), socat, and ripgrep using your system package manager. On macOS, scoped access requires APFS and Apple's `/usr/bin/sandbox-exec`; search uses Homebrew ripgrep (`brew install ripgrep`). No bubblewrap or socat is needed on macOS. The runtime dependency is pinned and patched by `patch-package` during installation.
 
 The only policy source is `<agent-dir>/permission-mode/permission-mode.json`, normally `~/.pi/agent/permission-mode/permission-mode.json`. Repository `.pi/permission-mode.json` files are never read, imported, changed, backed up, or deleted.
 

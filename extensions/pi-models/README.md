@@ -16,7 +16,7 @@ Typing filters by provider, model ID, provider/model ID, or model name.
 pi install npm:@strayge/pi-models
 ```
 
-Requires Node.js >=22.19.0 and pi.
+Requires Node.js >=22.19.0 and pi >=1.0.2.
 
 For development, load this checkout directly:
 

@@ -10,6 +10,7 @@ import {
   paceMarkerPosition,
   renderBar,
 } from "./gauge.ts";
+import { isCodexProvider } from "./providers/codex.ts";
 import type {
   ProviderUsageState,
   UsageBucket,
@@ -50,7 +51,7 @@ export function formatUsageReport(
   if (report.accountLabel) lines.push(`Account: ${report.accountLabel}`);
   lines.push(`Semantics: ${report.semantics.label}`, "");
 
-  if (report.providerId === "openai-codex") formatCodexReport(lines, report, config, now);
+  if (isCodexProvider(report.providerId)) formatCodexReport(lines, report, config, now);
   else if (report.providerId === "openrouter") formatOpenRouterReport(lines, report, config);
   else if (report.providerId === "opencode-go") formatOpenCodeGoReport(lines, report, config, now);
   else formatGenericReport(lines, report, config);
@@ -84,7 +85,7 @@ export function formatUsageSegments(
   config: UsageDisplayConfig = defaultDisplayConfig(),
   now: number = Date.now(),
 ): UsageSegment[] | undefined {
-  if (report.providerId === "openai-codex") return codexSegments(report, config, now, model);
+  if (isCodexProvider(report.providerId)) return codexSegments(report, config, now, model);
   if (report.providerId === "openrouter") return openRouterSegments(report, config, now);
   if (report.providerId === "opencode-go") return openCodeGoSegments(report, config, now);
   return undefined;
@@ -496,7 +497,7 @@ function valueWord(config: UsageDisplayConfig): string {
 
 function selectCodexGroup(report: UsageReport, model?: UsageModel): string | undefined {
   const groups = [...new Set(report.buckets.map((bucket) => bucket.groupId ?? bucket.id))];
-  if (model?.provider !== "openai-codex") {
+  if (!model || !isCodexProvider(model.provider)) {
     return groups.includes("codex") ? "codex" : groups[0];
   }
   const modelKeys = normalizedModelKeys(model);

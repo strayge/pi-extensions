@@ -147,6 +147,93 @@ test("/usage queries the current runtime account and offers its next actions", a
   assert.equal(statuses.get("usage"), "openrouter $75.00 left");
 });
 
+test("OpenAI ChatGPT login publishes subscription usage and saved-reset actions", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (input) =>
+    new Response(
+      JSON.stringify(
+        String(input).endsWith("/rate-limit-reset-credits")
+          ? { available_count: 1, credits: [{ status: "available", expires_at: null }] }
+          : {
+              rate_limit: { primary_window: { used_percent: 20, limit_window_seconds: 18_000 } },
+              rate_limit_reset_credits: { available_count: 1 },
+            },
+      ),
+      { status: 200 },
+    );
+  const mock = createMockPi();
+  usageExtension(mock.pi);
+  const model = { ...codexModel, provider: "openai", baseUrl: "https://api.openai.com/v1" };
+  const token = codexJwt("new-openai-account", "signature");
+  const { ctx, statuses } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model,
+    select: async (title: string, options: string[]) => {
+      assert.match(title, /OpenAI Usage · Current/);
+      assert.ok(options.includes("Use one reset…"));
+      return "Close";
+    },
+    modelRegistry: {
+      getProviderAuth: async () => ({ auth: { apiKey: token }, source: "OAuth" }),
+      getAvailable: () => [model],
+      getAll: () => [model],
+      getProviderDisplayName: () => "OpenAI",
+    },
+  });
+  const command = mock.commands.get("usage");
+  assert.ok(command);
+  await command.handler("", ctx);
+  assert.equal(statuses.get("usage"), "codex 80% 5h");
+  const entry = mock.entries[0];
+  assert.ok(entry);
+  assert.equal((entry.data as UsageSnapshot).report.providerId, "openai");
+  assert.doesNotMatch(JSON.stringify(mock.entries), /new-openai-account|signature/);
+});
+
+test("OpenAI API keys and provider overrides never reach the ChatGPT usage endpoint", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let fetches = 0;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    assert.fail("API keys must not be sent to ChatGPT");
+  };
+  const model = { ...codexModel, provider: "openai", baseUrl: "https://api.openai.com/v1" };
+  for (const source of ["OPENAI_API_KEY", "OAuth"]) {
+    const mock = createMockPi();
+    usageExtension(mock.pi);
+    const auth =
+      source === "OAuth"
+        ? { apiKey: "oauth-token", headers: { Authorization: "Bearer sk-api-key" } }
+        : { apiKey: "sk-api-key" };
+    const { ctx, statuses } = createMockContext({
+      hasUI: true,
+      mode: "rpc",
+      model,
+      select: async () => "Close",
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, ...auth }),
+        getProviderAuth: async () => ({ auth, source }),
+        getAvailable: () => [model],
+        getAll: () => [model],
+        getProviderDisplayName: () => "OpenAI",
+      },
+    });
+    const command = mock.commands.get("usage");
+    assert.ok(command);
+    await command.handler("", ctx);
+    assert.equal(statuses.get("usage"), "auth unavailable");
+    assert.deepEqual(mock.entries, []);
+  }
+  assert.equal(fetches, 0);
+});
+
 test("opening and closing usage history reuses the fetched live outcome", async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => {

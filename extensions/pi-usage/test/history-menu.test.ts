@@ -1503,6 +1503,19 @@ test("Quotas hides zero-only OpenCode Go histories and their capacity warnings",
   assert.equal(view.quotas.providers.length, 3);
   assert.equal(view.quotas.providers[0]?.identities.length, 2);
   assert.equal(view.quotas.providers[1]?.identities[0]?.buckets.length, 3);
+  const openaiProvider = view.quotas.providers[0];
+  assert.ok(openaiProvider);
+  openaiProvider.providerId = "openai";
+  openaiProvider.providerName = "OpenAI";
+  const openai = renderUsageHistory(
+    history,
+    { ...createHistoryMenuState(), tab: "Quotas" },
+    100,
+    100,
+    { view },
+  ).lines.join("\n");
+  assert.match(openai, /OpenAI\nWeekly[\s\S]*used 10 percent/);
+  assert.doesNotMatch(openai, /Spark|Secondary/);
 });
 
 test("legacy Codex bucket fallback accepts only an explicit codex bucket id", () => {

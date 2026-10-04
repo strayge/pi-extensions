@@ -10,6 +10,13 @@ import type {
 
 const MAX_NORMALIZED_RESET_CREDITS = 4_096;
 
+/** Pi's current and legacy ChatGPT logins share the same quota endpoints. */
+export function isCodexProvider(
+  providerId: string | undefined,
+): providerId is "openai" | "openai-codex" {
+  return providerId === "openai" || providerId === "openai-codex";
+}
+
 export function normalizeCodexBackendPayload(
   payload: CodexBackendPayload,
   capturedAt: number,

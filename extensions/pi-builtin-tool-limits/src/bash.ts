@@ -184,6 +184,23 @@ function statusFromError(error: unknown): string {
   return message;
 }
 
+function statusFromResult(result: {
+  isError?: boolean;
+  structuredContent?: unknown;
+}): string | undefined {
+  if (!result.isError) return undefined;
+  const structuredContent = result.structuredContent;
+  if (
+    typeof structuredContent === "object" &&
+    structuredContent !== null &&
+    "exit_code" in structuredContent &&
+    typeof structuredContent.exit_code === "number"
+  ) {
+    return `Command exited with code ${structuredContent.exit_code}`;
+  }
+  return "Command failed";
+}
+
 function renderCapture(
   snapshot: CaptureSnapshot,
   status: string | undefined,
@@ -282,6 +299,7 @@ export function createBashOverride(cwd: string, options?: BashToolOptions): Bash
             const snapshot = capture.snapshot();
             const rendered = renderCapture(snapshot, undefined);
             onUpdate({
+              ..._update,
               content: rendered.text ? [{ type: "text", text: rendered.text }] : [],
               details: rendered.details,
             });
@@ -289,8 +307,9 @@ export function createBashOverride(cwd: string, options?: BashToolOptions): Bash
         : undefined;
 
       let executionError: unknown;
+      let nativeResult: Awaited<ReturnType<typeof native.execute>> | undefined;
       try {
-        await native.execute(toolCallId, params, signal, wrappedUpdate, ctx);
+        nativeResult = await native.execute(toolCallId, params, signal, wrappedUpdate, ctx);
       } catch (error) {
         executionError = error;
       }
@@ -308,8 +327,10 @@ export function createBashOverride(cwd: string, options?: BashToolOptions): Bash
         throw new Error(rendered.text || statusFromError(executionError));
       }
 
-      const rendered = renderCapture(snapshot, undefined);
+      if (!nativeResult) throw new Error("Bash command returned no result");
+      const rendered = renderCapture(snapshot, statusFromResult(nativeResult));
       return {
+        ...nativeResult,
         content: [{ type: "text", text: rendered.text }],
         details: rendered.details,
       };

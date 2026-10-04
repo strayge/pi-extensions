@@ -20,7 +20,7 @@ to forward permission dialogs.
 pi install npm:@strayge/pi-attention
 ```
 
-Requires Node.js >=22.19.0 and pi.
+Requires Node.js >=22.19.0 and pi >=1.0.2.
 
 For development from a repository checkout:
 

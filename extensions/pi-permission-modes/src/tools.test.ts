@@ -26,7 +26,7 @@ function fixture(ask: AskApproval = async () => undefined) {
   const root = { family: randomUUID(), binding: bindPath(directory) };
   const catalog = resolveCatalog(config, root, { agentDir: directory, home: directory });
   const owner = new PermissionOwner(catalog, { ask });
-  const context = { cwd: directory, hasUI: false } as ExtensionContext;
+  const context = { ...({ cwd: directory, hasUI: false } as ExtensionContext), tools: [], executeTool: async () => { throw new Error("Nested tools are not part of this fixture"); } };
   return {
     directory,
     owner,

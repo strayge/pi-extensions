@@ -30,10 +30,10 @@ function fixture() {
   const tools = new Map<string, Parameters<ExtensionAPI["registerTool"]>[0]>();
   const hooks = new Map<string, Hook[]>(); const notifications: string[] = [];
   const manager = SessionManager.inMemory(project); let confirm = true;
-  const ctx = { cwd: project, hasUI: true, sessionManager: manager, ui: {
+  const ctx = { ...({ cwd: project, hasUI: true, sessionManager: manager, ui: {
     confirm: async () => confirm, select: async () => undefined, input: async () => undefined,
     notify: (message: string) => notifications.push(message), setStatus: () => {}, theme: { fg: (_color: string, value: string) => value },
-  } } as unknown as ExtensionCommandContext;
+  } } as unknown as ExtensionCommandContext), tools: [], executeTool: async () => { throw new Error("Nested tools are not part of this fixture"); } };
   const pi = {
     events: createEventBus(), registerFlag: () => {}, registerShortcut: () => {},
     registerTool: (tool: Parameters<ExtensionAPI["registerTool"]>[0]) => tools.set(tool.name, tool), getFlag: () => undefined,

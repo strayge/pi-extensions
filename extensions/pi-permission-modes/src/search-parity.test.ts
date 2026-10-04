@@ -54,7 +54,7 @@ test("fd and rg differential fixtures cover parent/tool ignore precedence, overr
       ask: async () => undefined,
     });
     const [find, grep] = createSearchTools(() => owner, directory);
-    const ctx = { cwd: directory } as ExtensionContext;
+    const ctx = { ...({ cwd: directory } as ExtensionContext), tools: [], executeTool: async () => { throw new Error("Nested tools are not part of this fixture"); } };
     const nativeFind = spawnSync(fd, ["--glob", "--hidden", "--color=never", "--", "*.txt", directory], {
       encoding: "utf8",
     });

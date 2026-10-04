@@ -36,7 +36,18 @@ function fixture() {
   config.modes.subproject = config.modes.project!;
   const root = { family: randomUUID(), binding: bindPath(project) };
   const owner = () => new PermissionOwner(resolveCatalog(config, root, { agentDir: dir, home: dir }), { ask: async () => undefined });
-  return { dir, project, config, put, owner, ctx: { cwd: project } as ExtensionContext, close: () => {
+  return {
+    dir,
+    project,
+    config,
+    put,
+    owner,
+    ctx: {
+      ...({ cwd: project } as ExtensionContext),
+      tools: [],
+      executeTool: async () => { throw new Error("Nested tools are not part of this fixture"); },
+    },
+    close: () => {
     if (home === undefined) delete process.env.HOME; else process.env.HOME = home;
     if (xdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = xdg;
     process.chdir(previousCwd);

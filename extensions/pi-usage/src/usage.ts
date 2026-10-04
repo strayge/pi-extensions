@@ -27,6 +27,7 @@ import { showDisplayMenu } from "./display-menu.ts";
 import { formatProviderState, formatUsageSegments, formatUsageStatusline } from "./format.ts";
 import { loadHistory } from "./history.ts";
 import { showUsageHistory } from "./history-menu.ts";
+import { isCodexProvider } from "./providers/codex.ts";
 import {
   adapterForProvider,
   isStaleExtensionContextError,
@@ -573,7 +574,8 @@ export default function usageExtension(
                 const currentModel = ctx.model;
                 const adapter = adapterForProvider(currentModel?.provider);
                 if (
-                  adapter?.id !== "openai-codex" ||
+                  !adapter ||
+                  !isCodexProvider(adapter.id) ||
                   modelIdentity(currentModel) !== modelIdentity(model)
                 ) {
                   return { kind: "account-changed" as const };
@@ -637,8 +639,10 @@ export default function usageExtension(
                 "warning",
               );
             }
-            cache.clearProvider("openai-codex");
-            failures.delete(`openai-codex:${expectedFingerprint}`);
+            for (const providerId of ["openai", "openai-codex"]) {
+              cache.clearProvider(providerId);
+              failures.delete(`${providerId}:${expectedFingerprint}`);
+            }
             latest = undefined;
             statuslineSlot.refresh();
             safeSetStatus(ctx, "checking", model);
@@ -770,7 +774,7 @@ export default function usageExtension(
 function availableResetCredits(outcome: QueryOutcome): number {
   if (
     outcome.state.status !== "ready" ||
-    outcome.state.providerId !== "openai-codex" ||
+    !isCodexProvider(outcome.state.providerId) ||
     !outcome.fingerprint
   ) {
     return 0;

@@ -44,6 +44,28 @@ describe("bash capture", () => {
     assert.equal(result.content[0]?.type, "text");
   });
 
+  it("preserves native structured output beyond the model-facing cap", async () => {
+    const output = "structured\n".repeat(1100);
+    const result = await runWithChunks([Buffer.from(output)]);
+    const structured = result.structuredContent as {
+      output: string;
+      truncated: boolean;
+      exit_code: number;
+      wall_time_seconds: number;
+    };
+
+    assert.equal(structured.output, output);
+    assert.equal(structured.truncated, false);
+    assert.equal(structured.exit_code, 0);
+    assert.equal(typeof structured.wall_time_seconds, "number");
+    assert.ok(
+      Buffer.byteLength(result.content[0]?.type === "text" ? result.content[0].text : "") <=
+        MAX_OUTPUT_BYTES,
+    );
+    assert.ok(result.details?.fullOutputPath);
+    await rm(result.details.fullOutputPath, { force: true });
+  });
+
   it("keeps the tail, persists exact raw bytes, and reports effective metadata", async () => {
     const chunks = [
       Buffer.from("first\n".repeat(2000)),
@@ -85,17 +107,20 @@ describe("bash capture", () => {
     assert.equal(text.text, "prefix-界-suffix");
   });
 
-  it("closes and reports the temp stream for non-zero commands", async () => {
+  it("returns native failure metadata and cleans up the temp stream", async () => {
     const chunks = [Buffer.from("output\n".repeat(3000))];
-    await assert.rejects(
-      () => runWithChunks(chunks, 7),
-      (error: Error) => {
-        assert.match(error.message, /Command exited with code 7/);
-        const path = error.message.match(/Full output: (\/[^\s\]]+)/)?.[1];
-        assert.ok(path);
-        return true;
-      },
+    const result = await runWithChunks(chunks, 7);
+    const structured = result.structuredContent as { exit_code: number };
+    const path = result.details?.fullOutputPath;
+
+    assert.equal(result.isError, true);
+    assert.equal(structured.exit_code, 7);
+    assert.match(
+      result.content[0]?.type === "text" ? result.content[0].text : "",
+      /Command exited with code 7/,
     );
+    assert.ok(path);
+    await rm(path, { force: true });
   });
 
   it("closes and reports the temp stream for timeout and abort errors", async () => {

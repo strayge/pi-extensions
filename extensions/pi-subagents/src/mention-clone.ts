@@ -37,10 +37,11 @@
  *   - the clone is handed the *registered* `Agent` tool, whose handler closes
  *     over the main activation, so it spawns top-level: widget, fleet row,
  *     handle, completion notification, all as if the main model had called it;
- *   - that tool is re-bound to the main `ExtensionContext`, because the handler
- *     reads `cwd`, `model` and `sessionManager.getSessionId()` off it to place
- *     the transcript and the `rootSessionId`. The clone's own context would
- *     file both under the throwaway fork;
+ *   - that tool retains the main session's context for attribution, because
+ *     the handler reads `cwd`, `model` and `sessionManager.getSessionId()` to
+ *     place the transcript and `rootSessionId`. Tool execution capabilities
+ *     still belong to the invoking clone; its attribution alone would file
+ *     the spawn under the throwaway fork;
  *   - it is called with no tool-call id. The clone's turn produces one, but the
  *     real session never issued it, and a `<tool-use-id>` pointing at nothing
  *     is exactly the bug the mention-resume path had to fix;
@@ -60,6 +61,7 @@ import {
   convertToLlm,
   createAgentSession,
   type ExtensionContext,
+  type ExtensionToolContext,
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -97,7 +99,7 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
   let spawned = false;
   const cloneAgentTool: ToolDefinition = {
     ...agentTool,
-    execute: (_cloneToolCallId, params, signal, onUpdate, _cloneCtx) => {
+    execute: (_cloneToolCallId, params, signal, onUpdate, cloneToolCtx) => {
       // One spawn per mention. The clone has a single tool and every reason to
       // stop after using it, but a model that decides to "also" launch a second
       // agent would do it where nobody can see and nobody asked.
@@ -114,12 +116,19 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
       // false, and a foreground agent answers through its TOOL RESULT — which
       // here is delivered into a session that is disposed moments later, so the
       // agent would run, appear in the widget and the fleet, and reach nobody.
+      // Preserve root attribution, but keep the clone's tool pipeline and
+      // nested-call ownership; the two contexts must not be passed by identity.
+      const attributionContext: ExtensionToolContext = {
+        ...ctx,
+        tools: cloneToolCtx.tools,
+        executeTool: cloneToolCtx.executeTool,
+      };
       return agentTool.execute(
         undefined as never,
         { ...(params as Record<string, unknown>), run_in_background: true } as typeof params,
         signal,
         onUpdate,
-        ctx,
+        attributionContext,
       );
     },
   };

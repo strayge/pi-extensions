@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -124,7 +133,7 @@ function info(path: string) {
 async function workspace(t: { after: (fn: () => Promise<void>) => void }) {
   const path = await mkdtemp(join(tmpdir(), "pi-usage-history-"));
   t.after(() => rm(path, { recursive: true, force: true }));
-  return path;
+  return realpath(path);
 }
 
 test("merges active unflushed entries, custom sessions, branch-safe billed calls, and records", async (t) => {

@@ -123,8 +123,9 @@ test("positive tree allows and approved asks never authorize escaping descendant
       assert.notEqual(decide(owner.snapshot(), bindPath(alias), "read").action, "allow", row.name);
       assert.notEqual(decide(owner.snapshot(), bindPath(alias), "write").action, "allow", row.name);
       const [read, , write] = createDirectTools(() => owner, f.work);
-      await assert.rejects(read.execute("read", { path: alias }, undefined, undefined, { cwd: f.work } as ExtensionContext), /denied/);
-      await assert.rejects(write.execute("write", { path: alias, content: "ESCAPED" }, undefined, undefined, { cwd: f.work } as ExtensionContext), /denied/);
+      const ctx = { ...({ cwd: f.work } as ExtensionContext), tools: [], executeTool: async () => { throw new Error("Nested tools are not part of this fixture"); } };
+      await assert.rejects(read.execute("read", { path: alias }, undefined, undefined, ctx), /denied/);
+      await assert.rejects(write.execute("write", { path: alias, content: "ESCAPED" }, undefined, undefined, ctx), /denied/);
       if (native) {
         let output = "";
         await runtime.operations(owner.snapshot(), { id: f.root.family, network: () => ({ revision: 0, restricted: false, allowedDomains: [], deniedDomains: [] }), decideHost: async () => false }, () => {}).exec(

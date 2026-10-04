@@ -8,6 +8,7 @@ import {
   UsageCache,
 } from "../src/core.ts";
 import {
+  adapterForProvider,
   queryProviderUsage,
   redeemCodexResetCredit,
   resolveUsageAuth,
@@ -243,6 +244,156 @@ test("Codex auth omits account routing for opaque tokens and unsafe claims", asy
     assert.deepEqual(auth?.headers, { Authorization: `Bearer ${token}` });
     assert.equal(auth?.accountKey, undefined);
   }
+});
+
+test("OpenAI subscription auth routes the current OAuth account without forwarding API keys", async () => {
+  const adapter = adapterForProvider("openai");
+  assert.ok(adapter);
+  const model = {
+    id: "gpt-6.1-sol",
+    name: "GPT-6.1 Sol",
+    provider: "openai",
+    baseUrl: "https://api.openai.com/v1",
+  };
+  const token = codexJwt("subscription-account");
+  const contextFor = (source: string, modelToken = token) =>
+    createMockContext({
+      model,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: modelToken }),
+        getProviderAuth: async () => ({ auth: { apiKey: token }, source }),
+        getAvailable: () => [model],
+        getAll: () => [model],
+      },
+    }).ctx;
+
+  const auth = await resolveUsageAuth(contextFor("OAuth"), adapter);
+  assert.deepEqual(auth?.headers, {
+    Authorization: `Bearer ${token}`,
+    "ChatGPT-Account-Id": "subscription-account",
+  });
+  assert.match(auth?.accountKey ?? "", /^[0-9a-f]{64}$/u);
+  assert.equal(await resolveUsageAuth(contextFor("OPENAI_API_KEY"), adapter), undefined);
+  await assert.rejects(
+    () => resolveUsageAuth(contextFor("OAuth", "sk-model-override"), adapter),
+    /overridden model authorization/,
+  );
+});
+
+test("OpenAI OAuth labels cannot legitimize provider-wide authorization overrides", async () => {
+  const adapter = adapterForProvider("openai");
+  assert.ok(adapter);
+  const model = {
+    id: "gpt-6.1-sol",
+    name: "GPT-6.1 Sol",
+    provider: "openai",
+    baseUrl: "https://api.openai.com/v1",
+  };
+  for (const header of ["Authorization", "authorization"]) {
+    const resolved = {
+      apiKey: codexJwt("subscription-account"),
+      headers: { [header]: "Bearer sk-provider-override" },
+    };
+    const { ctx } = createMockContext({
+      model,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, ...resolved }),
+        getProviderAuth: async () => ({ auth: resolved, source: "OAuth" }),
+        getAvailable: () => [model],
+        getAll: () => [model],
+      },
+    });
+    await assert.rejects(() => resolveUsageAuth(ctx, adapter), /overridden provider authorization/);
+  }
+});
+
+test("OpenAI subscription auth rejects configured and resolved proxy origins", async () => {
+  const adapter = adapterForProvider("openai");
+  assert.ok(adapter);
+  const model = {
+    id: "gpt-6.1-sol",
+    name: "GPT-6.1 Sol",
+    provider: "openai",
+    baseUrl: "https://api.openai.com/v1",
+  };
+  for (const proxyAt of ["model", "model-auth", "provider-auth"]) {
+    const { ctx } = createMockContext({
+      model: {
+        ...model,
+        baseUrl: proxyAt === "model" ? "https://proxy.example.test/v1" : model.baseUrl,
+      },
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({
+          ok: true,
+          apiKey: "token",
+          ...(proxyAt === "model-auth" ? { baseUrl: "https://proxy.example.test/v1" } : {}),
+        }),
+        getProviderAuth: async () => ({
+          auth: {
+            apiKey: "token",
+            ...(proxyAt === "provider-auth" ? { baseUrl: "https://proxy.example.test/v1" } : {}),
+          },
+          source: "OAuth",
+        }),
+        getAvailable: () => [model],
+        getAll: () => [model],
+      },
+    });
+    await assert.rejects(() => resolveUsageAuth(ctx, adapter), /official usage endpoint/);
+  }
+});
+
+test("OpenAI subscription queries and saved resets preserve the selected provider identity", async (t) => {
+  const adapter = adapterForProvider("openai");
+  assert.ok(adapter);
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    requests.push(url);
+    const payload = url.endsWith("/consume")
+      ? { code: "reset", windows_reset: 1 }
+      : url.endsWith("/rate-limit-reset-credits")
+        ? { available_count: 1, credits: [{ status: "available", expires_at: null }] }
+        : {
+            rate_limit: { primary_window: { used_percent: 20, limit_window_seconds: 18_000 } },
+            rate_limit_reset_credits: { available_count: 1 },
+          };
+    return new Response(JSON.stringify(payload), { status: 200 });
+  };
+  const model = {
+    id: "gpt-6.1-sol",
+    name: "GPT-6.1 Sol",
+    provider: "openai",
+    baseUrl: "https://api.openai.com/v1",
+  };
+  const token = codexJwt("subscription-account");
+  const { ctx } = createMockContext({
+    model,
+    modelRegistry: {
+      getProviderAuth: async () => ({ auth: { apiKey: token }, source: "OAuth" }),
+      getAvailable: () => [model],
+      getAll: () => [model],
+    },
+  });
+  const auth = await resolveUsageAuth(ctx, adapter);
+  assert.ok(auth);
+  const result = await queryProviderUsage(adapter, auth, new AbortController().signal, 1_000);
+  assert.equal(result.providerId, "openai");
+  assert.equal(result.providerName, "OpenAI");
+  assert.deepEqual(result.metrics[0]?.resetExpirations, [{ kind: "never" }]);
+  assert.deepEqual(
+    await redeemCodexResetCredit(auth, "openai-reset", new AbortController().signal, 1_000),
+    { code: "reset", windowsReset: 1 },
+  );
+  assert.deepEqual(requests, [
+    "https://chatgpt.com/backend-api/wham/usage",
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+  ]);
 });
 
 test("provider cancellation preserves AbortError identity", async () => {

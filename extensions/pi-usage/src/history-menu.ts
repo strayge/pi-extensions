@@ -17,6 +17,7 @@ import {
   type QuotaBucketHistory,
   type QuotaProviderHistory,
 } from "./history.ts";
+import { isCodexProvider } from "./providers/codex.ts";
 
 export const HISTORY_TABS = ["Models", "Cache", "Quotas"] as const;
 export const HISTORY_RANGES = [
@@ -605,7 +606,7 @@ function quotaPresentationProviders(view: HistoryRangeView): QuotaProviderHistor
       const buckets = identity.buckets.filter(
         (bucket) =>
           visibleQuotaBucket(bucket) &&
-          (provider.providerId !== "openai-codex" || isMainCodexBucket(bucket)),
+          (!isCodexProvider(provider.providerId) || isMainCodexBucket(bucket)),
       );
       return buckets.length > 0 ? [{ ...identity, buckets }] : [];
     });

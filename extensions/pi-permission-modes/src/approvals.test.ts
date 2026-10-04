@@ -34,7 +34,8 @@ test("edited approval can create the first missing ancestor without granting unr
       return { lifetime: "session", directory: ancestor, binding: bindPath(ancestor) };
     };
     const [, , write] = createDirectTools(() => f.owner, f.project);
-    await write.execute("create", { path: target, content: "allowed" }, undefined, undefined, { cwd: f.project } as ExtensionContext);
+    const ctx = { ...({ cwd: f.project } as ExtensionContext), tools: [], executeTool: async () => { throw new Error("Nested tools are not part of this fixture"); } };
+    await write.execute("create", { path: target, content: "allowed" }, undefined, undefined, ctx);
     assert.equal(asked, 1); assert.equal(readFileSync(target, "utf8"), "allowed");
     assert.equal(f.owner.snapshot().grants[0]?.binding.canonical, ancestor);
     f.owner.ask = async () => undefined;

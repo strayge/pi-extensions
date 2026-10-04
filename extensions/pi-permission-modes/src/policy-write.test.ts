@@ -566,7 +566,8 @@ test("globally approved creation continues the originating direct write without 
       f.owner.ask = async () => ({ lifetime: "global", directory: created, binding: bindPath(created) });
       if (cacheFailure) t.mock.method(f.store, "save", () => { throw new Error("injected cache failure"); });
       const [, , write] = createDirectTools(() => f.owner, f.project);
-      await write.execute("write", { path: file, content: "CREATED" }, undefined, undefined, { cwd: f.project } as ExtensionContext);
+      const ctx = { ...({ cwd: f.project } as ExtensionContext), tools: [], executeTool: async () => { throw new Error("Nested tools are not part of this fixture"); } };
+      await write.execute("write", { path: file, content: "CREATED" }, undefined, undefined, ctx);
       assert.equal(readFileSync(file, "utf8"), "CREATED");
       assert.equal(f.owner.snapshot().grants.length, 0);
       assert.equal(decide(f.owner.snapshot(), bindPath(file), "write").action, "allow");
