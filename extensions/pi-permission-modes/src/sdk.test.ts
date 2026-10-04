@@ -24,6 +24,7 @@ import permissionExtension, { type PermissionBridgeRequest } from "./index.ts";
 import { bindPath } from "./paths.ts";
 import { resolveCatalog } from "./policy.ts";
 import { GlobalPolicyWriter } from "./policy-write.ts";
+import { runtime } from "./sandbox.ts";
 
 /** Real Pi loading and tool dispatch need no provider request or personal policy edits. */
 test("isolated SDK child keeps inherited direct and shell enforcement and sees parent grant/revoke", async () => {
@@ -102,6 +103,8 @@ test("isolated SDK child keeps inherited direct and shell enforcement and sees p
     assert.ok(!session.getAllTools().some((tool) => tool.name === "show_plan"));
   } finally {
     await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
+    // This fixture supplies the parent owner; child shutdown does not retire its runtime.
+    await runtime.shutdown(owner.id);
     session.dispose();
     rmSync(dir, { recursive: true, force: true });
   }

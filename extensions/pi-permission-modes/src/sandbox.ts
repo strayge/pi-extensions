@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, rmdirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,7 @@ import { assertBinding, bindPath, identity, resolvePermissionBinding, sameIdenti
 import { withProxyReady } from "./proxy-wait.ts";
 import { assertNativeSemantics } from "./native-semantics.ts";
 import { decide, positiveTarget } from "./evaluation.ts";
+import { isHostAllowed, normalizeDomain } from "./network.ts";
 import type { FileIdentity, FilesystemSnapshot, NetworkSnapshot, PathBinding, ProcessMode } from "./schema.ts";
 
 type Manager = typeof import("@anthropic-ai/sandbox-runtime").SandboxManager;
@@ -217,6 +219,36 @@ async function waitFor(promise: Promise<void>, signal?: AbortSignal): Promise<vo
   }
 }
 
+/** Format only the current invocation's violation block and actionable network hint. */
+export function formatSandboxDiagnostics(annotated: string, network: NetworkSnapshot): string {
+  const block = annotated.match(/<sandbox_violations>\r?\n[\s\S]*?\r?\n<\/sandbox_violations>/)?.[0];
+  if (!block) return "";
+  const hosts = [...block.matchAll(/^deny network-outbound\s+(\S+):\d+\s+\((?:user denied|host is not on the allow list)\)$/gm)]
+    .map((match) => normalizeDomain(match[1]!))
+    .filter((host): host is string => Boolean(host))
+    .filter((host, index, all) => all.indexOf(host) === index)
+    .filter((host) => network.restricted && !isHostAllowed(host, network.deniedDomains) && !isHostAllowed(host, network.allowedDomains));
+  return `${block}${hosts.length ? `\nHint: request_network_access can approve: ${hosts.join(", ")}.` : ""}`;
+}
+
+async function reportSandboxDiagnostics(
+  manager: Manager,
+  commandId: string,
+  options: Parameters<BashOperations["exec"]>[2],
+  family: RuntimeFamily,
+): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  try {
+    const diagnostics = formatSandboxDiagnostics(
+      manager.annotateStderrWithSandboxFailures(commandId, ""),
+      family.network(),
+    );
+    if (diagnostics) options.onData(Buffer.from(`\n${diagnostics}\n`));
+  } catch {
+    /* Diagnostics are informational and cannot change execution or cleanup. */
+  }
+}
+
 /** One coordinator owns the process-global manager, including incompatible-family serialization. */
 export class RuntimeCoordinator {
   private manager?: Manager;
@@ -267,6 +299,8 @@ export class RuntimeCoordinator {
             } : {}),
           },
           ({ host, port }) => family.decideHost(host, port),
+          // The Linux monitor uses init-time grants, not concurrent per-command policies.
+          process.platform === "darwin",
         );
       }
       await this.initializing;
@@ -289,6 +323,7 @@ export class RuntimeCoordinator {
         let preparing = true;
         try {
         const network = family.network();
+        const commandId = randomUUID();
         const confined = snapshot.profile.kind !== "unrestricted" || network.restricted;
         const processMode = confined ? snapshot.processMode ?? "compatible" : "compatible";
         if (confined && noSandbox)
@@ -317,6 +352,7 @@ export class RuntimeCoordinator {
                 processMode,
               } as Parameters<Manager["wrapWithSandbox"]>[2],
               options.signal,
+              { commandId, commandText: command },
             );
           }
           options.signal?.throwIfAborted();
@@ -330,7 +366,11 @@ export class RuntimeCoordinator {
           if (process.platform === "darwin") validateLaunch();
           preparing = false;
           family.reportEnforcement?.();
-          return await runProcess("/bin/bash", ["-c", wrapped], cwd, options, pins.fds, processMode);
+          try {
+            return await runProcess("/bin/bash", ["-c", wrapped], cwd, options, pins.fds, processMode);
+          } finally {
+            if (manager) await reportSandboxDiagnostics(manager, commandId, options, family);
+          }
         } finally {
           pins.close();
           release();
