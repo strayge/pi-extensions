@@ -85,6 +85,23 @@ test("creating an ungranted protected directory requires a separate exception be
   }
 });
 
+test("blocking a future ask during directory creation does not create it or publish a grant/receipt", async () => {
+  const f = fixture(true);
+  try {
+    const target = path.join(f.outside, "new");
+    f.owner.ask = async (request) => {
+      if (request.kind === "directory") return { lifetime: "session" };
+      assert.equal(request.kind, "exception"); assert.equal(request.scope, "tree");
+      return { action: "block" };
+    };
+    await assert.rejects(f.owner.requestDirectory(target, "write", "create protected directory"), /blocked/);
+    assert.equal(existsSync(target), false);
+    assert.equal(f.owner.sessionBlocks[0]!.scope, "tree");
+    assert.equal(f.owner.snapshot().grants.length, 0);
+    assert.equal(f.owner.snapshot().exceptions.length, 0);
+  } finally { f.close(); }
+});
+
 test("owner retirement aborts active execution and drains its lease without cancelling ordinary mode switches", async () => {
   const f = fixture();
   try {

@@ -118,6 +118,28 @@ test("native Seatbelt enforces user file grants without admitting parent or sibl
   } finally { await runtime.shutdown(f.root.family); f.close(); }
 });
 
+test("native Seatbelt enforces session file blocks from the production owner snapshot", { skip: !mac }, async () => {
+  const f = fixture(); const runtime = new RuntimeCoordinator();
+  try {
+    const file = path.join(f.project, "secret"); const sibling = path.join(f.project, "sibling");
+    writeFileSync(file, "BLOCKED-CONTENT"); writeFileSync(sibling, "SIBLING-CONTENT");
+    const owner = new PermissionOwner(resolveCatalog(f.config, f.root, { agentDir: f.dir, home: f.dir }), {
+      ask: async () => ({ action: "block" }),
+    });
+    await assert.rejects(owner.requestGrant(file, "read", "block exact file"), /blocked/);
+    writeFileSync(`${file}.tmp`, "REPLACED-CONTENT"); renameSync(`${file}.tmp`, file);
+    let output = "";
+    const result = await runtime.operations(owner.snapshot(), f.family, () => {}).exec(
+      `cat secret; if echo bad > secret; then echo WRITE-LEAK; fi; echo UPDATED > sibling; cat sibling; echo DONE`,
+      f.project, { onData: (data) => { output += data; } },
+    );
+    assert.equal(result.exitCode, 0, output);
+    assert.doesNotMatch(output, /BLOCKED-CONTENT|REPLACED-CONTENT|WRITE-LEAK/);
+    assert.match(output, /UPDATED/);
+    assert.equal(readFileSync(file, "utf8"), "REPLACED-CONTENT");
+  } finally { await runtime.shutdown(f.root.family); f.close(); }
+});
+
 test("macOS launch revalidates bindings and cancellation kills the contained process", { skip: !mac }, async () => {
   const f = fixture(); const runtime = new RuntimeCoordinator();
   try {

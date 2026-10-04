@@ -89,8 +89,15 @@ test("isolated SDK child keeps inherited direct and shell enforcement and sees p
     assert.equal(owner.snapshot().grants.length, 0);
     assert.match(JSON.stringify((await read.execute("global", { path: "sentinel" })).content), /shared-live-grant/);
     assert.match(JSON.stringify((await bash.execute("global-shell", { command: "cat sentinel", timeout: 10 })).content), /shared-live-grant/);
+    owner.ask = async () => ({ action: "block" });
+    await assert.rejects(owner.requestDirectory(outside, "read", "parent session block"), /blocked/);
+    owner.ask = async () => assert.fail("Children must use the root's live denial without another dialog");
+    await assert.rejects(read.execute("blocked-child", { path: "sentinel" }), /denied/);
+    await assert.rejects(bash.execute("blocked-child-shell", { command: "cat sentinel" }), /denied/);
     await owner.changeGlobal({ kind: "clear" });
+    assert.equal(owner.sessionBlocks.length, 1);
     await assert.rejects(read.execute("global-revoked", { path: "sentinel" }), /denied/);
+    owner.revoke(owner.sessionBlocks[0]!.id);
     let entered!: () => void; let answer!: (value: { lifetime: "session" }) => void;
     const prompting = new Promise<void>((resolve) => { entered = resolve; });
     owner.ask = () => { entered(); return new Promise((resolve) => { answer = resolve; }); };

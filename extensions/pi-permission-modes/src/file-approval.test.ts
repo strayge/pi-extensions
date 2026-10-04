@@ -23,7 +23,7 @@ function context(cwd: string, ui: Partial<ExtensionContext["ui"]>): ExtensionCon
   return { cwd, hasUI: true, ui } as ExtensionContext;
 }
 
-const directoryOptions = ["Allow for this session", "Remember for this project", "Save globally", "Edit directory scope", "Deny"];
+const directoryOptions = ["Allow for this session", "Remember for this project", "Save globally", "Edit directory scope", "Deny and block for this session", "Deny"];
 
 test("directory approval chooses scope and lifetime in one menu", async (t) => {
   const f = fixture(t);
@@ -134,11 +134,11 @@ test("exact-file approval offers global saving without widening the scope", asyn
   const ask = approvalUI(() => context(f.root, {
     select: async (title, options) => {
       assert.ok(title.includes("Exact-file grant"));
-      assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Save globally", "Deny"]);
+      assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Save globally", "Deny and block for this session", "Deny"]);
       return "Save globally";
     },
   }));
-  assert.deepEqual(await ask({ ...f.request, kind: "file" }), { lifetime: "global" });
+  assert.deepEqual(await ask({ ...f.request, kind: "file" }), { action: "grant", lifetime: "global" });
 });
 
 test("path-rule exceptions keep one menu without scope editing", async (t) => {
@@ -148,12 +148,51 @@ test("path-rule exceptions keep one menu without scope editing", async (t) => {
     select: async (title, options) => {
       prompts++;
       assert.ok(title.includes(`Separate path-rule exception: R/O ${f.directory}`));
-      assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Deny"]);
+      assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Deny and block for this session", "Deny"]);
       return "Allow for this session";
     },
   }));
-  assert.deepEqual(await ask({ ...f.request, kind: "exception", access: "read" }), { lifetime: "session" });
+  assert.deepEqual(await ask({ ...f.request, kind: "exception", scope: "tree", access: "read" }), { action: "grant", lifetime: "session" });
   assert.equal(prompts, 1);
+});
+
+test("explicit session blocking shows scope and denial semantics without selecting a lifetime", async (t) => {
+  const f = fixture(t);
+  for (const [kind, scope, access] of [["directory", "tree", "write"], ["file", "file", "read"], ["exception", "file", "write"], ["exception", "tree", "read"]] as const) {
+    const ask = approvalUI(() => context(f.root, {
+      select: async (title, options) => {
+        assert.ok(options.includes("Deny and block for this session"));
+        assert.ok(title.includes(`Scope: ${scope}`));
+        assert.ok(title.includes(access === "read" ? "R/O denial also denies writes" : "R/W denial blocks writes only"));
+        return "Deny and block for this session";
+      },
+    }));
+    const answer = await ask({ ...f.request, kind, scope, access });
+    assert.equal(answer?.action, "block");
+    assert.equal(answer?.lifetime, undefined);
+    assert.equal(answer?.binding?.canonical, kind === "directory" ? f.directory : undefined);
+  }
+});
+
+test("edited blocking returns the binding explicitly displayed in the second menu", async (t) => {
+  const f = fixture(t); let prompts = 0;
+  const ask = approvalUI(() => context(f.root, {
+    select: async (title) => {
+      if (++prompts === 1) return "Edit directory scope";
+      assert.ok(title.includes(`R/W ${f.root}`));
+      return "Deny and block for this session";
+    },
+    input: async () => f.root,
+  }));
+  assert.deepEqual(await ask(f.request), { action: "block", directory: f.root, binding: bindPath(f.root) });
+});
+
+test("cancellation after choosing block never returns a block answer", async (t) => {
+  const f = fixture(t); const controller = new AbortController();
+  const ask = approvalUI(() => context(f.root, {
+    select: async () => { controller.abort(); return "Deny and block for this session"; },
+  }));
+  await assert.rejects(ask(f.request, controller.signal), { name: "AbortError" });
 });
 
 test("cancellation during scope editing stops before another approval menu", async (t) => {

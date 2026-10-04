@@ -326,12 +326,12 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         else if (rest.length === 1 && rest[0] === "global") await active.changeGlobal({ kind: "clear" });
         else throw new Error("Usage: /perm clear [global]");
       } else if (action === "revoke") {
-        if (rest.length !== 1 || !rest[0]) throw new Error("Usage: /perm revoke <approval-id|global:rule-id>");
+        if (rest.length !== 1 || !rest[0]) throw new Error("Usage: /perm revoke <approval-id|block:id|global:rule-id>");
         const id = rest[0];
         if (id.startsWith("global:")) await active.changeGlobal({ kind: "revoke", id: id.slice("global:".length) });
         else {
           const snapshot = active.snapshot();
-          if (!snapshot.grants.some((g) => g.id === id) && !snapshot.exceptions.some((e) => e.id === id)) throw new Error("Unknown or stale approval ID; use /perm inspect");
+          if (!snapshot.grants.some((g) => g.id === id) && !snapshot.exceptions.some((e) => e.id === id) && !active.sessionBlocks.some((b) => b.id === id)) throw new Error("Unknown or stale approval ID; use /perm inspect");
           active.revoke(id);
         }
       } else if (action === "grant") {

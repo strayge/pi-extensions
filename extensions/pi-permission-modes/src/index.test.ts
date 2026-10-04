@@ -105,7 +105,7 @@ test("perm grant detects files without granting their directory and retains ordi
     f.ctx.ui.select = async (title, options) => {
       prompts++;
       assert.ok(title.includes("Exact-file grant"));
-      assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Save globally", "Deny"]);
+      assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Save globally", "Deny and block for this session", "Deny"]);
       return "Remember for this project";
     };
     await f.perm("grant read ~/.gitconfig");
@@ -153,6 +153,36 @@ test("global command routes distinguish declaration revocation from ordinary cle
     await f.perm(`grant read ${file}`);
     await f.perm("clear global");
     assert.equal(JSON.parse(readFileSync(f.global, "utf8")).pathRules.length, 0);
+  } finally { await f.close(); }
+});
+
+test("session block commands, clear-global separation, reload and close lifecycle", async () => {
+  const f = fixture();
+  try {
+    const file = path.join(f.project, "notes"); writeFileSync(file, "NOTE");
+    await f.start(); f.ctx.ui.select = async () => "Allow for this session";
+    await f.perm(`grant read ${f.other}`);
+    f.ctx.ui.select = async () => "Deny and block for this session";
+    await assert.rejects(f.perm(`grant read ${file}`), /blocked/);
+    const id = (await f.awareness()).match(/block:[a-f0-9-]+/)![0];
+    await assert.rejects(f.execute("read", { path: file }), /access denied/);
+    await f.perm("clear global");
+    assert.match(await f.awareness(), new RegExp(id));
+    assert.match(await f.awareness(), /other \(tree, session, id /);
+    await f.reloadExtension();
+    assert.match(await f.awareness(), new RegExp(id));
+    await assert.rejects(f.execute("read", { path: file }), /access denied/);
+    await f.perm(`revoke ${id}`);
+    await assert.rejects(f.perm(`revoke ${id}`), /Unknown or stale/);
+    assert.match(JSON.stringify(await f.execute("read", { path: file })), /NOTE/);
+    await assert.rejects(f.perm(`grant write ${file}`), /blocked/);
+    await f.perm("clear");
+    assert.match(await f.awareness(), /Session blocks:\\nnone/);
+    assert.doesNotMatch(await f.awareness(), /other \(tree, session, id /);
+    await assert.rejects(f.perm(`grant read ${file}`), /blocked/);
+    await f.start("switch");
+    assert.match(await f.awareness(), /Session blocks:\\nnone/);
+    assert.match(JSON.stringify(await f.execute("read", { path: file })), /NOTE/);
   } finally { await f.close(); }
 });
 

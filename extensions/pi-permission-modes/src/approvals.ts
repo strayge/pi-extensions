@@ -14,6 +14,7 @@ import type {
   PathBinding,
   PermissionModeConfig,
   ResolvedCatalog,
+  ResolvedRule,
   RuleException,
 } from "./schema.ts";
 
@@ -25,12 +26,19 @@ export interface ApprovalRequest {
   reason: string;
   create: boolean;
   ruleId?: string;
+  scope?: "file" | "tree";
 }
-export interface ApprovalAnswer {
+export type ApprovalAnswer = {
+  action?: "grant";
   lifetime: Lifetime | "global";
   directory?: string;
   binding?: PathBinding;
-}
+} | {
+  action: "block";
+  lifetime?: never;
+  directory?: string;
+  binding?: PathBinding;
+};
 export type AskApproval = (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalAnswer | undefined>;
 
 /** The owner accepts intents, never replacement snapshots from executors or children. */
@@ -39,6 +47,7 @@ export class PermissionOwner {
   private mode: string;
   private grants: AccessGrant[];
   private exceptions: RuleException[];
+  private blocks: ResolvedRule[] = [];
   private revision = 0;
   private unavailable?: string;
   resetPending = false;
@@ -115,6 +124,9 @@ export class PermissionOwner {
   get rootIdentity() {
     return this.catalog.root;
   }
+  get sessionBlocks(): readonly ResolvedRule[] {
+    return freeze([...this.blocks]);
+  }
   snapshot(): FilesystemSnapshot {
     if (this.unavailable) throw new Error(`Filesystem policy unavailable: ${this.unavailable}`);
     assertBinding(this.catalog.root.binding);
@@ -124,7 +136,7 @@ export class PermissionOwner {
       mode: this.mode,
       processMode: this.catalog.config.processMode ?? "compatible",
       profile: this.catalog.profiles[this.mode]!,
-      rules: this.catalog.rules,
+      rules: [...this.catalog.rules, ...this.blocks],
       grants: [...this.grants],
       exceptions: [...this.exceptions],
     });
@@ -168,11 +180,17 @@ export class PermissionOwner {
 
   revoke(id?: string): void {
     this.snapshot();
-    const grants = id ? this.grants.filter((g) => g.id !== id) : [];
-    const exceptions = id ? this.exceptions.filter((e) => e.id !== id) : [];
-    this.persist(this.mode, grants, exceptions);
-    this.grants = grants;
-    this.exceptions = exceptions;
+    if (id?.startsWith("block:")) {
+      if (!this.blocks.some((block) => block.id === id)) throw new Error("Unknown or stale session block ID");
+      this.blocks = this.blocks.filter((block) => block.id !== id);
+    } else {
+      const grants = id ? this.grants.filter((g) => g.id !== id) : [];
+      const exceptions = id ? this.exceptions.filter((e) => e.id !== id) : [];
+      this.persist(this.mode, grants, exceptions);
+      this.grants = grants;
+      this.exceptions = exceptions;
+      if (!id) this.blocks = [];
+    }
     this.revision++;
   }
 
@@ -281,6 +299,7 @@ export class PermissionOwner {
     const key = JSON.stringify([revision, request.kind, request.path, request.access, request.ruleId]);
     let pending = this.pending.get(key);
     if (!pending) {
+      request = freeze({ ...request });
       const frozen = bindPath(request.path);
       pending = (async () => {
         const answer = await this.ask(request, signal);
@@ -288,6 +307,50 @@ export class PermissionOwner {
         this.check(revision);
         assertBinding(frozen, request.kind === "exception");
         if (!answer) throw new Error(`Access denied: ${request.path}`);
+        if (answer.action === "block") {
+          if (request.access !== "read" && request.access !== "write") throw new Error("Invalid block access");
+          if (answer.lifetime !== undefined) throw new Error("Session blocks have no grant lifetime");
+          let scope: "file" | "tree";
+          let binding: ResolvedRule["binding"];
+          if (request.kind === "directory") {
+            if (answer.directory && answer.directory !== frozen.lexical && !answer.binding)
+              throw new Error("Edited approval must retain its pre-confirmation identity");
+            const selected = answer.binding ?? frozen;
+            assertBinding(selected);
+            if (answer.directory && answer.directory !== selected.lexical && answer.directory !== selected.canonical)
+              throw new Error("Edited block must match its displayed directory");
+            if (!within(selected.canonical, frozen.canonical))
+              throw new Error("Edited directory must contain the requested target");
+            if (!selected.missing.length && selected.identity.type !== "directory")
+              throw new Error("Session directory blocks require a directory scope");
+            binding = selected;
+            scope = "tree";
+          } else {
+            if (answer.directory || answer.binding) throw new Error("File and exception blocks cannot edit scope");
+            if (request.kind === "file") {
+              binding = bindFile(frozen);
+              scope = "file";
+            } else {
+              const rule = this.catalog.rules.find((r) => r.id === request.ruleId);
+              if (rule?.[request.access] !== "ask" || !rule.binding || rule.scope !== request.scope || rule.binding.lexical !== request.path)
+                throw new Error("The requested rule exception is no longer available");
+              binding = rule.binding;
+              scope = rule.scope;
+            }
+          }
+          const current = resolvePermissionBinding(binding, true);
+          if (!current.missing.length && current.identity.type !== (scope === "file" ? "file" : "directory"))
+            throw new Error("Block target type does not match scope");
+          signal?.throwIfAborted();
+          this.check(revision);
+          const block: ResolvedRule = {
+            id: `block:${randomUUID()}`, path: binding.canonical, scope, binding,
+            definition: "session block", [request.access]: "deny",
+          };
+          this.blocks = [...this.blocks, freeze(block)];
+          this.revision++;
+          throw new Error(`Access denied; blocked for this session: ${request.path}`);
+        }
         if (answer.lifetime !== "session" && answer.lifetime !== "project" && (answer.lifetime !== "global" || request.kind === "exception"))
           throw new Error("Invalid approval lifetime");
         let created: PathBinding | undefined;
@@ -309,7 +372,7 @@ export class PermissionOwner {
             for (const exception of decision.exceptions) {
               await this.approve({
                 kind: "exception", path: exception.rule.binding!.lexical, access: exception.access,
-                ruleId: exception.rule.id, reason: request.reason, create: false,
+                ruleId: exception.rule.id, scope: exception.rule.scope, reason: request.reason, create: false,
               }, revision, signal);
               // Only the requested exception may advance authority while this directory answer is pending.
               this.check(++revision);
@@ -395,6 +458,7 @@ export class PermissionOwner {
                 path: exception.rule.binding!.lexical,
                 access: exception.access,
                 ruleId: exception.rule.id,
+                scope: exception.rule.scope,
                 reason,
                 create: false,
               },

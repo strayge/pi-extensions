@@ -13,12 +13,12 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
     let binding = bindPath(directory);
     for (;;) {
       const choice = await ctx.ui.select(
-        `${request.kind === "exception" ? "Separate path-rule exception" : request.kind === "file" ? "Exact-file grant" : "Directory grant"}: ${request.access === "write" ? "R/W" : "R/O"} ${directory}\n${request.reason}${request.kind === "directory" && binding.missing.length ? "\nThe approved directory will be created." : ""}`,
+        `${request.kind === "exception" ? "Separate path-rule exception" : request.kind === "file" ? "Exact-file grant" : "Directory grant"}: ${request.access === "write" ? "R/W" : "R/O"} ${directory}\n${request.reason}\nScope: ${request.kind === "directory" ? "tree" : request.kind === "file" ? "file" : request.scope}. ${request.access === "read" ? "R/O denial also denies writes." : "R/W denial blocks writes only; reads still require ordinary permission."}${request.kind === "directory" && binding.missing.length ? "\nThe approved directory will be created. Blocking never creates a directory." : ""}`,
         request.kind === "directory"
-          ? ["Allow for this session", "Remember for this project", "Save globally", "Edit directory scope", "Deny"]
+          ? ["Allow for this session", "Remember for this project", "Save globally", "Edit directory scope", "Deny and block for this session", "Deny"]
           : request.kind === "file"
-            ? ["Allow for this session", "Remember for this project", "Save globally", "Deny"]
-            : ["Allow for this session", "Remember for this project", "Deny"],
+            ? ["Allow for this session", "Remember for this project", "Save globally", "Deny and block for this session", "Deny"]
+            : ["Allow for this session", "Remember for this project", "Deny and block for this session", "Deny"],
         { signal },
       );
       signal?.throwIfAborted();
@@ -31,8 +31,13 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
         }
         continue;
       }
+      if (choice === "Deny and block for this session") return {
+        action: "block",
+        ...(request.kind === "directory" ? { directory, binding } : {}),
+      };
       if (choice !== "Allow for this session" && choice !== "Remember for this project" && (choice !== "Save globally" || request.kind === "exception")) return undefined;
       return {
+        action: "grant",
         lifetime: choice === "Save globally" ? "global" : choice === "Remember for this project" ? "project" : "session",
         ...(request.kind === "directory" ? { directory, binding } : {}),
       };

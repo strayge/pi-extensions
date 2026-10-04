@@ -66,20 +66,25 @@ Profile names merge by name; a supplied `filesystem` field replaces that profile
 
 ## Commands and requests
 
-- `/perm`, `/perm status`, `/perm grants`, `/perm inspect`: inspect resolved roots, resources, rules, ordinary approvals, and active/dormant/blocked global declarations.
+- `/perm`, `/perm status`, `/perm grants`, `/perm inspect`: inspect resolved roots, resources, rules, ordinary approvals, session blocks, and active/dormant/blocked global declarations.
 - `/perm <profile>` or **Shift+Tab**: select/cycle filesystem profiles.
 - `/perm grant read|write <path>`: request an exact-file grant for an existing regular file, or directory access with editable scope.
 - `/perm revoke <approval-id>`: revoke an ordinary grant or ask receipt.
+- `/perm revoke <block-id>`: remove one ephemeral denial, using its `block:<UUID>` ID from inspection; even a stale pinned target can be removed.
 - `/perm revoke global:<rule-id>`: confirm removal of all current allow-valued fields of that declaration; preserve ask/deny fields and remove an empty row.
-- `/perm clear`: clear ordinary grants and ask receipts for the active owner/project, never global policy.
-- `/perm clear global`: confirm removal of all configured allow fields, including dormant/blocked positives; preserve restrictions, ordinary approvals, profiles/resources, networking, and process mode. Unknown arguments fail safely.
+- `/perm clear`: clear ordinary grants, ask receipts, and all session blocks for the active owner/project, never global policy.
+- `/perm clear global`: confirm removal of all configured allow fields, including dormant/blocked positives; preserve restrictions, ordinary approvals, session blocks, profiles/resources, networking, and process mode. Unknown arguments fail safely.
 - `/net`, `/net open`, `/net restricted`, **Alt+N**: inspect/change networking.
 - `/net allow <domain>`, `/net deny <domain>`: update independent network policy.
 - Model tools: `request_directory_access`, `request_path_exception`, `request_network_access`.
 
 The footer and statusline show **Network restricted** only while an initialized policy restricts networking; open networking has no indicator. Failed policy initialization falls back to open networking and clears that indicator. `/net` still reports the current network policy when initialized.
 
-All directory grant menus, including agent-triggered requests, offer **Allow for this session** (default), **Remember for this project**, **Save globally**, **Edit directory scope**, and **Deny**. Editing returns to explicit approval of the revised scope; cancelling the edit preserves the previous scope. Exact-file menus offer the same saving choices without scope editing. Separate ask-receipt menus offer only session/project saving.
+All directory grant menus, including agent-triggered requests, offer **Allow for this session** (default), **Remember for this project**, **Save globally**, **Edit directory scope**, **Deny and block for this session**, and **Deny**. Editing returns to explicit approval of the revised scope; cancelling the edit preserves the previous scope. Exact-file menus offer the same choices without scope editing. Separate ask-receipt menus offer session/project saving and both denial choices, displaying the rule's exact file/tree scope.
+
+**Deny** or dismissing the menu rejects only the current request. **Deny and block for this session** rejects it and adds an in-memory denial shared by the root and all children. R/O denial also denies writes; R/W denial blocks only writes, and reads still require ordinary permission. Directory blocks cover the displayed tree; edited scopes must still contain the requested target. Missing directories can be blocked without creating them, using the same pinned future-target semantics as configured denies. Exact-file blocks pin the parent and follow atomic regular-file replacement, without covering siblings. Ask-receipt blocks use the rule's declared scope (including missing targets) and create no receipt.
+
+Session blocks survive profile switches, successful `/reload`, and global-policy edits, but disappear on session close, restart, or reopen. They never enter policy, catalogs, or saved state. They use the existing most-specific rule precedence: deny wins equal-specificity ties with grants/receipts, while narrower allows or approved asks can override it. Yolo bypasses them just like configured rules. Inspection lists them separately with `block:<UUID>` IDs. Adding/removing a block affects new operations and invalidates stale approvals; already-launched processes retain their original filesystem snapshot.
 
 R/O to R/W upgrades require approval. R/O grants do not create missing directories. R/W creation requires explicit root approval of the displayed directory, not an implicit parent grant. Winning asks are approved before requesting unrelated positive authority; equally specific asks still need their own receipts. A successful approved creation continues the triggering write for session, project, and global saving without a hidden extra grant. Pre-commit failure removes only an empty, identity-matching newly created directory; populated/replaced directories are retained with a warning.
 
