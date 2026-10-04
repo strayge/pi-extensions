@@ -18,9 +18,9 @@ const PI_ASK_CONFIG_PROMPT = `When the user asks to configure, customize, debug,
 
 export default function askExtension(pi: ExtensionAPI) {
 	resetAskConfigStore();
-	pi.on("before_agent_start", async (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${PI_ASK_CONFIG_PROMPT}`,
-	}));
+	pi.on("before_agent_start", (event) => {
+		event.systemPromptOptions.sections.pi_ask = PI_ASK_CONFIG_PROMPT;
+	});
 	const remoteAsk = createRemoteAskRuntime(pi.events);
 	pi.on("session_shutdown", () => {
 		remoteAsk.disposeAll();

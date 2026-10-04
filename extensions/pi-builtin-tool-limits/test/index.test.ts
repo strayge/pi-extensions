@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  buildSystemPrompt,
+  normalizeBuildSystemPromptOptions,
+} from "../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js";
 import extension, {
-  addGrepGuidance,
   FIND_MAX_RESULTS,
-  GREP_GUIDANCE,
+  GREP_GUIDELINES,
   GREP_MAX_MATCHES,
   LS_MAX_ENTRIES,
   MAX_OUTPUT_BYTES,
@@ -12,9 +15,43 @@ import extension, {
 } from "../src/index.ts";
 
 describe("guidance", () => {
-  it("appends grep guidance once", () => {
-    assert.equal(addGrepGuidance("Base"), `Base\n\n${GREP_GUIDANCE}`);
-    assert.equal(addGrepGuidance(`Base\n\n${GREP_GUIDANCE}`), `Base\n\n${GREP_GUIDANCE}`);
+  it("merges active grep guidelines without replacing or reparsing the system prompt", () => {
+    const handlers = new Map<string, (event: never, ctx: never) => unknown>();
+    const pi = {
+      registerTool() {},
+      on(name: string, handler: (event: never, ctx: never) => unknown) {
+        handlers.set(name, handler);
+      },
+    } as unknown as ExtensionAPI;
+    extension(pi);
+    const handler = handlers.get("before_agent_start");
+    assert.ok(handler);
+    const options = normalizeBuildSystemPromptOptions({
+      cwd: "/work/project",
+      selectedTools: ["grep"],
+      toolGuidelines: { grep: ["Native grep rule"], read: ["Native read rule"] },
+      sections: { other_extension: "Keep this section" },
+    });
+    const event = {
+      systemPromptOptions: options,
+      get systemPrompt() {
+        return assert.fail("Rendered prompt should not be read");
+      },
+    } as never;
+
+    assert.equal(handler(event, {} as never), undefined);
+    assert.equal(handler(event, {} as never), undefined);
+    assert.deepEqual(options.toolGuidelines.grep, ["Native grep rule", ...GREP_GUIDELINES]);
+    assert.deepEqual(options.sections, { other_extension: "Keep this section" });
+    assert.equal(options.forceSystemPrompt, undefined);
+    const active = buildSystemPrompt(options);
+    for (const guideline of GREP_GUIDELINES) assert.ok(active.includes(guideline));
+    assert.ok(active.includes("Native grep rule"));
+
+    options.selectedTools = ["read"];
+    const inactive = buildSystemPrompt(options);
+    for (const guideline of GREP_GUIDELINES) assert.ok(!inactive.includes(guideline));
+    assert.ok(inactive.includes("Native read rule"));
   });
 });
 

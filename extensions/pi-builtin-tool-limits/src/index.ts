@@ -9,17 +9,12 @@ import {
   createReadOverride,
 } from "./tools.ts";
 
-export const GREP_GUIDANCE = `## Grep
-- Use specific paths/globs and start with \`limit: 20\`, \`context: 0\`.
-- After locating a match, use a focused \`read\`.
-- If truncated, narrow the search—do not raise the limit.
-- Never run multiple broad greps in parallel.`;
-
-/** Adds the search discipline once, including when a child inherits its parent's prompt. */
-export function addGrepGuidance(systemPrompt: string): string {
-  if (systemPrompt.includes(GREP_GUIDANCE)) return systemPrompt;
-  return `${systemPrompt}\n\n${GREP_GUIDANCE}`;
-}
+export const GREP_GUIDELINES = [
+  "Use specific paths/globs and start with `limit: 20`, `context: 0`.",
+  "After locating a match, use a focused `read`.",
+  "If truncated, narrow the search—do not raise the limit.",
+  "Never run multiple broad greps in parallel.",
+];
 
 export function clampToolCallLimits(pi: ExtensionAPI): void {
   pi.on("tool_call", (event) => {
@@ -47,9 +42,8 @@ export default function (pi: ExtensionAPI): void {
   clampToolCallLimits(pi);
 
   pi.on("before_agent_start", (event) => {
-    const systemPrompt = addGrepGuidance(event.systemPrompt);
-    if (systemPrompt === event.systemPrompt) return;
-    return { systemPrompt };
+    const guidelines = event.systemPromptOptions.toolGuidelines;
+    guidelines.grep = [...new Set([...(guidelines.grep ?? []), ...GREP_GUIDELINES])];
   });
 }
 
