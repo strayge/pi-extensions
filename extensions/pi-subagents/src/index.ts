@@ -2760,11 +2760,11 @@ Terse command-style prompts produce shallow, generic work.
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
     description:
-      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the agent ID returned by Agent.",
+      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Live records take precedence. After cleanup or reload, use the exact agent ID to retrieve the latest saved completion on the current parent-session branch, marked historical without restoring the agent runtime.",
     promptSnippet: "Check status and retrieve results from a background agent",
     parameters: Type.Object({
       agent_id: Type.String({
-        description: "The agent ID to check. The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
+        description: "The exact agent ID works for live and historical results. While a live record remains, its handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
       }),
       wait: Type.Optional(
         Type.Boolean({
@@ -2773,13 +2773,56 @@ Terse command-style prompts produce shallow, generic work.
       ),
       verbose: Type.Optional(
         Type.Boolean({
-          description: "If true, include the agent's full conversation (messages + tool calls). Default: false.",
+          description: "If true, include the agent's full conversation (messages + tool calls) when its live session is available. Historical results report that the conversation is unavailable. Default: false.",
         }),
       ),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       const record = resolveAgentRef(params.agent_id);
-      if (!record || !isTopLevelAgent(record)) {
+      if (!record) {
+        const branch = ctx.sessionManager.getBranch();
+        for (let i = branch.length - 1; i >= 0; i--) {
+          const entry = branch[i];
+          if (entry.type !== "custom" || entry.customType !== "subagents:record") continue;
+          const saved = entry.data as Partial<Pick<AgentRecord,
+            "id" | "type" | "description" | "status" | "result" | "error" | "startedAt" | "completedAt"
+          >> | null;
+          if (!saved || saved.id !== params.agent_id) continue;
+
+          const started = typeof saved.startedAt === "number" ? new Date(saved.startedAt).toJSON() : null;
+          const completed = typeof saved.completedAt === "number" ? new Date(saved.completedAt).toJSON() : null;
+          if (
+            typeof saved.type !== "string" || typeof saved.description !== "string"
+            || typeof saved.status !== "string"
+            || !["completed", "steered", "aborted", "stopped", "error"].includes(saved.status)
+            || !started || !completed
+            || (saved.result !== undefined && typeof saved.result !== "string")
+            || (saved.error !== undefined && typeof saved.error !== "string")
+          ) break;
+
+          let output =
+            `Agent: ${saved.id}\n`
+            + "Historical result: latest saved completion on the current parent-session branch. "
+            + "The live runtime is unavailable; this does not describe any newer unfinished run.\n"
+            + `Type: ${saved.type} | Status: ${saved.status}${getStatusNote(saved.status)}\n`
+            + `Description: ${saved.description}\n`
+            + `Started: ${started}\nCompleted: ${completed}\n\n`;
+          const result = saved.result?.trim();
+          if (saved.status === "error") {
+            output += `Error: ${saved.error ?? "unknown"}`;
+            if (result) output += `\n\nPartial output before the failure:\n${result}`;
+          } else {
+            if (saved.error) output += `Error: ${saved.error}\n\n`;
+            output += result || "No output.";
+          }
+          if (params.verbose) {
+            output += "\n\nFull conversation is unavailable for historical results; the child session is not reopened.";
+          }
+          return textResult(output);
+        }
+        return textResult(`Agent not found: "${params.agent_id}". No saved completion is available for this exact ID on the current parent-session branch.`);
+      }
+      if (!isTopLevelAgent(record)) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 

@@ -462,13 +462,17 @@ Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, in
 
 ### `get_subagent_result`
 
-Check status and retrieve results from a background agent.
+Check status and retrieve results from a background agent. A live record always takes precedence, including when the same ID is running again.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `agent_id` | string | yes | Agent ID to check |
-| `wait` | boolean | no | Wait for completion |
-| `verbose` | boolean | no | Include full conversation log |
+| `agent_id` | string | yes | Exact agent ID; handles also work while a live record remains |
+| `wait` | boolean | no | Wait for live execution to finish; historical results return immediately |
+| `verbose` | boolean | no | Include the conversation when a live session is available; historical results explain that it is unavailable |
+
+Completed live records are still cleaned up after one hour. Once a record is gone, including after reload or reopening the parent session, an exact ID retrieves the latest saved `subagents:record` completion on the **current conversation branch**. Results from abandoned branches or other parent sessions are not searched, and archived handle lookup is not supported.
+
+Historical responses are explicitly labeled and include saved identity, status, output/error, and start/completion times. They do not restore an agent runtime, guarantee resume, or include runtime statistics. The latest saved completion may predate a newer unfinished run; it is historical evidence, not a claim about that run's current status. If no usable completion is saved on the current branch, the tool reports that it is unavailable without rerunning the task.
 
 Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait. The background agent keeps running, and its completion notification still arrives normally.
 
