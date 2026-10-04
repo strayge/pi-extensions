@@ -1,103 +1,31 @@
-/**
- * Sandbox awareness — the factual "these are your enforcement boundaries"
- * system-prompt section injected each turn (via before_agent_start) while a
- * sandboxed mode is active.
- *
- * Without it the model discovers the sandbox by crashing into it: writes to
- * $HOME, installs into ~/.npm, fetches from non-allowlisted domains — then
- * wastes turns probing variants of a command the kernel will never allow.
- * This section is generated from the ACTIVE mode's merged profile (so global
- * overrides and project layers are reflected truthfully) and
- * states where writes work, which reads are denied, which domains are
- * reachable, and how the prompt flow handles everything else.
- *
- * Tone matters: boundary-crossing commands (out-of-project paths, sudo) are
- * NOT discouraged — the policy layer prompts the user automatically and
- * approved commands run outside the sandbox. Only silent sandbox denials
- * (non-allowlisted domains, undetected out-of-boundary writes) warrant
- * "ask the user" guidance.
- *
- * Pure and SDK-free (like schema.ts/resolve.ts) so it unit-tests without the
- * host.
- */
+import { positiveTarget } from "./evaluation.ts";
+import type { PermissionOwner } from "./approvals.ts";
 
-import type { ModeDef } from "./schema.ts";
-
-export interface AwarenessOptions {
-  /** Whether the OS sandbox is actually enforcing (ready and not --no-sandbox). */
-  active: boolean;
-  /** Why it isn't, when a sandboxed mode runs degraded (warn text / --no-sandbox). */
-  reason?: string;
-  /** `/net open` / alt+n: domain filtering suspended for this session. */
-  networkOpen?: boolean;
-  /** Session-granted domains (via prompts, /net allow, request_network_access). */
-  sessionDomains?: string[];
-}
-
-/** Render an allowWrite entry for the prompt ("." is the project root). */
-const renderWritePath = (p: string): string => (p === "." || p === "./" ? "the project directory" : p);
-
-/**
- * The sandbox-boundary section for `mode`, or undefined when there is nothing
- * to inject: the mode opted out (`injectSandboxInfo: false`) or doesn't
- * sandbox at all (`sandbox.enabled: false` — full permissions need no
- * boundary briefing).
- */
-export function sandboxAwarenessPrompt(mode: ModeDef, opts: AwarenessOptions): string | undefined {
-  if (mode.injectSandboxInfo === false) return undefined;
-  const sb = mode.sandbox;
-  if (!sb.enabled) return undefined;
-
-  const header = `## Sandbox & permissions (${mode.label})`;
-
-  if (!opts.active) {
-    return [
-      header,
-      "",
-      `This mode normally runs bash inside an OS sandbox, but the sandbox is unavailable here${opts.reason ? ` (${opts.reason})` : ""}.`,
-      "Bash commands run with full user permissions and ask for the user's confirmation instead — issue them normally",
-      "and let the prompt do the gating.",
-    ].join("\n");
-  }
-
-  const lines = [header, "", "Bash runs inside an OS-level sandbox with these boundaries:", ""];
-
-  if (!sb.writable) {
-    lines.push(
-      "- Bash is READ-ONLY: filesystem writes from bash fail regardless of path (no mkdir, no redirects, no installs). Use the Write/Edit tools for the file changes this mode permits.",
-    );
-  } else {
-    const writable = (sb.allowWrite ?? []).map(renderWritePath);
-    lines.push(
-      `- Writable paths: ${writable.join(", ") || "(none)"}. Use them for installs, temp files, and downloads (./node_modules, an in-project venv, /tmp/...).`,
-    );
-  }
-  if (sb.denyWrite?.length) {
-    lines.push(`- Additionally write-denied: ${sb.denyWrite.join(", ")}.`);
-  }
-  if (sb.denyRead?.length) {
-    lines.push(`- Reads are broadly allowed EXCEPT: ${sb.denyRead.join(", ")}.`);
-  }
-  if (opts.networkOpen) {
-    lines.push("- Network filtering is disabled for this session: all hosts are reachable from bash.");
-  } else {
-    const domains = [...new Set([...(sb.network?.allowedDomains ?? []), ...(opts.sessionDomains ?? [])])];
-    const scope = domains.length
-      ? `- Network is limited to these domains: ${domains.join(", ")}.`
-      : "- No domains are allowlisted for bash network access.";
-    lines.push(
-      sb.askOnBlockedHost === false
-        ? `${scope} Other hosts are silently unreachable — request access with the request_network_access tool.`
-        : `${scope} A request to any other host pauses while the user is asked to allow it — if they approve, simply retry the command. To get domains approved up front (e.g. before an install that hits several hosts), call the request_network_access tool.`,
-    );
-  }
-  lines.push(
-    "- Commands beyond these boundaries (out-of-project paths, sudo/doas) are fine to issue: the user is asked for permission automatically, and approved commands run outside the sandbox.",
-    mode.bypassProtectedPaths
-      ? "- File tools (read/edit/write/…) are policy-gated rather than OS-sandboxed."
-      : "- File tools (read/edit/write/…) are policy-gated rather than OS-sandboxed; writes to protected paths (.git/, .env*, dotfiles) are blocked.",
-    "",
-    "If a command fails with a permission or network error without a prompt having appeared, the sandbox blocked it silently — ask the user for that step instead of retrying variants.",
-  );
-  return lines.join("\n");
+export function permissionAwareness(owner: PermissionOwner): string {
+  if (owner.reason)
+    return `Filesystem policy is unavailable: ${owner.reason}. Governed operations fail closed until a valid /reload or explicit /perm reset.`;
+  const snapshot = owner.snapshot();
+  const network = owner.network.snapshot();
+  const grants = [
+    ...snapshot.profile.grants.map(
+      (g) => `${g.access === "write" ? "R/W" : "R/O"} ${g.binding.canonical} (${g.scope})`,
+    ),
+    ...snapshot.grants.map(
+      (g) => `${g.access === "write" ? "R/W" : "R/O"} ${g.binding.canonical} (${"parent" in g.binding ? "file" : "tree"}, ${g.lifetime}, id ${g.id})`,
+    ),
+  ];
+  return [
+    `Filesystem profile: ${snapshot.mode}; ${snapshot.profile.kind}. Frozen starting directory: ${owner.root}.`,
+    snapshot.profile.kind === "unrestricted"
+      ? "Filesystem limits and path rules are bypassed; network policy is independent."
+      : `Resolved path and automatic resource access:\n${grants.join("\n")}`,
+    `Path rules:\n${snapshot.rules.map((r) => `${r.binding?.canonical ?? r.path} (${r.scope}): read=${r.read ?? "ordinary"}, write=${r.write ?? "ordinary"}${r.read === "allow" || r.write === "allow" ? `; global id global:${r.id}; ${positiveTarget(r.binding, r.scope).state}${r.blocked ? `: ${r.blocked}` : ""}` : ""}`).join("\n") || "none"}`,
+    `Ask receipts:\n${snapshot.exceptions.map((e) => `${e.id}: ${e.access} ${snapshot.rules.find((r) => r.id === e.ruleId)?.path ?? e.ruleId} (${e.lifetime})`).join("\n") || "none"}`,
+    "The most-specific custom allow/ask/deny wins; equal-specificity deny or pending ask still blocks. Session, project, and global allows have the same scope semantics. Use request_directory_access or request_path_exception proactively. Session grants are the default. Global grants are allow declarations in the user policy, require root UI confirmation and affect all scoped profiles/projects. /perm inspect shows current global:rule IDs; revoke removes every allow field of that declaration. /perm clear clears ordinary approvals only; /perm clear global removes configured allow fields only.",
+    "Direct file tools use host-side checks, not an OS sandbox. Recursive grep/find omit unauthorized entries and discovered symlinks; unavailable ignore context causes explicit omissions or search unavailability.",
+    `Process mode: ${snapshot.processMode ?? "compatible"}. ${snapshot.processMode === "strict" ? "Confined subprocesses are retired with their command." : "Detached subprocesses remain sandboxed but cleanup is best-effort; they may outlive commands and retain their original filesystem snapshot."}`,
+    "Governed shells require an OS sandbox unless filesystem access and networking are both unrestricted. Dynamic scripts remain sandboxed. A restricted descendant may prevent renaming/removing its ancestors while ordinary sibling contents remain writable. Commands are never automatically retried after a permission failure.",
+    `Network: ${network.restricted ? "restricted" : "open"}; allowed=${network.allowedDomains.join(", ")}; denied=${network.deniedDomains.join(", ")}. Proxied processes use live policy for new connections. Established connections and already-launched open-network processes keep their access until exit.`,
+    "Children share this root's live authority; a different cwd is not a grant. Trusted custom tools/extensions, including their own processes and network clients, are outside these checks.",
+  ].join("\n");
 }

@@ -1,136 +1,58 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/strayge/pi-extensions/main/extensions/pi-permission-modes/schemas/permission-mode.schema.json",
-  "title": "permission-mode configuration",
-  "description": "Declarative permission modes for the pi coding agent. Global config has full authority. A trusted project config may add permission grants, allowWrite paths, and allowedDomains. Permission grants satisfy only matching ask decisions and cannot override denies. Project writable, askOnBlockedHost, denyRead, denyWrite, and deniedDomains remain tighten-only. Project files cannot change sandbox.enabled, defaultMode, cycleOrder, or add modes. An untrusted project config is entirely tighten-only and its remembered grants are ignored.",
+  "title": "Pi filesystem profiles and independent network policy",
   "type": "object",
   "additionalProperties": false,
+  "required": ["version"],
   "properties": {
     "$schema": { "type": "string" },
-    "defaultMode": {
-      "type": "string",
-      "description": "Name of the mode a new session starts in."
-    },
-    "cycleOrder": {
-      "type": "array",
-      "description": "Order modes are cycled with alt+m; also the display order.",
-      "items": { "type": "string" }
-    },
+    "version": { "const": 3 },
+    "defaultMode": { "type": "string", "minLength": 1 },
+    "processMode": { "enum": ["compatible", "strict"], "default": "compatible" },
+    "cycleOrder": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$" } },
     "modes": {
       "type": "object",
-      "description": "Map of mode name → mode definition.",
-      "additionalProperties": { "$ref": "#/$defs/mode" }
+      "propertyNames": { "pattern": "^[a-zA-Z0-9_-]+$", "not": { "enum": ["__proto__", "constructor", "prototype"] } },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "label": { "type": "string", "minLength": 1 },
+          "color": { "enum": ["muted", "mdLink", "accent", "error"] },
+          "filesystem": {
+            "oneOf": [
+              { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "unrestricted" } } },
+              {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "readOnly", "readWrite", "resourceReads"],
+                "properties": {
+                  "kind": { "const": "scoped" },
+                  "readOnly": { "$ref": "#/$defs/paths" },
+                  "readWrite": { "$ref": "#/$defs/paths" },
+                  "resourceReads": { "type": "array", "uniqueItems": true, "items": { "enum": ["pi", "system"] } }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "pathRules": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["path", "scope"],
+        "anyOf": [{ "required": ["read"] }, { "required": ["write"] }],
+        "properties": { "path": { "type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$" }, "scope": { "enum": ["file", "tree"] }, "read": { "enum": ["allow", "ask", "deny"] }, "write": { "enum": ["allow", "ask", "deny"] } }
+      }
+    },
+    "network": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "default": { "enum": ["restricted", "open"] }, "allowedDomains": { "$ref": "#/$defs/domains" }, "deniedDomains": { "$ref": "#/$defs/domains" } }
     }
   },
   "$defs": {
-    "action": {
-      "enum": ["allow", "ask", "deny"],
-      "description": "allow = pass through; ask = prompt; deny = block."
-    },
-    "surfaceValue": {
-      "description": "An action, or a glob pattern→action map (last match wins; '*' is the catch-all).",
-      "oneOf": [
-        { "$ref": "#/$defs/action" },
-        {
-          "type": "object",
-          "additionalProperties": { "$ref": "#/$defs/action" }
-        }
-      ]
-    },
-    "sandbox": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "OS sandbox profile for the mode.",
-      "properties": {
-        "enabled": { "type": "boolean", "description": "false = run bash unsandboxed (YOLO-style)." },
-        "writable": { "type": "boolean", "description": "false = bash runs read-only (Plan-style)." },
-        "askOnBlockedHost": { "type": "boolean", "description": "Ask the user live when bash tries a host outside the allowlist (default true). false = silent deny. Projects may set false, never true." },
-        "allowWrite": { "type": "array", "items": { "type": "string" } },
-        "denyWrite": { "type": "array", "items": { "type": "string" } },
-        "denyRead": { "type": "array", "items": { "type": "string" } },
-        "network": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "allowedDomains": { "type": "array", "items": { "type": "string" } },
-            "deniedDomains": { "type": "array", "items": { "type": "string" } }
-          }
-        }
-      },
-      "required": ["enabled", "writable"]
-    },
-    "permission": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "Per-surface allow/ask/deny policy.",
-      "properties": {
-        "path": { "$ref": "#/$defs/surfaceValue", "description": "Cross-cutting gate over ALL file access; a deny here overrides per-tool allows." },
-        "external_directory": { "$ref": "#/$defs/surfaceValue", "description": "Access to paths outside the project." },
-        "read": { "$ref": "#/$defs/surfaceValue" },
-        "write": { "$ref": "#/$defs/surfaceValue" },
-        "edit": { "$ref": "#/$defs/surfaceValue" },
-        "grep": { "$ref": "#/$defs/surfaceValue" },
-        "find": { "$ref": "#/$defs/surfaceValue" },
-        "ls": { "$ref": "#/$defs/surfaceValue" },
-        "bash": { "$ref": "#/$defs/surfaceValue", "description": "Matched per extracted command (name + args)." },
-        "web_search": { "$ref": "#/$defs/surfaceValue" },
-        "tool": { "$ref": "#/$defs/surfaceValue", "description": "Any non-builtin (extension) tool, by name." },
-        "skill": { "$ref": "#/$defs/surfaceValue", "description": "Skills, by name (gated at /skill:<name>)." }
-      }
-    },
-    "fileScope": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind", "value"],
-      "properties": {
-        "kind": { "enum": ["exact", "tree", "glob"], "description": "tree values are literal canonical directories; the UI displays them as <directory>/*" },
-        "value": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "UI-created values are canonical absolute paths; exact and tree values never interpret wildcard characters" }
-      }
-    },
-    "permissionGrant": {
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["permission", "scope"],
-          "properties": {
-            "permission": { "enum": ["path", "external_directory", "read", "write", "edit", "grep", "find", "ls"] },
-            "scope": { "$ref": "#/$defs/fileScope" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["permission", "pattern"],
-          "properties": {
-            "permission": { "const": "bash" },
-            "pattern": { "type": "string", "minLength": 1, "maxLength": 4096 }
-          }
-        }
-      ],
-      "description": "A remembered grant satisfies only a matching ask and never overrides deny. File scopes are canonical absolute bindings."
-    },
-    "permissionGrantList": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/permissionGrant" }
-    },
-    "mode": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "label": { "type": "string", "description": "Footer label." },
-        "color": { "enum": ["muted", "mdLink", "accent", "error"], "description": "Footer label color." },
-        "systemPrompt": { "type": "string", "description": "System prompt to inject; '@plan' resolves to the dated Plan-mode prompt." },
-        "injectSandboxInfo": { "type": "boolean", "description": "Inject the mode's sandbox boundaries (writable paths, denied reads, network allowlist) into the system prompt each turn (default true). Modes with sandbox.enabled:false never inject." },
-        "sandbox": { "$ref": "#/$defs/sandbox" },
-        "permission": { "$ref": "#/$defs/permission" },
-        "permissionGrants": {
-          "$ref": "#/$defs/permissionGrantList",
-          "description": "Typed remembered grants. A grant satisfies only a matching ask and never overrides a configured deny."
-        },
-        "hideTools": { "type": "array", "items": { "type": "string" }, "description": "Tools hidden from the model in this mode." },
-        "bypassProtectedPaths": { "type": "boolean", "description": "Skip the .git/.env/dotfile write backstop (only trusted modes)." }
-      }
-    }
+    "paths": { "type": "array", "items": { "type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$" } },
+    "domains": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^(\\*\\.)?[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?$" } }
   }
 }

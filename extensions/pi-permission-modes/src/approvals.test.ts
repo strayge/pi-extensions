@@ -1,155 +1,101 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { ALWAYS_ALLOW, type ApprovalUI, askApproval, askWithSession, SessionApprovals } from "./approvals.ts";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { PermissionOwner, type ApprovalAnswer } from "./approvals.ts";
+import { defaultConfig } from "./config-load.ts";
+import { createDirectTools } from "./direct-tools.ts";
+import { bindPath } from "./paths.ts";
+import { decide, resolveCatalog } from "./policy.ts";
 
-test("SessionApprovals: remembers per (mode, surface, target)", () => {
-  const a = new SessionApprovals();
-  assert.equal(a.has("default", "bash", "ls"), false);
-  a.remember("default", "bash", "ls");
-  assert.equal(a.has("default", "bash", "ls"), true);
-  assert.equal(a.has("default", "bash", "rm"), false); // different target
-  assert.equal(a.has("default", "write", "ls"), false); // different surface
-  assert.equal(a.has("build", "bash", "ls"), false); // different mode
+function fixture(restrictCreation = false) {
+  const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-approval-"))).canonical;
+  const project = path.join(dir, "project"); const outside = path.join(dir, "outside");
+  mkdirSync(project); mkdirSync(outside);
+  const config = defaultConfig();
+  config.pathRules = restrictCreation ? [{ path: path.join(outside, "new"), scope: "tree", write: "ask" }] : [];
+  config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: [] };
+  config.modes.subproject = config.modes.project!;
+  const root = { family: randomUUID(), binding: bindPath(project) };
+  const owner = new PermissionOwner(resolveCatalog(config, root, { agentDir: dir, home: dir }), { ask: async () => undefined });
+  return { dir, project, outside, owner, close: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+test("edited approval can create the first missing ancestor without granting unrelated directories", async () => {
+  const f = fixture();
+  try {
+    const ancestor = path.join(f.outside, "first"); const target = path.join(ancestor, "deeper", "file");
+    let asked = 0;
+    f.owner.ask = async (request) => {
+      asked++; assert.equal(request.path, path.dirname(target)); assert.equal(request.create, true);
+      return { lifetime: "session", directory: ancestor, binding: bindPath(ancestor) };
+    };
+    const [, , write] = createDirectTools(() => f.owner, f.project);
+    await write.execute("create", { path: target, content: "allowed" }, undefined, undefined, { cwd: f.project } as ExtensionContext);
+    assert.equal(asked, 1); assert.equal(readFileSync(target, "utf8"), "allowed");
+    assert.equal(f.owner.snapshot().grants[0]?.binding.canonical, ancestor);
+    f.owner.ask = async () => undefined;
+    await assert.rejects(f.owner.authorize([path.join(f.outside, "sibling")], "write", "not included"), /denied/);
+  } finally { f.close(); }
 });
 
-test("SessionApprovals: clearMode and clearAll", () => {
-  const a = new SessionApprovals();
-  a.remember("default", "bash", "ls");
-  a.remember("build", "bash", "make");
-  a.clearMode("default");
-  assert.equal(a.has("default", "bash", "ls"), false);
-  assert.equal(a.has("build", "bash", "make"), true);
-  a.clearAll();
-  assert.equal(a.has("build", "bash", "make"), false);
+test("missing R/O approvals and replaced pre-confirmation identities never create directories", async () => {
+  const f = fixture();
+  try {
+    f.owner.ask = async () => ({ lifetime: "session" });
+    const missing = path.join(f.outside, "missing");
+    await assert.rejects(f.owner.requestDirectory(missing, "read", "read-only"), /R\/W/);
+    assert.ok(!existsSync(missing));
+    let answer!: (value: ApprovalAnswer) => void;
+    f.owner.ask = () => new Promise((resolve) => { answer = resolve; });
+    const pending = f.owner.requestDirectory(missing, "write", "create");
+    const selected = bindPath(missing);
+    renameSync(f.outside, `${f.outside}-old`); mkdirSync(f.outside);
+    answer({ lifetime: "session", directory: missing, binding: selected });
+    await assert.rejects(pending, /identity changed/);
+    assert.ok(!existsSync(missing)); assert.equal(f.owner.snapshot().grants.length, 0);
+  } finally { f.close(); }
 });
 
-const ui = (hasUI: boolean, answer?: string): ApprovalUI & { calls: number } => ({
-  hasUI,
-  calls: 0,
-  async select(_t, _o) {
-    this.calls++;
-    return answer;
-  },
+test("creating an ungranted protected directory requires a separate exception before mutation", async () => {
+  for (const allowException of [false, true]) {
+    const f = fixture(true);
+    try {
+      const target = path.join(f.outside, "new"); const requests: string[] = [];
+      f.owner.ask = async (request) => {
+        requests.push(request.kind); assert.equal(existsSync(target), false);
+        return request.kind === "directory" || allowException ? { lifetime: "session" } : undefined;
+      };
+      const pending = f.owner.requestDirectory(target, "write", "create protected directory");
+      if (allowException) {
+        await pending;
+        assert.equal(decide(f.owner.snapshot(), bindPath(target), "write").action, "allow");
+      } else {
+        await assert.rejects(pending, /Access denied/);
+        assert.equal(f.owner.snapshot().grants.length, 0);
+        assert.equal(f.owner.snapshot().exceptions.length, 0);
+      }
+      assert.equal(existsSync(target), allowException);
+      assert.deepEqual(requests, ["directory", "exception"]);
+    } finally { f.close(); }
+  }
 });
 
-test("askWithSession: no UI denies without prompting", async () => {
-  const u = ui(false);
-  const a = new SessionApprovals();
-  assert.equal(await askWithSession(u, a, "default", "bash", "ls", "?"), false);
-  assert.equal(u.calls, 0);
-});
-
-test("askWithSession: 'Allow for session' suppresses the next prompt", async () => {
-  const u = ui(true, "Allow for session");
-  const a = new SessionApprovals();
-  assert.equal(await askWithSession(u, a, "default", "bash", "ls", "?"), true);
-  assert.equal(u.calls, 1);
-  // Second identical ask returns true WITHOUT prompting again.
-  assert.equal(await askWithSession(u, a, "default", "bash", "ls", "?"), true);
-  assert.equal(u.calls, 1);
-});
-
-test("askWithSession: 'Allow once' allows but does not remember", async () => {
-  const u = ui(true, "Allow once");
-  const a = new SessionApprovals();
-  assert.equal(await askWithSession(u, a, "default", "bash", "ls", "?"), true);
-  assert.equal(await askWithSession(u, a, "default", "bash", "ls", "?"), true);
-  assert.equal(u.calls, 2); // prompted both times
-});
-
-test("askWithSession: 'Deny' (or dismiss) denies", async () => {
-  assert.equal(await askWithSession(ui(true, "Deny"), new SessionApprovals(), "d", "bash", "x", "?"), false);
-  assert.equal(await askWithSession(ui(true, undefined), new SessionApprovals(), "d", "bash", "x", "?"), false);
-});
-
-test("askWithSession: a target list requires EVERY entry to be granted", async () => {
-  const u = ui(true, "Allow for session");
-  const a = new SessionApprovals();
-  // Granting a chain remembers every supplied target.
-  assert.equal(await askWithSession(u, a, "default", "bash", ["git", "curl"], "?"), true);
-  assert.equal(u.calls, 1);
-  assert.equal(a.has("default", "bash", "git"), true);
-  assert.equal(a.has("default", "bash", "curl"), true);
-  // The same chain (and any subset) now passes silently.
-  assert.equal(await askWithSession(u, a, "default", "bash", ["git", "curl"], "?"), true);
-  assert.equal(await askWithSession(u, a, "default", "bash", ["git"], "?"), true);
-  assert.equal(u.calls, 1);
-  // A chain with ONE ungranted name prompts again — "allow git" must not
-  // cover `git status && rm ...`.
-  assert.equal(await askWithSession(u, a, "default", "bash", ["git", "rm"], "?"), true);
-  assert.equal(u.calls, 2);
-});
-
-test("askWithSession: an empty target list never auto-allows", async () => {
-  const u = ui(true, "Deny");
-  const a = new SessionApprovals();
-  assert.equal(await askWithSession(u, a, "default", "bash", [], "?"), false);
-  assert.equal(u.calls, 1); // prompted (and denied), not silently allowed
-});
-
-test("askWithSession: 'Allow forever' option only appears with onForever, and persists", async () => {
-  // Without onForever: only three options offered.
-  const u3 = ui(true, "Allow once");
-  let seen: string[] = [];
-  u3.select = async (_t, o) => {
-    seen = o;
-    return "Allow once";
-  };
-  await askWithSession(u3, new SessionApprovals(), "default", "tool", "foo", "?");
-  assert.deepEqual(seen, ["Allow once", "Allow for session", "Deny"]);
-
-  // With onForever: fourth option offered; choosing it remembers + calls onForever.
-  const a = new SessionApprovals();
-  let persisted = 0;
-  const u4 = ui(true, "Allow forever");
-  u4.select = async (_t, o) => {
-    seen = o;
-    return "Allow forever";
-  };
-  const ok = await askWithSession(u4, a, "default", "tool", "foo", "?", () => {
-    persisted++;
-  });
-  assert.equal(ok, true);
-  assert.deepEqual(seen, ["Allow once", "Allow for session", "Allow forever", "Deny"]);
-  assert.equal(persisted, 1);
-  assert.equal(a.has("default", "tool", "foo"), true); // also covers the session
-});
-
-test("askApproval: the literal Always allow menu choice is persistent approval", async () => {
-  const u = ui(true, ALWAYS_ALLOW);
-  assert.equal(await askApproval(u, "bash?", ["Allow once", "Allow for session", ALWAYS_ALLOW, "Deny"]), "forever-global");
-});
-
-test("SessionApprovals: bash globs match full commands without covering fetch-pack", () => {
-  const a = new SessionApprovals();
-  a.remember("default", "bash", "git fetch");
-  a.remember("default", "bash", "git fetch *");
-  assert.equal(a.has("default", "bash", "git fetch origin"), true);
-  assert.equal(a.has("default", "bash", "git fetch-pack origin"), false);
-  a.remember("default", "bash", "literal?*");
-  assert.equal(a.has("default", "bash", "literalXYZ"), true);
-});
-
-test("SessionApprovals: non-bash wildcard characters remain literal", () => {
-  const a = new SessionApprovals();
-  a.remember("default", "write", "reports/draft?.txt");
-  a.remember("default", "tool", "build*");
-  assert.equal(a.has("default", "write", "reports/draft?.txt"), true);
-  assert.equal(a.has("default", "write", "reports/draft1.txt"), false);
-  assert.equal(a.has("default", "tool", "build*"), true);
-  assert.equal(a.has("default", "tool", "builder"), false);
-});
-
-test("SessionApprovals: typed grants deduplicate and clear per mode", () => {
-  const a = new SessionApprovals();
-  const readGrant = { permission: "read" as const, scope: { kind: "glob" as const, value: "/tmp/*" } };
-  a.rememberGrant("default", readGrant);
-  a.rememberGrant("default", readGrant);
-  a.rememberGrant("build", { permission: "write", scope: { kind: "exact", value: "/tmp/out" } });
-  assert.deepEqual(a.grants("default"), [readGrant]);
-  a.clearMode("default");
-  assert.deepEqual(a.grants("default"), []);
-  assert.equal(a.grants("build").length, 1);
-  a.clearAll();
-  assert.deepEqual(a.grants("build"), []);
+test("owner retirement aborts active execution and drains its lease without cancelling ordinary mode switches", async () => {
+  const f = fixture();
+  try {
+    let started!: () => void; const ready = new Promise<void>((resolve) => { started = resolve; });
+    let effective!: AbortSignal;
+    const running = f.owner.run([f.project], "read", "operation", undefined, async (_snapshot, _targets, signal) => {
+      effective = signal; started();
+      await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    });
+    const rejected = assert.rejects(running, /aborted/i);
+    await ready; f.owner.select("yolo"); assert.equal(effective.aborted, false);
+    f.owner.block("shutdown"); assert.equal(effective.aborted, true);
+    await Promise.all([rejected, f.owner.drain()]);
+  } finally { f.close(); }
 });

@@ -26,6 +26,7 @@ import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createModelProgressWatchdog } from "./model-progress-watchdog.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { attachParentPermissions, PERMISSION_EXTENSION, type PermissionAttachment } from "./permission-bridge.ts";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
@@ -48,6 +49,7 @@ export const SUBAGENT_TOOL_NAMES = {
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
 const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
+const sessionPermissions = new WeakMap<AgentSession, PermissionAttachment>();
 
 /**
  * Canonical name of an extension for `extensions: [...]` allowlist matching.
@@ -259,6 +261,7 @@ export function installExtensionToolScope(
     const keep = new Set(toolNames.filter((t) => !disallowedSet?.has(t)));
     const optInActive = extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
+      if (extension.path === PERMISSION_EXTENSION) continue;
       const canons = extensionCanonicalNames(extension.path);
       if (optInActive && !canons.some((c) => extNames.has(c))) continue;
       // First alias that carries a narrowing set — a user won't narrow one
@@ -639,6 +642,7 @@ export async function runAgent(
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
+  const permissionCancellation = new AbortController();
   const invocationModelProgressTimeoutMinutes = getModelProgressTimeoutMinutes();
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
@@ -771,12 +775,28 @@ export async function runAgent(
           };
         };
 
+  const permission = attachParentPermissions(options.pi, ctx, () => permissionCancellation.abort());
+  if (permission) options = { ...options, signal: options.signal ? AbortSignal.any([options.signal, permissionCancellation.signal]) : permissionCancellation.signal };
+  let permissionSession: AgentSession | undefined;
+  let sessionHandedOff = false;
+  try {
   const loader = new DefaultResourceLoader({
     cwd: configCwd,
     agentDir,
+    // Nested tools reuse this API, so inherited policy bridges must share its event bus.
+    eventBus: options.pi.events,
     noExtensions,
     additionalExtensionPaths,
-    extensionsOverride,
+    extensionFactories: permission ? [{ name: "permission-policy-v2", hidden: true, factory: permission.factory }] : [],
+    extensionsOverride: (base) => {
+      const filtered = extensionsOverride?.(base) ?? base;
+      // Children inherit the parent's live policy or stay ungoverned; discovery cannot enable a separate policy.
+      const extensions = filtered.extensions.filter((extension) => extension.path !== PERMISSION_EXTENSION && !extensionCanonicalNames(extension.path).includes("pi-permission-modes"));
+      if (!permission) return { ...filtered, extensions };
+      const mandatory = base.extensions.find((extension) => extension.path === PERMISSION_EXTENSION);
+      if (!mandatory) throw new Error("Required child permission extension failed to load");
+      return { ...filtered, extensions: [...extensions, mandatory] };
+    },
     noSkills,
     noPromptTemplates: true,
     noThemes: true,
@@ -1033,6 +1053,7 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  permissionSession = session;
 
   const baseSessionName = agentConfig?.name ?? type;
   const sessionName = options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName;
@@ -1057,6 +1078,9 @@ export async function runAgent(
     },
   });
 
+  permission?.verify();
+  if (permission) sessionPermissions.set(session, permission);
+
   // With `allowedToolNames` unset, the registry is scoped by `excludeTools` but
   // the ACTIVE set still needs managing: pi activates only its four default
   // built-ins at turn 1, and `ext:` narrowing has no registry-level expression
@@ -1074,6 +1098,7 @@ export async function runAgent(
     });
   }
 
+  sessionHandedOff = true;
   options.onSessionCreated?.(session);
 
   // Track turns for graceful max_turns enforcement
@@ -1200,6 +1225,13 @@ export async function runAgent(
     ...(structuredRetried ? { structuredRetried } : {}),
     ...(modelProgressWatchdog !== undefined ? { modelProgressWatchdog } : {}),
   };
+  } finally {
+    permission?.release();
+    if (permission && permissionSession && !sessionHandedOff) {
+      try { await permissionSession.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" }); }
+      finally { permissionSession.dispose(); }
+    }
+  }
 }
 
 /**
@@ -1215,6 +1247,11 @@ export async function resumeAgent(
     signal?: AbortSignal;
   } = {},
 ): Promise<{ text: string; failure?: string; modelProgressWatchdog?: ModelProgressWatchdogMetadata }> {
+  const permission = sessionPermissions.get(session);
+  const cancellation = new AbortController();
+  const releasePermission = permission?.resume(() => cancellation.abort());
+  if (permission) options = { ...options, signal: options.signal ? AbortSignal.any([options.signal, cancellation.signal]) : cancellation.signal };
+  try {
   const invocationModelProgressTimeoutMinutes = getModelProgressTimeoutMinutes();
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
@@ -1276,6 +1313,7 @@ export async function resumeAgent(
     failure,
     ...(modelProgressWatchdog !== undefined ? { modelProgressWatchdog } : {}),
   };
+  } finally { releasePermission?.(); }
 }
 
 /**

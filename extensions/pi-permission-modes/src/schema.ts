@@ -1,223 +1,130 @@
-/**
- * Mode schema — the declarative vocabulary a permission mode is built from.
- *
- * A MODE is data: a named bundle of a sandbox profile, an allow/ask/deny
- * permission policy keyed by surface, plus UI metadata (label/color), an
- * optional system-prompt injection, and a hidden-tools list. The four built-in
- * modes ship in `permission-mode.defaults.json`; users override or extend them in
- * `permission-mode.json`.
- *
- * This module is pure and SDK-free (string-literal unions, not enums, for Node's
- * strip-only TS) so the resolution engine and loader can be unit-tested without
- * the host.
- */
-
-/** Three-state permission outcome (opencode-compatible semantics). */
-export type Action = "allow" | "ask" | "deny";
-
-/** A glob pattern → action map. The `"*"` key is the universal fallback. */
-export type PatternMap = Record<string, Action>;
-
-/** A surface value is either a shorthand action or a pattern-map. */
-export type SurfaceValue = Action | PatternMap;
-
-/** A remembered file scope.
- *
- * Tree values are literal directory paths. Their display form adds `/*`, but
- * the matcher uses canonical path containment rather than glob syntax.
- */
-export type FileScope =
-  | { kind: "exact"; value: string }
-  | { kind: "tree"; value: string }
-  | { kind: "glob"; value: string };
-
-/** File permissions that can be remembered independently. */
-export type PathGrantPermission =
-  | "path"
-  | "external_directory"
-  | "read"
-  | "write"
-  | "edit"
-  | "grep"
-  | "find"
-  | "ls";
-
-/** A typed remembered approval. */
-export type PermissionGrant =
-  | { permission: PathGrantPermission; scope: FileScope }
-  | { permission: "bash"; pattern: string };
-
-/** File-tool surfaces (excluding the cross-cutting path gates). */
-export type FileSurface = Exclude<PathGrantPermission, "path" | "external_directory">;
-
-export const PATH_GRANT_PERMISSIONS: PathGrantPermission[] = [
-  "path",
-  "external_directory",
-  "read",
-  "write",
-  "edit",
-  "grep",
-  "find",
-  "ls",
-];
-
-/**
- * The gateable surfaces.
- *   path                cross-cutting gate over ALL file access (incl. bash args);
- *                       a `path` deny overrides any per-tool allow.
- *   external_directory  the out-of-project (CWD-escape) boundary.
- *   read/write/edit/grep/find/ls   per-file-tool, matched against `input.path`.
- *   bash                per-command patterns, matched against each extracted
- *                       command name (+ path-like args via path/external_directory).
- *   web_search          the web_search tool.
- *   tool                generic surface for any non-builtin (extension) tool, by name.
- *   skill               skills, matched by skill name (gated via the input event).
- */
-export type Surface =
-  | "path"
-  | "external_directory"
-  | "read"
-  | "write"
-  | "edit"
-  | "grep"
-  | "find"
-  | "ls"
-  | "bash"
-  | "web_search"
-  | "tool"
-  | "skill";
-
-/** The set of valid surface names, for loader validation. */
-export const SURFACES: Surface[] = [
-  "path",
-  "external_directory",
-  "read",
-  "write",
-  "edit",
-  "grep",
-  "find",
-  "ls",
-  "bash",
-  "web_search",
-  "tool",
-  "skill",
-];
-
-/** Surfaces that resolve against a filesystem path (subject to the `path` gate). */
-export const FILE_SURFACES: Surface[] = ["read", "write", "edit", "grep", "find", "ls", "bash"];
-
-/** Footer label colors (semantic theme tokens, no icons). */
+/** Filesystem authority and network policy have independent lifetimes. */
+export type Access = "read" | "write";
+export type RuleAction = "allow" | "ask" | "deny";
+export type Lifetime = "session" | "project";
+export type ProcessMode = "compatible" | "strict";
 export type ModeColor = "muted" | "mdLink" | "accent" | "error";
 
-/**
- * The OS-sandbox profile for a mode. `enabled:false` runs bash unsandboxed
- * (YOLO); `writable:false` confines bash to reads (Plan). The filesystem/network
- * fields feed @anthropic-ai/sandbox-runtime.
- */
-export interface SandboxProfile {
-  enabled: boolean;
-  writable: boolean;
-  allowWrite?: string[];
-  denyWrite?: string[];
-  denyRead?: string[];
-  network?: { allowedDomains?: string[]; deniedDomains?: string[] };
-  /**
-   * Ask the user live when bash tries to reach a host outside the allowlist
-   * (the connection waits while they decide). Defaults to true; false denies
-   * silently as before. Project configs may set it to false (stricter), never
-   * back to true.
-   */
-  askOnBlockedHost?: boolean;
-}
+export type FilesystemProfile =
+  | { kind: "unrestricted" }
+  | { kind: "scoped"; readOnly: string[]; readWrite: string[]; resourceReads: ("pi" | "system")[] };
 
-/** One named mode. */
 export interface ModeDef {
   label: string;
   color: ModeColor;
-  /**
-   * Optional system-prompt injected via before_agent_start while this mode is
-   * active. The sentinel `"@plan"` is resolved at runtime to the date-stamped
-   * `planModeSystemPrompt(today)`; any other string is injected verbatim.
-   */
-  systemPrompt?: string;
-  /**
-   * Inject a factual description of this mode's sandbox boundaries (writable
-   * paths, denied reads, network allowlist, prompt flow) into the system
-   * prompt each turn, so the model picks paths/domains that work instead of
-   * discovering the sandbox through failed commands. Defaults to true; set
-   * false to opt out. Modes with `sandbox.enabled: false` never inject.
-   */
-  injectSandboxInfo?: boolean;
-  sandbox: SandboxProfile;
-  permission: Partial<Record<Surface, SurfaceValue>>;
-  /** Tool names hidden from the model while this mode is active. */
-  hideTools?: string[];
-  /**
-   * Skip the hard protected-path backstop (`.git`, `.env`, dotfiles) for file
-   * tools. Defaults to false — the backstop applies in every mode unless a mode
-   * explicitly trusts everything. Only YOLO sets this true.
-   */
-  bypassProtectedPaths?: boolean;
-  /**
-   * Internal (NOT part of the JSON schema): an untrusted project config's
-   * permission overlay, set by the loader. The resolver folds it in as an extra
-   * most-restrictive layer, so it can only tighten the base policy, never loosen
-   * it — regardless of the patterns it contains.
-   */
-  projectOverlay?: Partial<Record<Surface, SurfaceValue>>;
-  /**
-   * Retains trusted rules so persistence does not offer a global rule that a
-   * later project `ask` would override.
-   */
-  trustedProjectPermission?: Partial<Record<Surface, SurfaceValue>>;
-  /** Deny-safe remembered grants from the global configuration. */
-  permissionGrants?: PermissionGrant[];
-  /** Deny-safe remembered grants from the trusted project configuration. */
-  trustedProjectPermissionGrants?: PermissionGrant[];
+  filesystem: FilesystemProfile;
 }
 
-/** Top-level config: the mode registry plus cycle/default metadata. */
+export interface PathRule {
+  path: string;
+  scope: "file" | "tree";
+  read?: RuleAction;
+  write?: RuleAction;
+}
+
+export interface NetworkPolicy {
+  default: "restricted" | "open";
+  allowedDomains: string[];
+  deniedDomains: string[];
+}
+
 export interface PermissionModeConfig {
+  version: 3;
   $schema?: string;
   defaultMode: string;
-  /** shift+tab cycle order; also the display order. */
+  processMode?: ProcessMode;
   cycleOrder: string[];
   modes: Record<string, ModeDef>;
+  pathRules: PathRule[];
+  network: NetworkPolicy;
 }
 
-/** Sentinel a mode's `systemPrompt` can use to request the Plan-mode prompt. */
-export const PLAN_PROMPT_SENTINEL = "@plan";
+/** Execution identities are pinned within a launch, not persisted across launches. */
+export interface FileIdentity {
+  dev: string;
+  ino: string;
+  birthtimeNs: string;
+  type: "file" | "directory" | "symlink" | "other";
+}
 
-// The shipped default modes live in `permission-mode.defaults.json` at the package
-// root (loaded by config-load.ts), so the defaults are data in the same format
-// users edit. The emergency in-code fallback lives in config-load.ts.
+export interface PathBinding {
+  lexical: string;
+  canonical: string;
+  prefix: string;
+  identity: FileIdentity;
+  missing: string[];
+}
 
-/**
- * System-prompt addition injected while Plan Mode is active (resolved from the
- * `"@plan"` sentinel). `today` is an ISO date (YYYY-MM-DD) stamped at call time
- * so the suggested plan filename uses the current date.
- */
-export function planModeSystemPrompt(today: string): string {
-  return [
-    "## Plan Mode is active",
-    "",
-    "In this mode bash runs read-only and only Markdown files can be created or",
-    "edited, so do not change code now.",
-    "",
-    "If the user asks you to plan a task (a feature, refactor, investigation, or any",
-    "multi-step change):",
-    `1. Use the **Write** tool to create the plan file at \`docs/plans/${today}_<short-kebab-description>.md\`.`,
-    "   Write creates the `docs/plans/` directory automatically — do NOT run `mkdir` or any",
-    "   other bash command to make the folder (bash is read-only here and will fail).",
-    "2. Keep it concise but actionable — context, approach, the files to change, and",
-    "   how to verify.",
-    "3. Then call the **show_plan** tool with that file path — it renders the plan in",
-    "   the terminal for the user. Do NOT paste the plan text into your reply; show_plan",
-    "   displays it.",
-    "4. After show_plan, do NOT summarize, recap, or describe the plan, and add no other",
-    "   commentary. Your entire reply must be a single short line: ask the user to review",
-    "   the plan and press `shift+tab` (or run `/perm build`) to switch to Build mode and apply it.",
-    "",
-    "For quick questions that aren't planning tasks, just answer normally.",
-  ].join("\n");
+/** Exact-file authority follows a name inside a pinned parent, not a replaceable leaf inode. */
+export interface FileBinding {
+  lexical: string;
+  canonical: string;
+  parent: PathBinding;
+}
+
+export type PermissionBinding = PathBinding | FileBinding;
+
+export interface RootIdentity {
+  family: string;
+  binding: PathBinding;
+}
+
+export interface AccessGrant {
+  id: string;
+  binding: PermissionBinding;
+  access: Access;
+  lifetime: Lifetime;
+}
+
+export interface ResolvedRule extends PathRule {
+  id: string;
+  definition: string;
+  binding?: PermissionBinding;
+  blocked?: string;
+}
+
+export interface RuleException {
+  id: string;
+  ruleId: string;
+  access: Access;
+  lifetime: Lifetime;
+}
+
+export interface ResourceGrant {
+  /** Host-runtime resources are rediscovered instead of becoming saved authority. */
+  runtime?: true;
+  definition?: string;
+  binding: PermissionBinding;
+  scope: "file" | "tree";
+  access: Access;
+}
+
+export interface ResolvedProfile {
+  kind: "scoped" | "unrestricted";
+  grants: ResourceGrant[];
+}
+
+export interface ResolvedCatalog {
+  root: RootIdentity;
+  config: PermissionModeConfig;
+  profiles: Record<string, ResolvedProfile>;
+  rules: ResolvedRule[];
+}
+
+export interface FilesystemSnapshot {
+  revision: number;
+  root: RootIdentity;
+  mode: string;
+  processMode?: ProcessMode;
+  profile: ResolvedProfile;
+  rules: ResolvedRule[];
+  grants: AccessGrant[];
+  exceptions: RuleException[];
+}
+
+export interface NetworkSnapshot {
+  revision: number;
+  restricted: boolean;
+  allowedDomains: string[];
+  deniedDomains: string[];
 }

@@ -1,534 +1,94 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import os from "node:os";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import {
-  canonicalizeSandboxPaths,
-  FALLBACK_CONFIG,
-  isUnsafeDomain,
-  loadModeConfig,
-  loadStockDefaults,
-  persistModeDomains,
-  persistModeRule,
-  persistPermissionGrants,
-  persistProjectPermissionGrants,
-  persistProjectRule,
-  profileToConfig,
-  projectGrantCount,
-  readOnlyOverride,
-  stockDefaultsFile,
-} from "./config-load.ts";
-import { canonicalizeScope } from "./file-approval.ts";
-import { decide } from "./resolve.ts";
+import { defaultConfig, loadConfig, mergeConfig, parseConfig, readConfig } from "./config-load.ts";
+import { bindPath } from "./paths.ts";
 
-/** Build a temp agentDir + cwd, optionally seeding the global/project JSON. */
-function sandbox(opts: { global?: unknown; project?: unknown } = {}): {
-  cwd: string;
-  agentDir: string;
-  errors: string[];
-  cleanup: () => void;
-} {
-  const tmpdir = os.tmpdir();
-  if (!existsSync(tmpdir)) mkdirSync(tmpdir, { recursive: true });
-  const tmp = mkdtempSync(path.join(tmpdir, "permmode-"));
-  const agentDir = path.join(tmp, "agent");
-  const cwd = path.join(tmp, "project");
-  mkdirSync(cwd, { recursive: true });
-  if (opts.global !== undefined) {
-    const dir = path.join(agentDir, "permission-mode");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      path.join(dir, "permission-mode.json"),
-      typeof opts.global === "string" ? opts.global : JSON.stringify(opts.global),
-    );
+test("strict v3 overrides reject duplicate rules and invalid shapes and normalize domains idempotently", () => {
+  const base = defaultConfig();
+  assert.throws(() => mergeConfig(base, { version: 3, $schema: 1 }), /schema/);
+  assert.throws(() => mergeConfig(base, { version: 3, network: null }), /object/);
+  assert.throws(() => mergeConfig(base, { version: 3, pathRules: [base.pathRules[0], base.pathRules[0]] }), /Duplicate/);
+  assert.throws(() => mergeConfig(base, { version: 3, modes: { project: { filesystem: { kind: "scoped", readOnly: ["a\0b"], readWrite: [], resourceReads: [] } } } }), /nonempty/);
+  const normalized = mergeConfig(base, { version: 3, network: { allowedDomains: ["EXAMPLE.COM", "example.com"], deniedDomains: ["Blocked.EXAMPLE"] } });
+  assert.deepEqual(normalized.network.allowedDomains, ["example.com"]);
+  assert.deepEqual(normalized.network.deniedDomains, ["blocked.example"]);
+  assert.deepEqual(parseConfig(normalized), normalized);
+  const schema = JSON.parse(readFileSync(new URL("../schemas/permission-mode.schema.json", import.meta.url), "utf8"));
+  assert.equal(schema.properties.pathRules.uniqueItems, true);
+  assert.equal(schema.properties.$schema.type, "string");
+  assert.ok(!new RegExp(schema.$defs.paths.items.pattern).test("a\0b"));
+});
+
+test("macOS defaults include writable var/folders without overriding explicit filesystem scopes", () => {
+  const config = defaultConfig();
+  for (const name of ["project", "subproject"]) {
+    const filesystem = config.modes[name]!.filesystem;
+    assert.equal(filesystem.kind, "scoped");
+    if (filesystem.kind !== "scoped") assert.fail("Expected a scoped default profile");
+    assert.ok(filesystem.readWrite.includes("/tmp"));
+    assert.equal(filesystem.readWrite.includes("/var/folders"), process.platform === "darwin");
   }
-  if (opts.project !== undefined) {
-    const dir = path.join(cwd, ".pi");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      path.join(dir, "permission-mode.json"),
-      typeof opts.project === "string" ? opts.project : JSON.stringify(opts.project),
-    );
-  }
-  const errors: string[] = [];
-  return { cwd, agentDir, errors, cleanup: () => rmSync(tmp, { recursive: true, force: true }) };
-}
-
-test("loadStockDefaults: reads the shipped JSON → four modes, correct defaults", () => {
-  const errors: string[] = [];
-  const c = loadStockDefaults((m) => errors.push(m));
-  assert.equal(errors.length, 0, errors.join("; ")); // stock file present & valid
-  assert.equal(c.defaultMode, "default");
-  assert.deepEqual(c.cycleOrder, ["default", "plan", "build", "yolo"]);
-  assert.deepEqual(Object.keys(c.modes).sort(), ["build", "default", "plan", "yolo"]);
-  assert.ok(stockDefaultsFile().endsWith("permission-mode.defaults.json"));
+  assert.deepEqual(config.modes.yolo!.filesystem, { kind: "unrestricted" });
+  const scoped = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: [] };
+  const explicit = mergeConfig(config, { version: 3, modes: { project: { filesystem: scoped } } });
+  assert.deepEqual(explicit.modes.project!.filesystem, scoped);
 });
 
-test("FALLBACK_CONFIG is a valid, safe single-mode config", () => {
-  assert.equal(FALLBACK_CONFIG.defaultMode, "default");
-  assert.deepEqual(Object.keys(FALLBACK_CONFIG.modes), ["default"]);
-  const d = FALLBACK_CONFIG.modes.default;
-  assert.equal(d.sandbox.enabled, true); // sandboxed
-  assert.equal(decide(d, "bash", "ls"), "ask"); // never silently allows
-  assert.equal(decide(d, "write", "x.ts"), "ask");
+test("process mode defaults to compatible, accepts strict, and preserves legacy configuration shapes", () => {
+  const config = defaultConfig();
+  assert.equal(config.processMode, "compatible");
+  assert.equal(mergeConfig(config, { version: 3, processMode: "strict" }).processMode, "strict");
+  for (const processMode of [null, "relaxed", false])
+    assert.throws(() => mergeConfig(config, { version: 3, processMode }), /processMode/);
+  const legacy = { ...config }; delete legacy.processMode;
+  assert.deepEqual(parseConfig(legacy), legacy);
+  const schema = JSON.parse(readFileSync(new URL("../schemas/permission-mode.schema.json", import.meta.url), "utf8"));
+  assert.deepEqual(schema.properties.processMode.enum, ["compatible", "strict"]);
+  assert.equal(schema.properties.processMode.default, "compatible");
 });
 
-test("loadModeConfig: no files → the four built-in modes", () => {
-  const s = sandbox();
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.equal(c.defaultMode, "default");
-  assert.deepEqual(Object.keys(c.modes).sort(), ["build", "default", "plan", "yolo"]);
-  assert.equal(s.errors.length, 0);
-  s.cleanup();
+test("networking defaults to open without overriding explicit restrictions", () => {
+  const config = defaultConfig();
+  assert.equal(config.network.default, "open");
+  assert.equal(mergeConfig(config, { version: 3, network: { default: "restricted" } }).network.default, "restricted");
 });
 
-test("global: full authority — add a mode, redefine a built-in, change defaults", () => {
-  const s = sandbox({
-    global: {
-      defaultMode: "build",
-      cycleOrder: ["build", "default", "review"],
-      modes: {
-        default: { permission: { bash: "deny" } }, // redefine: deny bash in Default
-        review: {
-          label: "Review",
-          color: "mdLink",
-          sandbox: { enabled: true, writable: false },
-          permission: { bash: "allow", write: "deny" },
-        },
-      },
-    },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.equal(c.defaultMode, "build");
-  assert.deepEqual(c.cycleOrder, ["build", "default", "review"]);
-  assert.equal(decide(c.modes.default, "bash", "ls"), "deny"); // redefined
-  assert.equal(decide(c.modes.default, "read", "x"), "allow"); // untouched surface preserved
-  assert.ok(c.modes.review); // new mode added
-  assert.equal(c.modes.review.label, "Review");
-  s.cleanup();
-});
-
-test("warns on array-index-like pattern keys (JS front-loads their order)", () => {
-  const s = sandbox({
-    global: {
-      modes: {
-        // "777" would iterate FIRST regardless of file order, silently breaking
-        // last-match-wins; the pattern still loads, but the user is told.
-        default: { permission: { bash: { "*": "ask", "777": "deny" } } },
-      },
-    },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.ok(s.errors.some((e) => /bare number/.test(e) && /777/.test(e)));
-  assert.equal(decide(c.modes.default, "bash", "777"), "ask"); // "777" reordered before "*" — exactly the trap being warned about
-  // Non-index-like numeric-ish keys don't warn.
-  const s2 = sandbox({
-    global: { modes: { default: { permission: { bash: { "7z*": "allow", "0x*": "allow" } } } } },
-  });
-  loadModeConfig(s2.cwd, s2.agentDir, (m) => s2.errors.push(m));
-  assert.ok(!s2.errors.some((e) => /bare number/.test(e)));
-  s.cleanup();
-  s2.cleanup();
-});
-
-test("project: tighten-only — can tighten, never loosen", () => {
-  const s = sandbox({
-    project: {
-      modes: {
-        default: { permission: { bash: "deny", write: "allow" }, sandbox: { enabled: false, writable: false } },
-        yolo: { sandbox: { enabled: true } },
-      },
-    },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  // bash ask → deny: tightened.
-  assert.equal(decide(c.modes.default, "bash", "ls"), "deny");
-  // write ask + project "allow": most-restrictive overlay can't loosen → stays ask.
-  assert.equal(decide(c.modes.default, "write", "x.ts"), "ask");
-  // A project cannot disable globally enabled containment.
-  assert.equal(c.modes.default.sandbox.enabled, true);
-  assert.ok(s.errors.some((e) => /cannot change sandbox\.enabled.*false/.test(e)));
-  // Project config also cannot create a new runtime profile by enabling a
-  // globally unsandboxed mode.
-  assert.equal(c.modes.yolo.sandbox.enabled, false);
-  assert.ok(s.errors.some((e) => /cannot change sandbox\.enabled.*true/.test(e)));
-  // sandbox writable forced off.
-  assert.equal(c.modes.default.sandbox.writable, false);
-  s.cleanup();
-});
-
-test("trusted project permission entries append after global rules", () => {
-  const s = sandbox({
-    global: { modes: { default: { permission: { bash: { "*": "ask", "git *": "deny" } } } } },
-    project: { modes: { default: { permission: { bash: { "git fetch": "allow", "git fetch *": "allow" } } } } },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
-  const bash = c.modes.default.permission.bash;
-  assert.ok(bash && typeof bash !== "string");
-  assert.deepEqual(Object.keys(bash), ["*", "git *", "git fetch", "git fetch *"]);
-  assert.equal(decide(c.modes.default, "bash", "git fetch origin"), "allow");
-  assert.equal(decide(c.modes.default, "bash", "git push origin"), "deny");
-  s.cleanup();
-});
-
-test("trusted project ask can override a global allow", () => {
-  const s = sandbox({
-    global: { modes: { default: { permission: { bash: { "*": "ask", "git *": "allow" } } } } },
-    project: { modes: { default: { permission: { bash: { "git push *": "ask" } } } } },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
-  assert.equal(decide(c.modes.default, "bash", "git fetch origin"), "allow");
-  assert.equal(decide(c.modes.default, "bash", "git push origin"), "ask");
-  s.cleanup();
-});
-
-test("project: repeating inherited sandbox.enabled is a silent no-op", () => {
-  const s = sandbox({
-    project: {
-      modes: {
-        default: { sandbox: { enabled: true } },
-        yolo: { sandbox: { enabled: false } },
-      },
-    },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.equal(c.modes.default.sandbox.enabled, true);
-  assert.equal(c.modes.yolo.sandbox.enabled, false);
-  assert.ok(!s.errors.some((e) => /sandbox\.enabled/.test(e)));
-  s.cleanup();
-});
-
-test("project: sandbox intersect/union + unsafe domains rejected", () => {
-  const s = sandbox({
-    project: {
-      modes: {
-        build: {
-          sandbox: {
-            allowWrite: ["."], // intersect with ['.','/tmp'] → ['.']
-            denyRead: ["~/.config"], // union
-            network: { allowedDomains: ["github.com", "*.com"] }, // *.com rejected
-          },
-        },
-      },
-    },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  const sb = c.modes.build.sandbox;
-  assert.deepEqual(sb.allowWrite, ["."]); // intersected
-  assert.ok(sb.denyRead?.includes("~/.config") && sb.denyRead?.includes("~/.ssh")); // unioned
-  assert.deepEqual(sb.network?.allowedDomains, ["github.com"]); // *.com dropped (intersect of safe)
-  assert.ok(s.errors.some((e) => /overly-broad/.test(e)));
-  s.cleanup();
-});
-
-test("project: cannot add a mode or change defaults", () => {
-  const s = sandbox({
-    project: { defaultMode: "yolo", modes: { hacker: { label: "H", color: "error", sandbox: { enabled: false, writable: true }, permission: {} } } },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.equal(c.defaultMode, "default"); // unchanged
-  assert.ok(!c.modes.hacker); // not added
-  assert.ok(s.errors.some((e) => /cannot add new mode/.test(e)));
-  assert.ok(s.errors.some((e) => /defaultMode\/cycleOrder/.test(e)));
-  s.cleanup();
-});
-
-test("malformed JSON keeps prior layer and reports the error", () => {
-  const s = sandbox({ global: "{ not valid json " });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.deepEqual(Object.keys(c.modes).sort(), ["build", "default", "plan", "yolo"]); // defaults intact
-  assert.ok(s.errors.some((e) => /could not parse/.test(e)));
-  s.cleanup();
-});
-
-test("unknown surface and $schema are handled", () => {
-  const s = sandbox({
-    global: { $schema: "./x.json", modes: { default: { permission: { bogus: "deny", bash: "deny" } } } },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.equal(decide(c.modes.default, "bash", "ls"), "deny"); // valid surface applied
-  assert.ok(s.errors.some((e) => /unknown surface "bogus"/.test(e)));
-  s.cleanup();
-});
-
-test("readOnlyOverride drops allowWrite; profileToConfig maps fields; isUnsafeDomain", () => {
-  assert.deepEqual(readOnlyOverride({ filesystem: { allowWrite: ["."], denyRead: ["~/.ssh"] } }).filesystem, {
-    allowWrite: [],
-    denyRead: ["~/.ssh"],
-  });
-  const c = profileToConfig({ enabled: true, writable: true, allowWrite: ["."], denyRead: ["~/.ssh"], denyWrite: [] });
-  assert.equal(c.filesystem?.allowWrite?.[0], ".");
-  assert.ok(isUnsafeDomain("*") && isUnsafeDomain("*.com") && isUnsafeDomain("http://x"));
-  assert.ok(!isUnsafeDomain("*.github.com") && !isUnsafeDomain("github.com"));
-});
-
-test("canonicalizeSandboxPaths: resolves symlinked mount points, drops widening ones", () => {
-  const tmp = realpathSync(mkdtempSync(path.join(os.tmpdir(), "permmode-fs-")));
+test("v3 allow/ask/deny syntax agrees with the schema and repository policy is never read", () => {
+  const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-user-only-"))).canonical;
   try {
-    const store = path.join(tmp, "store");
-    mkdirSync(store, { recursive: true });
-    const link = path.join(tmp, "link");
-    symlinkSync(store, link);
-    const wide = path.join(tmp, "sub", "wide");
-    mkdirSync(path.dirname(wide), { recursive: true });
-    symlinkSync(tmp, wide);
-
-    const errors: string[] = [];
-    const out = canonicalizeSandboxPaths(
-      { filesystem: { denyRead: [link, wide], allowWrite: [store], denyWrite: [] } },
-      (m) => errors.push(m),
-    );
-    assert.deepEqual(out.filesystem?.denyRead, [store]); // symlink resolved, widening entry dropped
-    assert.deepEqual(out.filesystem?.allowWrite, [store]);
-    assert.deepEqual(out.filesystem?.denyWrite, []);
-    assert.ok(errors.some((e) => e.includes(wide) && /denyRead/.test(e)));
-
-    // Nothing to canonicalize when a config carries no filesystem section.
-    assert.deepEqual(canonicalizeSandboxPaths({ network: { allowedDomains: ["x.dev"] } }), {
-      network: { allowedDomains: ["x.dev"] },
-    });
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
-  }
+    const agentDir = path.join(dir, "agent");
+    mkdirSync(agentDir); mkdirSync(path.join(agentDir, "permission-mode")); mkdirSync(path.join(dir, ".pi"));
+    writeFileSync(path.join(dir, ".pi", "permission-mode.json"), "malformed and expansive repository input");
+    const raw = { version: 3, pathRules: [{ path: "~/notes", scope: "file", read: "allow", write: "ask" }] };
+    writeFileSync(path.join(agentDir, "permission-mode", "permission-mode.json"), JSON.stringify(raw));
+    assert.deepEqual(loadConfig(agentDir, dir).global.pathRules, raw.pathRules);
+    assert.equal(loadConfig(agentDir, dir).global.version, 3);
+    assert.throws(() => mergeConfig(defaultConfig(), { ...raw, version: 2 }), /only version 3/);
+    for (const action of ["allow", "ask", "deny"]) {
+      for (const operation of ["read", "write"])
+        assert.throws(() => mergeConfig(defaultConfig(), { version: 3, pathRules: [{ path: "~/notes", scope: "file", [operation]: [action] }] }), /must be allow, ask, or deny/);
+    }
+    const schema = JSON.parse(readFileSync(new URL("../schemas/permission-mode.schema.json", import.meta.url), "utf8"));
+    assert.equal(schema.properties.version.const, 3);
+    assert.deepEqual(schema.properties.pathRules.items.properties.read.enum, ["allow", "ask", "deny"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("persistModeRule: creates the global file with the learned rule, round-trips", () => {
-  const s = sandbox();
-  const file = persistModeRule(s.agentDir, "default", "tool", "fooTool", "allow");
-  assert.ok(file.endsWith(path.join("permission-mode", "permission-mode.json")));
-  const written = JSON.parse(readFileSync(file, "utf-8"));
-  // Seeds "*": "ask" so other tools keep prompting, plus the learned allow.
-  assert.deepEqual(written.modes.default.permission.tool, { "*": "ask", fooTool: "allow" });
-  // The persisted allow takes effect through the normal loader.
-  const c = loadModeConfig(s.cwd, s.agentDir, () => {});
-  assert.equal(decide(c.modes.default, "tool", "fooTool"), "allow");
-  assert.equal(decide(c.modes.default, "tool", "otherTool"), "ask"); // others still prompt
-  s.cleanup();
-});
-
-test("persistProjectRule omits a fallback, moves duplicates last, and preserves malformed files", () => {
-  const s = sandbox();
-  const file = persistProjectRule(s.cwd, "default", "bash", "git fetch", "allow");
-  let written = JSON.parse(readFileSync(file, "utf-8"));
-  assert.deepEqual(written.modes.default.permission.bash, { "git fetch": "allow" });
-
-  writeFileSync(file, JSON.stringify({ modes: { default: { permission: { bash: { "git fetch": "deny", "*": "ask" } } } } }));
-  persistProjectRule(s.cwd, "default", "bash", "git fetch", "allow");
-  written = JSON.parse(readFileSync(file, "utf-8"));
-  assert.deepEqual(Object.keys(written.modes.default.permission.bash), ["*", "git fetch"]);
-
-  writeFileSync(file, "{ malformed");
-  assert.throws(() => persistProjectRule(s.cwd, "default", "bash", "git push", "allow"), /malformed config/);
-  assert.equal(readFileSync(file, "utf-8"), "{ malformed");
-  s.cleanup();
-});
-
-test("persistModeDomains: appends to the FULL stock+global allowlist, round-trips", () => {
-  const s = sandbox();
-  const stockDomains = loadStockDefaults().modes.default.sandbox.network?.allowedDomains ?? [];
-  const file = persistModeDomains(s.agentDir, "default", ["api.internal.io"]);
-  const written = JSON.parse(readFileSync(file, "utf-8"));
-  // mergeGlobal replaces `network` wholesale, so the stock domains must be
-  // baked into the persisted list or they'd be lost on the next load.
-  const list = written.modes.default.sandbox.network.allowedDomains as string[];
-  for (const d of stockDomains) assert.ok(list.includes(d), `stock domain ${d} preserved`);
-  assert.ok(list.includes("api.internal.io"));
-  const c = loadModeConfig(s.cwd, s.agentDir, () => {});
-  assert.ok(c.modes.default.sandbox.network?.allowedDomains?.includes("api.internal.io"));
-  assert.ok(c.modes.default.sandbox.network?.allowedDomains?.includes(stockDomains[0]));
-  // Idempotent: persisting again doesn't duplicate.
-  persistModeDomains(s.agentDir, "default", ["api.internal.io"]);
-  const again = JSON.parse(readFileSync(file, "utf-8")).modes.default.sandbox.network.allowedDomains as string[];
-  assert.equal(again.filter((d) => d === "api.internal.io").length, 1);
-  s.cleanup();
-});
-
-test("persistModeDomains: never bakes a project's tightened list into the global config", () => {
-  // Project intersects the allowlist down to one domain; a forever-grant made
-  // while that project is open must still persist against the UNTIGHTENED base.
-  const s = sandbox({ project: { modes: { default: { sandbox: { network: { allowedDomains: ["github.com"] } } } } } });
-  const stockDomains = loadStockDefaults().modes.default.sandbox.network?.allowedDomains ?? [];
-  const file = persistModeDomains(s.agentDir, "default", ["api.internal.io"]);
-  const list = JSON.parse(readFileSync(file, "utf-8")).modes.default.sandbox.network.allowedDomains as string[];
-  for (const d of stockDomains) assert.ok(list.includes(d), `stock domain ${d} not lost to project tightening`);
-  s.cleanup();
-});
-
-test("project: askOnBlockedHost can be forced off (silent deny), never back on", () => {
-  const s = sandbox({
-    global: { modes: { default: { sandbox: { askOnBlockedHost: false } } } },
-    project: { modes: { default: { sandbox: { askOnBlockedHost: true } }, build: { sandbox: { askOnBlockedHost: false } } } },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m));
-  assert.equal(c.modes.default.sandbox.askOnBlockedHost, false); // project cannot re-enable asking
-  assert.equal(c.modes.build.sandbox.askOnBlockedHost, false); // project may force silent-deny
-  s.cleanup();
-});
-
-test("projectGrantCount counts only valid grants for known modes and surfaces", () => {
-  const s = sandbox({
-    project: {
-      modes: {
-        default: { permission: { bash: { "git": "allow", "git fetch": "invalid" }, write: "allow", bogus: "allow" } },
-        unknown: { permission: { bash: "allow" } },
-      },
-    },
-  });
-  assert.equal(projectGrantCount(s.cwd), 2);
-  s.cleanup();
-});
-
-test("trusted project sandbox additions warn once and preserve tighten-only fields", () => {
-  const s = sandbox({
-    project: {
-      modes: {
-        default: {
-          sandbox: {
-            allowWrite: ["/tmp/project-extra"],
-            denyRead: ["~/.secret"],
-            denyWrite: ["~/.locked"],
-            writable: false,
-            askOnBlockedHost: false,
-            network: { allowedDomains: ["api.example.com", "*.com"], deniedDomains: ["bad.example.com"] },
-          },
-        },
-      },
-    },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
-  const sb = c.modes.default.sandbox;
-  assert.ok(sb.allowWrite?.includes("/tmp/project-extra"));
-  assert.ok(sb.denyRead?.includes("~/.secret"));
-  assert.ok(sb.denyWrite?.includes("~/.locked"));
-  assert.equal(sb.writable, false);
-  assert.equal(sb.askOnBlockedHost, false);
-  assert.ok(sb.network?.allowedDomains?.includes("api.example.com"));
-  assert.ok(sb.network?.deniedDomains?.includes("bad.example.com"));
-  assert.equal(s.errors.filter((e) => e.includes('"*.com"')).length, 1);
-  assert.equal(sb.enabled, true);
-  s.cleanup();
-});
-
-test("permission grants round-trip globally and for trusted projects", () => {
-  const s = sandbox();
-  const globalFile = persistPermissionGrants(s.agentDir, "default", [
-    { permission: "read", scope: { kind: "glob", value: "/tmp/*" } },
-  ]);
-  const projectFile = persistProjectPermissionGrants(s.cwd, "default", [
-    { permission: "write", scope: { kind: "exact", value: "/tmp/out" } },
-  ]);
-  assert.ok(existsSync(globalFile) && existsSync(projectFile));
-  const trusted = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
-  assert.deepEqual(trusted.modes.default.permissionGrants, [{ permission: "read", scope: { kind: "glob", value: "/tmp/*" } }]);
-  assert.deepEqual(trusted.modes.default.trustedProjectPermissionGrants, [
-    { permission: "write", scope: { kind: "exact", value: "/tmp/out" } },
-  ]);
-  assert.equal(projectGrantCount(s.cwd, s.agentDir), 1);
-  const untrusted = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), false);
-  assert.equal(untrusted.modes.default.trustedProjectPermissionGrants, undefined);
-  assert.ok(s.errors.some((error) => /ignoring permissionGrants for untrusted/.test(error)));
-  s.cleanup();
-});
-
-test("permission grants preserve canonical bindings when a target is replaced by a symlink", () => {
-  const s = sandbox();
-  const fixedTarget = path.join(s.cwd, "fixed.txt");
-  const replacementTarget = path.join(s.cwd, "replacement.txt");
-  writeFileSync(fixedTarget, "fixed");
-  writeFileSync(replacementTarget, "replacement");
-  const bound = canonicalizeScope({ kind: "exact", value: fixedTarget }, s.cwd);
-  assert.deepEqual(bound, { kind: "exact", value: fixedTarget });
-  persistPermissionGrants(s.agentDir, "default", [{ permission: "read", scope: bound! }]);
-
-  rmSync(fixedTarget);
-  symlinkSync(replacementTarget, fixedTarget);
-  const reloaded = loadModeConfig(s.cwd, s.agentDir, () => {});
-  assert.deepEqual(reloaded.modes.default.permissionGrants, [{ permission: "read", scope: bound }]);
-  s.cleanup();
-});
-
-test("obsolete outside-file grants are warned about and inert", () => {
-  const s = sandbox({
-    global: { modes: { default: { outsideFileGrants: { read: [{ kind: "glob", value: "/tmp/*" }] } } } },
-    project: { modes: { default: { outsideFileGrants: { write: [{ kind: "exact", value: "/tmp/out" }] } } } },
-  });
-  const c = loadModeConfig(s.cwd, s.agentDir, (m) => s.errors.push(m), true);
-  assert.equal(c.modes.default.permissionGrants, undefined);
-  assert.equal(c.modes.default.trustedProjectPermissionGrants, undefined);
-  assert.ok(s.errors.filter((error) => /outsideFileGrants.*obsolete/.test(error)).length >= 2);
-  s.cleanup();
-});
-
-test("generic grant persistence is atomic, deduplicated, and removes stale grants only when touched", () => {
-  const s = sandbox({
-    global: {
-      $schema: "./custom-schema.json",
-      modes: {
-        default: {
-          permission: { bash: { "git *": "deny" } },
-          outsideFileGrants: { read: [{ kind: "exact", value: "/tmp/old" }] },
-        },
-        build: { outsideFileGrants: { read: [{ kind: "exact", value: "/tmp/keep" }] } },
-      },
-    },
-  });
-  const file = path.join(s.agentDir, "permission-mode", "permission-mode.json");
-  const grant = { permission: "read" as const, scope: { kind: "exact" as const, value: "/tmp/file" } };
-  assert.equal(persistPermissionGrants(s.agentDir, "default", [grant, grant]), file);
-  const saved = JSON.parse(readFileSync(file, "utf-8"));
-  assert.equal(saved.$schema, "./custom-schema.json");
-  assert.deepEqual(saved.modes.default.permission.bash, { "git *": "deny" });
-  assert.deepEqual(saved.modes.default.permissionGrants, [grant]);
-  assert.equal(saved.modes.default.outsideFileGrants, undefined);
-  assert.deepEqual(saved.modes.build.outsideFileGrants.read, [{ kind: "exact", value: "/tmp/keep" }]);
-  for (const value of ["/?*", "/*?", "?*", "/tmp/../?*"]) {
-    assert.throws(
-      () => persistPermissionGrants(s.agentDir, "default", [{ permission: "read", scope: { kind: "glob", value } }]),
-      /malformed|root-wide/,
-    );
-  }
-  const malformedGrantFile = JSON.stringify({
-    modes: {
-      default: {
-        permissionGrants: [
-          { permission: "read", scope: { kind: "exact", value: "/tmp/existing" }, unexpected: true },
-        ],
-      },
-    },
-  });
-  writeFileSync(file, malformedGrantFile);
-  assert.throws(() => persistPermissionGrants(s.agentDir, "default", [grant]), /malformed/);
-  assert.equal(readFileSync(file, "utf-8"), malformedGrantFile, "a malformed touched mode must remain untouched");
-  assert.throws(
-    () => persistPermissionGrants(s.agentDir, "default", [
-      { permission: "read", scope: { kind: "exact", value: "/tmp/new" }, unexpected: true } as never,
-    ]),
-    /malformed/,
-  );
-  assert.equal(readFileSync(file, "utf-8"), malformedGrantFile);
-
-  writeFileSync(file, "{ malformed");
-  assert.throws(() => persistPermissionGrants(s.agentDir, "default", [grant]), /malformed config/);
-  assert.equal(readFileSync(file, "utf-8"), "{ malformed");
-  s.cleanup();
-});
-
-test("persistModeRule: converts a string surface to a map and preserves other content", () => {
-  const s = sandbox({
-    global: { $schema: "./x.json", modes: { default: { permission: { tool: "allow", bash: "deny" } } } },
-  });
-  // Write the user's existing global file first (sandbox() only seeds it in memory if given).
-  const dir = path.join(s.agentDir, "permission-mode");
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(
-    path.join(dir, "permission-mode.json"),
-    JSON.stringify({ $schema: "./x.json", modes: { default: { permission: { tool: "allow", bash: "deny" } } } }),
-  );
-  const file = persistModeRule(s.agentDir, "default", "tool", "fooTool", "allow");
-  const written = JSON.parse(readFileSync(file, "utf-8"));
-  assert.equal(written.$schema, "./x.json"); // preserved
-  assert.equal(written.modes.default.permission.bash, "deny"); // preserved
-  assert.deepEqual(written.modes.default.permission.tool, { "*": "allow", fooTool: "allow" }); // string→map
-  s.cleanup();
+test("only genuinely absent configuration is absent; symlinks and special files fail closed", () => {
+  const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-config-"))).canonical;
+  try {
+    assert.equal(readConfig(path.join(dir, "missing.json")), undefined);
+    const file = path.join(dir, "config.json"); writeFileSync(file, "{}");
+    assert.deepEqual(readConfig(file), {});
+    symlinkSync("config.json", path.join(dir, "alias"));
+    symlinkSync("missing.json", path.join(dir, "dangling"));
+    mkdirSync(path.join(dir, "directory"));
+    assert.throws(() => readConfig(path.join(dir, "alias")), /symlink/);
+    assert.throws(() => readConfig(path.join(dir, "dangling")), /Dangling/);
+    assert.throws(() => readConfig(path.join(dir, "directory")), /regular file/);
+    writeFileSync(file, "invalid json"); assert.throws(() => readConfig(file), SyntaxError);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -1,132 +1,98 @@
-/**
- * Tests for network.ts — domain matching (runtime-mirroring semantics),
- * normalization, and the NetworkSession decision/memory/coalescing rules.
- */
-
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { NetworkSession, isHostAllowed, matchesDomainPattern, normalizeDomain } from "./network.ts";
+import { PermissionOwner } from "./approvals.ts";
+import { defaultConfig, parseConfig } from "./config-load.ts";
+import { NetworkSession, type NetAskResult } from "./network.ts";
+import { bindPath } from "./paths.ts";
+import { resolveCatalog } from "./policy.ts";
 
-test("matchesDomainPattern mirrors the sandbox-runtime semantics", () => {
-  // Exact, case-insensitive.
-  assert.ok(matchesDomainPattern("github.com", "github.com"));
-  assert.ok(matchesDomainPattern("GitHub.COM", "github.com"));
-  assert.ok(!matchesDomainPattern("api.github.com", "github.com"));
-  // *.x matches subdomains only, NOT the base domain.
-  assert.ok(matchesDomainPattern("api.github.com", "*.github.com"));
-  assert.ok(matchesDomainPattern("a.b.github.com", "*.github.com"));
-  assert.ok(!matchesDomainPattern("github.com", "*.github.com"));
-  // No suffix tricks: evilgithub.com is not *.github.com.
-  assert.ok(!matchesDomainPattern("evilgithub.com", "*.github.com"));
-  assert.ok(isHostAllowed("registry.npmjs.org", ["github.com", "*.npmjs.org"]));
-  assert.ok(!isHostAllowed("example.com", ["github.com", "*.npmjs.org"]));
-});
+function fixture() {
+  const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-net-state-"))).canonical;
+  const config = defaultConfig(); config.pathRules = [];
+  config.network.default = "restricted";
+  config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: [] };
+  config.modes.subproject = config.modes.project!;
+  const context = { agentDir: dir, home: dir };
+  const root = { family: randomUUID(), binding: bindPath(dir) };
+  const owner = new PermissionOwner(resolveCatalog(config, root, context), { ask: async () => undefined });
+  return { owner, config, context, close: () => rmSync(dir, { recursive: true, force: true }) };
+}
 
-test("normalizeDomain strips URL decoration down to the host", () => {
-  assert.equal(normalizeDomain("https://api.example.com/v1/users?x=1"), "api.example.com");
-  assert.equal(normalizeDomain("http://user:pw@host.io:8443/path"), "host.io");
-  assert.equal(normalizeDomain("  Example.COM  "), "example.com");
-  assert.equal(normalizeDomain("*.example.com"), "*.example.com"); // patterns pass through
-  assert.equal(normalizeDomain("example.com:443"), "example.com");
-  assert.equal(normalizeDomain("   "), undefined);
-  assert.equal(normalizeDomain("https://"), undefined);
-});
-
-test("decide: open toggle allows everything without asking", async () => {
-  const s = new NetworkSession();
-  s.open = true;
+test("equivalent IPv4 spellings share configured, live, restored, and prompted network authority", async () => {
+  const aliases = ["127.1", "2130706433", "0x7f000001", "0177.0.0.1", "127.0.0.1."];
+  const config = defaultConfig(); config.network.allowedDomains = aliases.slice(0, -1);
+  config.network.default = "restricted";
+  config.network.deniedDomains = ["0x7f000001"];
+  const parsed = parseConfig(config).network;
+  assert.deepEqual(parsed.allowedDomains, ["127.0.0.1"]);
+  assert.deepEqual(parsed.deniedDomains, ["127.0.0.1"]);
+  const network = new NetworkSession(parsed, () => {});
+  for (const alias of aliases) assert.equal(await network.decide(alias), false, alias);
+  assert.throws(() => network.grant(["127.1"]), /denied/);
+  const restored = new NetworkSession(parsed, () => {}, network.snapshot());
+  assert.equal(await restored.decide("2130706433"), false);
+  const open = new NetworkSession({ default: "restricted", allowedDomains: [], deniedDomains: [] }, () => {});
   let asked = 0;
-  assert.equal(
-    await s.decide("anything.example", 443, async () => {
-      asked++;
-      return "deny";
-    }),
-    true,
-  );
-  assert.equal(asked, 0);
+  for (const alias of aliases) assert.equal(await open.decide(alias, undefined, async (host) => {
+    asked++; assert.equal(host, "127.0.0.1"); return "allow-session";
+  }), true);
+  assert.equal(asked, 1);
+  open.change({ deniedDomains: ["0177.0.0.1"] });
+  for (const alias of aliases) assert.equal(await open.decide(alias), false);
 });
 
-test("decide: session grants allow (incl. wildcard patterns), no prompt", async () => {
-  const s = new NetworkSession();
-  s.grant(["api.example.com", "*.trusted.io"]);
-  assert.equal(await s.decide("api.example.com", 443, undefined), true);
-  assert.equal(await s.decide("sub.trusted.io", 443, undefined), true);
-  assert.equal(await s.decide("other.example.com", 443, undefined), false); // not granted, nobody to ask
+test("late non-UI network answers cannot install authority after shutdown or failed reload", async () => {
+  for (const retiring of ["shutdown", "reload"] as const) {
+    const f = fixture();
+    try {
+      let answer!: (value: NetAskResult) => void;
+      const pending = f.owner.network.decide("pending.example", undefined, () => new Promise((resolve) => { answer = resolve; }));
+      if (retiring === "shutdown") f.owner.block("shutdown");
+      else await assert.rejects(f.owner.reload({ ...f.config, modes: {} }, undefined, f.context), /removed/);
+      answer("allow-session");
+      assert.equal(await pending, false);
+      assert.ok(!f.owner.network.snapshot().allowedDomains.includes("pending.example"));
+      assert.throws(() => f.owner.network.grant(["later.example"]), /unavailable/);
+      assert.equal(await f.owner.network.decide("github.com"), false);
+    } finally { f.close(); }
+  }
 });
 
-test("decide: explicit deny is remembered, dismiss is not", async () => {
-  const s = new NetworkSession();
-  let calls = 0;
-  const deny = async (): Promise<"deny"> => {
-    calls++;
-    return "deny";
-  };
-  assert.equal(await s.decide("blocked.io", 443, deny), false);
-  assert.equal(await s.decide("blocked.io", 443, deny), false); // remembered — no second prompt
-  assert.equal(calls, 1);
-  assert.deepEqual(s.denies(), ["blocked.io"]);
-
-  let dismissCalls = 0;
-  const dismiss = async (): Promise<"dismiss"> => {
-    dismissCalls++;
-    return "dismiss";
-  };
-  assert.equal(await s.decide("flaky.io", 443, dismiss), false);
-  assert.equal(await s.decide("flaky.io", 443, dismiss), false); // asked again — dismiss isn't memory
-  assert.equal(dismissCalls, 2);
+test("ordinary filesystem switches preserve pending network decisions; successful reload invalidates old answers", async () => {
+  const f = fixture();
+  try {
+    let answer!: (value: NetAskResult) => void;
+    const first = f.owner.network.decide("first.example", undefined, () => new Promise((resolve) => { answer = resolve; }));
+    f.owner.select("yolo"); answer("allow-session"); assert.equal(await first, true);
+    const second = f.owner.network.decide("second.example", undefined, () => new Promise((resolve) => { answer = resolve; }));
+    await f.owner.reload(f.config, undefined, f.context);
+    answer("allow-forever"); assert.equal(await second, false);
+    assert.equal(await f.owner.network.decide("first.example"), true);
+    assert.equal(await f.owner.network.decide("second.example"), false);
+  } finally { f.close(); }
 });
 
-test("decide: allow-session grants and lifts a prior deny via grant()", async () => {
-  const s = new NetworkSession();
-  assert.equal(await s.decide("api.svc.io", 443, async () => "deny"), false);
-  s.grant(["api.svc.io"]); // e.g. /net allow after the fact
-  assert.equal(await s.decide("api.svc.io", 443, undefined), true);
-
-  assert.equal(await s.decide("other.svc.io", 443, async () => "allow-session"), true);
-  assert.equal(await s.decide("other.svc.io", 443, undefined), true); // now granted
-});
-
-test("decide: concurrent asks for the same host coalesce into one prompt", async () => {
-  const s = new NetworkSession();
-  let calls = 0;
-  let release: (v: "allow-session") => void;
-  const gate = new Promise<"allow-session">((r) => {
-    release = r;
-  });
-  const ask = async () => {
-    calls++;
-    return gate;
-  };
-  const [a, b, c] = await Promise.all([
-    s.decide("burst.io", 443, ask),
-    s.decide("burst.io", 443, ask),
-    (async () => {
-      release!("allow-session");
-      return s.decide("burst.io", 443, ask);
-    })(),
-  ]);
-  assert.deepEqual([a, b, c], [true, true, true]);
-  assert.equal(calls, 1);
-});
-
-test("drainBlocked reports each denied host once, then resets", async () => {
-  const s = new NetworkSession();
-  const deny = async (): Promise<"deny"> => "deny";
-  await s.decide("x.io", 443, deny);
-  await s.decide("x.io", 443, deny); // remembered deny also records a block
-  await s.decide("y.io", 443, undefined);
-  assert.deepEqual(s.drainBlocked().sort(), ["x.io", "y.io"]);
-  assert.deepEqual(s.drainBlocked(), []);
-});
-
-test("clear() resets grants, denies, and the open toggle", async () => {
-  const s = new NetworkSession();
-  s.open = true;
-  s.grant(["a.io"]);
-  await s.decide("b.io", 443, async () => "deny");
-  s.clear();
-  assert.equal(s.open, false);
-  assert.deepEqual(s.grants(), []);
-  assert.deepEqual(s.denies(), []);
-  assert.equal(await s.decide("a.io", 443, undefined), false);
+test("live deny, toggle, config changes and failed persistence never resurrect stale network grants", async () => {
+  let fail = false;
+  const policy = { default: "restricted" as const, allowedDomains: ["configured.example"], deniedDomains: [] as string[] };
+  const network = new NetworkSession(policy, () => { if (fail) throw new Error("save failed"); });
+  let answer!: (value: NetAskResult) => void;
+  const pending = network.decide("pending.example", undefined, () => new Promise((resolve) => { answer = resolve; }));
+  network.change({ deniedDomains: ["pending.example"] }); answer("allow-session");
+  assert.equal(await pending, false);
+  assert.throws(() => network.grant(["pending.example"]), /denied/);
+  network.grant(["session.example"]);
+  network.change({ restricted: false }); assert.equal(await network.decide("any.example"), true);
+  network.change({ restricted: true }); assert.equal(await network.decide("any.example"), false);
+  network.reconfigure({ default: "restricted", allowedDomains: ["new.example"], deniedDomains: ["blocked.example"] }, policy);
+  assert.equal(await network.decide("configured.example"), false);
+  assert.equal(await network.decide("new.example"), true);
+  assert.equal(await network.decide("session.example"), true);
+  fail = true; const before = network.snapshot();
+  assert.throws(() => network.grant(["failed.example"]), /save failed/);
+  assert.deepEqual(network.snapshot(), before);
 });

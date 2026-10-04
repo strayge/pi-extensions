@@ -23,10 +23,11 @@
  * provider registers in a different `pi-ai` module instance than the one
  * pi-coding-agent streams through, which is brittle and orthogonal to gating.)
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { type AgentSession, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { extensionCanonicalName, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
@@ -51,16 +52,22 @@ function makePi() {
 
 describe("agent-runner end-to-end (real pi-mono session + real extension)", () => {
   let cwd: string;
+  let previousAgentDir: string | undefined;
   let faux: ReturnType<typeof registerFauxProvider>;
 
   beforeEach(() => {
     cwd = mkdtempSync(join(tmpdir(), "subagents-e2e-"));
+    previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(cwd, "agent");
+    mkdirSync(process.env.PI_CODING_AGENT_DIR);
     // Only used as a valid Model object for createAgentSession; we never rely
     // on it actually streaming (we assert on the pre-prompt gated tool set).
     faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
   });
   afterEach(() => {
     faux.unregister();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     rmSync(cwd, { recursive: true, force: true });
   });
 
@@ -68,7 +75,7 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
    * Register `cfg` as agent type "e2e", run it through the REAL runAgent, and
    * return the real session's active tool names captured at construction time.
    */
-  async function activeToolsFor(cfg: Partial<AgentConfig>): Promise<string[]> {
+  async function activeToolsFor(cfg: Partial<AgentConfig>, probe?: (session: AgentSession) => void): Promise<string[]> {
     registerAgents(
       new Map([
         [
@@ -108,6 +115,7 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
         model,
         onSessionCreated: (s) => {
           active = s.getActiveToolNames();
+          probe?.(s);
         },
       });
     } catch {
@@ -122,6 +130,43 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     // The extension actually loaded and its tool reached the live session.
     expect(active).toContain(EXT_TOOL);
     for (const b of BUILTINS) expect(active).toContain(b);
+  });
+
+  it("keeps real read and shell tools working when permission modes is not installed", async () => {
+    const file = join(cwd, "sentinel.txt");
+    writeFileSync(file, "no-permission-package");
+    let read: Promise<unknown> | undefined;
+    let shell: Promise<unknown> | undefined;
+    const active = await activeToolsFor({ extensions: true }, (session) => {
+      read = session.agent.state.tools.find((tool) => tool.name === "read")!.execute("read-probe", { path: file });
+      shell = session.agent.state.tools.find((tool) => tool.name === "bash")!.execute("shell-probe", { command: "printf no-permission-package" });
+    });
+    for (const builtin of BUILTINS) expect(active).toContain(builtin);
+    expect(active).not.toContain("request_directory_access");
+    expect(read).toBeDefined(); expect(shell).toBeDefined();
+    expect(JSON.stringify(await read)).toContain("no-permission-package");
+    expect(JSON.stringify(await shell)).toContain("no-permission-package");
+  });
+
+  it("does not activate an installed permission package when the parent has no policy", async () => {
+    const packageDir = join(process.env.PI_CODING_AGENT_DIR!, "extensions", "pi-permission-modes");
+    mkdirSync(join(packageDir, "src"), { recursive: true });
+    writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "@test/pi-permission-modes", type: "module", pi: { extensions: ["./src/index.js"] } }));
+    const marker = join(cwd, "permission-started");
+    writeFileSync(join(packageDir, "src", "index.js"), `
+      import { writeFileSync } from "node:fs";
+      export default function(pi) {
+        pi.registerCommand("permission_probe", { handler: async () => {} });
+        pi.on("session_start", () => writeFileSync(${JSON.stringify(marker)}, "started"));
+      }
+    `);
+    const discovery = new DefaultResourceLoader({ cwd, agentDir: process.env.PI_CODING_AGENT_DIR!, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
+    await discovery.reload();
+    expect(discovery.getExtensions().errors).toEqual([]);
+    expect(discovery.getExtensions().extensions.map((extension) => extension.path)).toContain(join(packageDir, "src", "index.js"));
+    const active = await activeToolsFor({ extensions: true });
+    for (const builtin of BUILTINS) expect(active).toContain(builtin);
+    expect(existsSync(marker)).toBe(false);
   });
 
   it("an extension tool is absent when extensions are disabled (not loaded)", async () => {

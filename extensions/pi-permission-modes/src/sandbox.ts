@@ -1,318 +1,445 @@
-/**
- * OS-level sandbox lifecycle for Build mode.
- *
- * Wraps `@anthropic-ai/sandbox-runtime` (loaded lazily so a missing dependency
- * degrades gracefully instead of crashing) behind a small `SandboxController`
- * that owns init / wrap / reset and the readiness state surfaced in the footer.
- */
-
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, rmdirSync, unlinkSync } from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
-import { type SandboxConfig, canonicalizeSandboxPaths, profileToConfig, readOnlyOverride } from "./config-load.ts";
-import { type GitLayout, removeSandboxPlaceholders, resolveGitLayout } from "./paths.ts";
+import { assertBinding, bindPath, identity, resolvePermissionBinding, sameIdentity, within } from "./paths.ts";
 import { withProxyReady } from "./proxy-wait.ts";
-import type { SandboxProfile } from "./schema.ts";
-import { isModuleNotFound } from "./util.ts";
+import { assertNativeSemantics } from "./native-semantics.ts";
+import { decide, positiveTarget } from "./evaluation.ts";
+import type { FileIdentity, FilesystemSnapshot, NetworkSnapshot, PathBinding, ProcessMode } from "./schema.ts";
 
-// Real type of the runtime singleton, erased at compile time so a missing
-// dependency never breaks loading. Replaces the former `any`.
-type SandboxManagerType = typeof import("@anthropic-ai/sandbox-runtime").SandboxManager;
+type Manager = typeof import("@anthropic-ai/sandbox-runtime").SandboxManager;
+export interface RuntimePolicy {
+  bindings: Record<string, PathBinding>;
+  sourceFds?: Record<string, number>;
+  guards: string[];
+  rules: { path: string; directory: boolean; read: boolean; write: boolean }[];
+  grants: { path: string; directory: boolean; write: boolean }[];
+  program: { path: string; directory: boolean; read: boolean; write: boolean }[];
+}
 
-/** This extension's own directory (works wherever it's installed). */
-const EXTENSION_DIR = fileURLToPath(new URL("..", import.meta.url));
+function literal(value: string): void {
+  if (/[*?[\]{}\n\r]/.test(value)) throw new Error(`Sandbox cannot represent this literal path safely: ${value}`);
+}
 
-/**
- * BashOperations backed by `SandboxManager.wrapWithSandbox`. An optional
- * `customConfig` overrides the init-time config per command (used to drop write
- * access in Read mode without re-initializing the sandbox).
- */
-export function createSandboxedBashOps(
-  SandboxManager: SandboxManagerType,
-  customConfig?: Partial<SandboxConfig>,
-  drainBlockedHosts?: () => string[],
-): BashOperations {
-  return {
-    async exec(command, cwd, { onData, signal, timeout }) {
-      // Any network denial during this run (allowlist miss the user didn't
-      // approve) is recorded by the ask callback; surface it to the model
-      // after the run so a refused connection is diagnosable, not mystery.
-      const emitBlockedHint = () => {
-        const hosts = drainBlockedHosts?.() ?? [];
-        if (hosts.length > 0) {
-          onData(
-            Buffer.from(
-              `\n[permission-mode] network: connection(s) blocked by the sandbox allowlist: ${hosts.join(", ")}. ` +
-                "Request access with the request_network_access tool, or ask the user (/net allow <domain>).\n",
-            ),
-          );
-        }
-      };
-      if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
-      drainBlockedHosts?.(); // discard denials that belong to earlier runs
-      // Clear any leftover 0-byte placeholders the sandbox plants for its
-      // mandatory-deny paths (a stale .git would also break this run).
-      removeSandboxPlaceholders(cwd);
-      try {
-        const wrapped = await SandboxManager.wrapWithSandbox(withProxyReady(command), undefined, customConfig as never);
-        // `await` so the finally runs after the child exits, not after the
-        // Promise is constructed — otherwise cleanup would race the run.
-        return await new Promise((resolve, reject) => {
-          const child = spawn("bash", ["-c", wrapped], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-          let timedOut = false;
-          let timer: NodeJS.Timeout | undefined;
-          const kill = () => {
-            if (child.pid) {
-              try {
-                process.kill(-child.pid, "SIGKILL");
-              } catch {
-                child.kill("SIGKILL");
-              }
-            }
-          };
-          if (timeout && timeout > 0) {
-            timer = setTimeout(() => {
-              timedOut = true;
-              kill();
-            }, timeout * 1000);
-          }
-          child.stdout?.on("data", onData);
-          child.stderr?.on("data", onData);
-          child.on("error", (err) => {
-            if (timer) clearTimeout(timer);
-            reject(err);
-          });
-          const onAbort = () => kill();
-          signal?.addEventListener("abort", onAbort, { once: true });
-          child.on("close", (code) => {
-            if (timer) clearTimeout(timer);
-            signal?.removeEventListener("abort", onAbort);
-            emitBlockedHint();
-            if (signal?.aborted) reject(new Error("aborted"));
-            else if (timedOut) reject(new Error(`timeout:${timeout}`));
-            else resolve({ exitCode: code });
-          });
-        });
-      } finally {
-        // The runtime tracks every host mountpoint it materializes and requires
-        // per-command cleanup once the child has exited. Keep our narrow legacy
-        // cleanup as a backstop for placeholders left by older runtime behavior.
-        try {
-          SandboxManager.cleanupAfterCommand();
-        } finally {
-          removeSandboxPlaceholders(cwd);
-        }
+/** Runtime guards pin only ancestor entries, not their otherwise writable contents. */
+export function compileFilesystem(snapshot: FilesystemSnapshot): {
+  allowRead: string[];
+  denyRead: string[];
+  allowWrite: string[];
+  denyWrite: string[];
+  disabled?: boolean;
+  explicitPolicy?: RuntimePolicy;
+} {
+  assertBinding(snapshot.root.binding);
+  if (snapshot.profile.kind === "unrestricted")
+    return { disabled: true, allowRead: [], denyRead: [], allowWrite: [], denyWrite: [] };
+  const bindings: Record<string, PathBinding> = {};
+  const boundaries = new Map<string, { binding: PathBinding; directory: boolean }>();
+  const grants: RuntimePolicy["grants"] = [];
+  const addBoundary = (binding: PathBinding, directory: boolean) => {
+    assertNativeSemantics(binding);
+    literal(binding.canonical);
+    const old = boundaries.get(binding.canonical);
+    if (old && old.directory !== directory) throw new Error(`Conflicting native rule scopes: ${binding.canonical}`);
+    boundaries.set(binding.canonical, { binding, directory });
+  };
+  for (const source of snapshot.profile.grants) {
+    const positive = positiveTarget(source.binding, source.scope);
+    if (!positive.binding) continue;
+    addBoundary(positive.binding, source.scope === "tree");
+    grants.push({ path: positive.binding.canonical, directory: source.scope === "tree", write: source.access === "write" });
+  }
+  for (const source of snapshot.grants) {
+    const binding = resolvePermissionBinding(source.binding);
+    if (binding.missing.length) throw new Error(`Permission target does not exist: ${binding.lexical}`);
+    const directory = !("parent" in source.binding);
+    addBoundary(binding, directory);
+    grants.push({ path: binding.canonical, directory, write: source.access === "write" });
+  }
+  let effective = snapshot;
+  if (process.platform === "linux") {
+    const helper = fileURLToPath(new URL(`../vendor/seccomp/${process.arch}/apply-seccomp`, import.meta.resolve("@anthropic-ai/sandbox-runtime")));
+    const binding = bindPath(helper);
+    if (binding.missing.length || binding.identity.type !== "file") throw new Error(`Missing sandbox process-isolation helper: ${helper}`);
+    addBoundary(binding, false);
+    grants.push({ path: binding.canonical, directory: false, write: false });
+    effective = { ...snapshot, profile: { ...snapshot.profile, grants: [...snapshot.profile.grants, { binding, scope: "file", access: "read", runtime: true }] } };
+  }
+  const negative: { binding: PathBinding; directory: boolean }[] = [];
+  for (const rule of snapshot.rules) {
+    const restriction = rule.read === "deny" || rule.read === "ask" || rule.write === "deny" || rule.write === "ask";
+    if (!rule.binding) { if (restriction) throw new Error(`Restriction has no validated target: ${rule.path}`); continue; }
+    const positive = positiveTarget(rule.binding, rule.scope);
+    const read = rule.read === "allow" || (rule.read === "ask" && snapshot.exceptions.some((e) => e.ruleId === rule.id && e.access === "read"));
+    const write = rule.write === "allow" || (rule.write === "ask" && snapshot.exceptions.some((e) => e.ruleId === rule.id && e.access === "write"));
+    if (positive.binding && (read || write)) {
+      addBoundary(positive.binding, rule.scope === "tree");
+      grants.push({ path: positive.binding.canonical, directory: rule.scope === "tree", write });
+    }
+    if (!restriction) continue;
+    const binding = resolvePermissionBinding(rule.binding, true);
+    if (!binding.missing.length && binding.identity.type !== (rule.scope === "tree" ? "directory" : "file")) throw new Error(`Sandbox rule scope cannot be represented for this target type: ${binding.canonical}`);
+    negative.push({ binding, directory: rule.scope === "tree" });
+  }
+  const policy: RuntimePolicy = { bindings, grants, guards: [], rules: [], program: [] };
+  for (const entry of negative) {
+    if (!grants.some((g) => (g.directory && within(g.path, entry.binding.canonical)) || g.path === entry.binding.canonical || (entry.directory && within(entry.binding.canonical, g.path)))) continue;
+    addBoundary(entry.binding, entry.directory);
+    if (entry.binding.lexical !== entry.binding.canonical) {
+      let prefix = path.parse(entry.binding.lexical).root;
+      for (const part of entry.binding.lexical.slice(prefix.length).split(path.sep).filter(Boolean)) {
+        prefix = path.join(prefix, part);
+        if (!existsSync(prefix)) break;
+        if (lstatSync(prefix).isSymbolicLink() && grants.some((g) => g.write && g.directory && within(g.path, bindPath(path.dirname(prefix)).canonical)))
+          throw new Error(`Writable restricted symlink cannot be guarded safely: ${prefix}`);
       }
-    },
+    }
+    for (let ancestor = path.dirname(entry.binding.canonical); ; ancestor = path.dirname(ancestor)) {
+      if (grants.some((g) => g.write && g.directory && within(g.path, ancestor))) {
+        const binding = bindPath(ancestor);
+        if (binding.missing.length || binding.canonical !== ancestor || binding.identity.type !== "directory") throw new Error(`Restriction needs an existing, nonsymlink ancestor: ${ancestor}`);
+        policy.guards.push(ancestor);
+        if (decide(effective, binding, "read").action === "allow") addBoundary(binding, true);
+      }
+      if (path.dirname(ancestor) === ancestor) break;
+    }
+  }
+  const depth = (value: string) => value.split(path.sep).filter(Boolean).length;
+  policy.guards = [...new Set(policy.guards)].sort((a, b) => depth(a) - depth(b));
+  for (const [target, entry] of [...boundaries].sort(([a], [b]) => depth(a) - depth(b) || a.localeCompare(b))) {
+    const read = decide(effective, entry.binding, "read").action === "allow";
+    const write = decide(effective, entry.binding, "write").action === "allow";
+    policy.program.push({ path: target, directory: entry.directory, read, write });
+    if (read) bindings[target] = entry.binding;
+    if ((!read || !write) && negative.some((r) => r.binding.canonical === target))
+      policy.rules.push({ path: target, directory: entry.directory, read: !read, write: !write });
+  }
+  return {
+    allowRead: policy.program.filter((r) => r.read).map((r) => r.path),
+    denyRead: ["/"],
+    allowWrite: policy.program.filter((r) => r.write).map((r) => r.path),
+    denyWrite: [],
+    explicitPolicy: policy,
   };
 }
 
-/** Add writable Git metadata for a validated gitfile project. */
-export function addGitWriteAccess(config: SandboxConfig, layout: GitLayout): SandboxConfig {
-  if (layout.kind !== "gitfile") return config;
-  const filesystem = config.filesystem ?? {};
-  return {
-    ...config,
-    filesystem: {
-      ...filesystem,
-      allowWrite: [...new Set([...(filesystem.allowWrite ?? []), ...layout.writePaths])],
-      // The project itself is writable, but its gitfile must keep pointing at
-      // the metadata tree that was validated before the sandbox started.
-      denyWrite: [...new Set([...(filesystem.denyWrite ?? []), layout.gitFile])],
-    },
-  };
+interface Placeholder {
+  identity: FileIdentity;
+  directory: boolean;
+  users: number;
 }
+const placeholders = new Map<string, Placeholder>();
 
-/** How the caller surfaces warnings (e.g. a TUI notify), only used when there's a UI. */
-type Notify = (message: string) => void;
-
-export interface InitOptions {
-  cwd: string;
-  noSandbox: boolean;
-  hasUI: boolean;
-  notify: Notify;
-  /** The active mode's sandbox profile to initialize the runtime with. */
-  profile: SandboxProfile;
-  /**
-   * Live network ask: called by the runtime's proxy for a host no allow/deny
-   * rule matches, WHILE the connection waits. Return true to allow. Undefined
-   * keeps the historic silent-deny behavior.
-   */
-  askHost?: (host: string, port: number | undefined) => Promise<boolean>;
-  /** Drained by the bash wrapper to report hosts blocked during a run. */
-  drainBlockedHosts?: () => string[];
-}
-
-/**
- * Owns the sandbox runtime and its readiness state. A single instance lives for
- * the extension's lifetime; `init` is re-runnable across sessions, and
- * `applyProfile` re-initializes when the active mode's sandbox profile changes.
- */
-export class SandboxController {
-  private manager: SandboxManagerType | null = null;
-  private profile: SandboxProfile | undefined;
-  /** Key of the profile the runtime is currently initialized with. */
-  private appliedKey: string | undefined;
-  /** Platform/dependency/git issue — never (re)initialize the runtime. */
-  private degraded = false;
-  private hasUI = false;
-  private notifyFn: Notify = () => {};
-  private askHost: ((host: string, port: number | undefined) => Promise<boolean>) | undefined;
-  private drainBlockedHosts: (() => string[]) | undefined;
-  private gitLayout: GitLayout = { kind: "none" };
-  ready = false;
-  disabled = false;
-  warn: string | undefined;
-
-  /** The active runtime, or null when unavailable. */
-  get sandboxManager(): SandboxManagerType | null {
-    return this.manager;
-  }
-
-  /** Runtime-facing profile including any validated gitfile write grant. */
-  effectiveConfig(profile: SandboxProfile): SandboxConfig {
-    const config = profileToConfig(profile);
-    return profile.writable ? addGitWriteAccess(config, this.gitLayout) : config;
-  }
-
-  /**
-   * Wrap a fresh BashOperations around the active runtime, or null when
-   * unavailable. With `readOnly`, the command runs with project writes disabled
-   * (Plan mode) — the library still allows its own default scratch paths.
-   */
-  bashOps(opts: { readOnly?: boolean } = {}): BashOperations | null {
-    if (!this.manager || !this.profile) return null;
-    // Dropped paths were already reported when the profile was applied, so this
-    // per-command path stays quiet.
-    const customConfig = opts.readOnly
-      ? canonicalizeSandboxPaths(readOnlyOverride(profileToConfig(this.profile)))
-      : undefined;
-    return createSandboxedBashOps(this.manager, customConfig, this.drainBlockedHosts);
-  }
-
-  /** Install instructions shown when the runtime is missing or fails to init. */
-  private static installHint(): string {
-    const linux = process.platform === "linux" ? "  (Linux also needs: bubblewrap, socat, ripgrep)" : "";
-    return `Fix: cd ${EXTENSION_DIR} && npm install${linux}`;
-  }
-
-  async init({ cwd, noSandbox, hasUI, notify, profile, askHost, drainBlockedHosts }: InitOptions): Promise<void> {
-    this.ready = false;
-    this.disabled = false;
-    this.degraded = false;
-    this.warn = undefined;
-    this.manager = null;
-    this.appliedKey = undefined;
-    this.hasUI = hasUI;
-    this.notifyFn = notify;
-    this.askHost = askHost;
-    this.drainBlockedHosts = drainBlockedHosts;
-    this.gitLayout = { kind: "none" };
-
-    if (noSandbox) {
-      this.disabled = true;
-      this.degraded = true;
-      this.profile = profile;
-      return;
-    }
-    if (process.platform !== "darwin" && process.platform !== "linux") {
-      this.warn = `sandbox unsupported on ${process.platform}`;
-      this.degraded = true;
-      this.profile = profile;
-      return;
-    }
-
-    try {
-      const mod = (await import("@anthropic-ai/sandbox-runtime")) as { SandboxManager: SandboxManagerType };
-      this.manager = mod.SandboxManager;
-    } catch (err) {
-      this.degraded = true;
-      this.profile = profile;
-      this.warn = isModuleNotFound(err)
-        ? "sandbox-runtime missing (run npm install in the extension dir)"
-        : `sandbox load failed: ${err instanceof Error ? err.message : String(err)}`;
-      if (hasUI) {
-        notify(
-          `permission-mode: OS sandbox unavailable — protection is heuristic-only.\n${this.warn}\n` +
-            SandboxController.installHint(),
-        );
-      }
-      return;
-    }
-
-    // Clear any 0-byte placeholders left by a prior sandboxed run (incl. a stale
-    // .git), so .git below isn't mistaken for a worktree.
-    removeSandboxPlaceholders(cwd);
-
-    this.gitLayout = resolveGitLayout(cwd);
-    if (this.gitLayout.kind === "invalid") {
-      this.degraded = true;
-      this.profile = profile;
-      this.warn = `sandbox off: project .git metadata is invalid (${this.gitLayout.reason})`;
-      if (hasUI) {
-        notify(
-          "permission-mode: OS sandbox disabled because the project's `.git` metadata could not be resolved safely. " +
-            "In-project bash will prompt for confirmation instead.\n" +
-            this.gitLayout.reason,
-        );
-      }
-      return;
-    }
-
-    await this.applyProfile(profile);
-  }
-
-  /**
-   * Ensure the runtime is initialized with `profile`. A no-op when degraded, when
-   * the profile doesn't sandbox (`enabled:false`), or when the profile's
-   * filesystem/network is unchanged. Re-initializes (reset + initialize) when the
-   * profile differs, so switching to a mode with different folders/network takes
-   * effect immediately.
-   */
-  async applyProfile(profile: SandboxProfile): Promise<void> {
-    this.profile = profile;
-    if (this.degraded || !this.manager) return;
-    if (!profile.enabled) return; // non-sandboxing mode (e.g. YOLO): keep prior init
-
-    const dropped: string[] = [];
-    const cfg = canonicalizeSandboxPaths(this.effectiveConfig(profile), (m) => dropped.push(m));
-    const key = JSON.stringify({ n: cfg.network, f: cfg.filesystem });
-    if (this.ready && key === this.appliedKey) return;
-
-    try {
-      if (this.ready) await this.manager.reset();
-      // The ask callback rides along so unmatched hosts prompt instead of
-      // silently failing; it reads live session state, so grants/`/net open`
-      // apply instantly without re-initializing.
-      const ask = this.askHost;
-      await this.manager.initialize(
-        { network: cfg.network, filesystem: cfg.filesystem } as never,
-        ask ? (p: { host: string; port?: number }) => ask(p.host, p.port) : undefined,
-      );
-      this.ready = true;
-      this.appliedKey = key;
-      this.warn = undefined;
-      if (dropped.length > 0 && this.hasUI) this.notifyFn(dropped.join("\n"));
-    } catch (err) {
-      this.ready = false;
-      this.warn = `sandbox init failed: ${err instanceof Error ? err.message : String(err)}`;
-      if (this.hasUI) {
-        this.notifyFn(
-          `permission-mode: sandbox failed to initialize — protection is heuristic-only.\n${this.warn}` +
-            `${process.platform === "linux" ? "\nLinux requires: bubblewrap, socat, ripgrep" : ""}`,
-        );
-      }
-    }
-  }
-
-  async reset(): Promise<void> {
-    if (this.ready && this.manager) {
+/** Mountpoints for future restrictions are owned and removed by identity, never by filename alone. */
+function prepareFutureRules(policy?: RuntimePolicy): () => void {
+  const acquired: string[] = [];
+  const release = () => {
+    for (const file of acquired.reverse()) {
+      const record = placeholders.get(file);
+      if (!record || --record.users > 0) continue;
+      placeholders.delete(file);
       try {
-        await this.manager.reset();
+        if (!sameIdentity(identity(file), record.identity)) continue;
+        if (record.directory) rmdirSync(file);
+        else unlinkSync(file);
       } catch {
-        // ignore cleanup errors
+        /* A replaced or populated mountpoint must never be removed. */
       }
     }
+  };
+  try {
+    for (const rule of policy?.rules ?? []) {
+      const known = placeholders.get(rule.path);
+      if (known) {
+        known.users++;
+        acquired.push(rule.path);
+        continue;
+      }
+      if (existsSync(rule.path)) continue;
+      const parent = bindPath(path.dirname(rule.path));
+      if (parent.missing.length) throw new Error(`Future restriction has a missing ancestor: ${rule.path}`);
+      if (rule.directory) mkdirSync(rule.path, { mode: 0o500 });
+      else closeSync(openSync(rule.path, "wx", 0o400));
+      placeholders.set(rule.path, { identity: identity(rule.path), directory: rule.directory, users: 1 });
+      acquired.push(rule.path);
+    }
+    return release;
+  } catch (error) {
+    release();
+    throw error;
   }
+}
+
+/** Descriptor mounts keep approved sources stable until bwrap consumes and closes the descriptors. */
+function pinSources(policy?: RuntimePolicy): { fds: number[]; close(): void } {
+  const fds: number[] = [];
+  const close = () => { for (const fd of fds.splice(0)) closeSync(fd); };
+  try {
+    if (policy) {
+      policy.sourceFds = {};
+      for (const [file, binding] of Object.entries(policy.bindings)) {
+        assertBinding(binding, binding.missing.length > 0);
+        const expected = binding.missing.length ? placeholders.get(file)?.identity : binding.identity;
+        if (!expected) throw new Error(`No owned mountpoint identity: ${file}`);
+        const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | (expected.type === "directory" ? constants.O_DIRECTORY : 0));
+        fds.push(fd);
+        if (!sameIdentity(identity(fd), expected)) throw new Error(`Sandbox source identity changed: ${file}`);
+        policy.sourceFds[file] = fds.length + 2;
+      }
+    }
+    return { fds, close };
+  } catch (error) { close(); throw error; }
+}
+
+export interface RuntimeFamily {
+  id: string;
+  network(): NetworkSnapshot;
+  decideHost(host: string, port?: number): Promise<boolean>;
+  reportEnforcement?(error?: string): void;
+}
+
+async function waitFor(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return promise;
+  signal.throwIfAborted();
+  let abort!: () => void;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        abort = () => reject(signal.reason ?? new Error("Operation aborted"));
+        signal.addEventListener("abort", abort, { once: true });
+      }),
+    ]);
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+/** One coordinator owns the process-global manager, including incompatible-family serialization. */
+export class RuntimeCoordinator {
+  private manager?: Manager;
+  private family?: RuntimeFamily;
+  private users = 0;
+  private initializing?: Promise<void>;
+  private idle: (() => void)[] = [];
+  private admission: Promise<void> = Promise.resolve();
+
+  private async acquire(family: RuntimeFamily, signal?: AbortSignal): Promise<Manager> {
+    let unlock!: () => void;
+    const before = this.admission;
+    this.admission = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    try {
+      await waitFor(before, signal);
+    } catch (error) {
+      void before.then(unlock);
+      throw error;
+    }
+    try {
+      while (this.family && this.family.id !== family.id && this.users) {
+        let done!: () => void;
+        const idle = new Promise<void>((resolve) => {
+          done = resolve;
+          this.idle.push(resolve);
+        });
+        try {
+          await waitFor(idle, signal);
+        } finally {
+          this.idle = this.idle.filter((resolve) => resolve !== done);
+        }
+      }
+      signal?.throwIfAborted();
+      if (!this.manager) this.manager = (await import("@anthropic-ai/sandbox-runtime")).SandboxManager;
+      if (this.family?.id !== family.id) {
+        await this.manager.reset();
+        this.family = family;
+        this.initializing = this.manager.initialize(
+          {
+            filesystem: { disabled: true, denyRead: [], allowWrite: [], denyWrite: [] },
+            network: { allowedDomains: [], deniedDomains: [] },
+            ...(process.platform === "linux" ? {
+              bwrapPath: "/usr/bin/bwrap",
+              socatPath: "/usr/bin/socat",
+              ripgrep: { command: "/usr/bin/rg" },
+            } : {}),
+          },
+          ({ host, port }) => family.decideHost(host, port),
+        );
+      }
+      await this.initializing;
+      signal?.throwIfAborted();
+      this.users++;
+      return this.manager;
+    } finally {
+      unlock();
+    }
+  }
+
+  operations(
+    snapshot: FilesystemSnapshot,
+    family: RuntimeFamily,
+    beforeSpawn: () => void,
+    noSandbox = false,
+  ): BashOperations {
+    return {
+      exec: async (command, cwd, options) => {
+        let preparing = true;
+        try {
+        const network = family.network();
+        const confined = snapshot.profile.kind !== "unrestricted" || network.restricted;
+        const processMode = confined ? snapshot.processMode ?? "compatible" : "compatible";
+        if (confined && noSandbox)
+          throw new Error("--no-sandbox cannot disable a required filesystem or network layer");
+        if (confined && process.platform !== "linux" && process.platform !== "darwin")
+          throw new Error(`Required sandbox is unavailable on ${process.platform}`);
+        const fs = compileFilesystem(snapshot);
+        let manager: Manager | undefined;
+        let release = () => {};
+        let pins = { fds: [] as number[], close: () => {} };
+        try {
+          options.signal?.throwIfAborted();
+          let wrapped = command;
+          if (confined) {
+            manager = await this.acquire(family, options.signal);
+            if (process.platform === "linux") {
+              release = prepareFutureRules(fs.explicitPolicy);
+              pins = pinSources(fs.explicitPolicy);
+            }
+            wrapped = await manager.wrapWithSandbox(
+              network.restricted ? withProxyReady(command) : command,
+              "/bin/bash",
+              {
+                filesystem: fs,
+                network: { allowedDomains: [], deniedDomains: [], disabled: !network.restricted },
+                processMode,
+              } as Parameters<Manager["wrapWithSandbox"]>[2],
+              options.signal,
+            );
+          }
+          options.signal?.throwIfAborted();
+          const validateLaunch = () => {
+            const current = compileFilesystem(snapshot);
+            if (process.platform === "darwin" && JSON.stringify([current.explicitPolicy?.program, current.explicitPolicy?.guards]) !== JSON.stringify([fs.explicitPolicy?.program, fs.explicitPolicy?.guards]))
+              throw new Error("Filesystem permission program changed after sandbox profile generation; reauthorize before execution");
+          };
+          validateLaunch();
+          beforeSpawn();
+          if (process.platform === "darwin") validateLaunch();
+          preparing = false;
+          family.reportEnforcement?.();
+          return await runProcess("/bin/bash", ["-c", wrapped], cwd, options, pins.fds, processMode);
+        } finally {
+          pins.close();
+          release();
+          if (manager) {
+            manager.cleanupAfterCommand();
+            if (--this.users === 0) {
+              const pending = this.idle.splice(0);
+              for (const resolve of pending) resolve();
+            }
+          }
+        }
+        } catch (error) {
+          if (preparing && !options.signal?.aborted) family.reportEnforcement?.(String(error));
+          throw error;
+        }
+      },
+    };
+  }
+
+  async shutdown(family: string): Promise<void> {
+    let unlock!: () => void;
+    const before = this.admission;
+    this.admission = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    await before;
+    try {
+      if (this.family?.id !== family) return;
+      while (this.users) await new Promise<void>((resolve) => this.idle.push(resolve));
+      await this.manager?.reset();
+      this.family = undefined;
+      this.initializing = undefined;
+    } finally {
+      unlock();
+    }
+  }
+}
+
+const coordinatorKey = Symbol.for("pi.permission-modes.runtime.v3");
+const processState = globalThis as typeof globalThis & { [coordinatorKey]?: RuntimeCoordinator };
+export const runtime = (processState[coordinatorKey] ??= new RuntimeCoordinator());
+
+export async function runProcess(
+  executable: string,
+  args: string[],
+  cwd: string,
+  options: Parameters<BashOperations["exec"]>[2],
+  fds: number[] = [],
+  processMode: ProcessMode = "compatible",
+): Promise<{ exitCode: number | null }> {
+  options.signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe", ...fds] });
+    let timeout = false;
+    let finished = false;
+    let exitCode: number | null = null;
+    let outputTimer: ReturnType<typeof setTimeout> | undefined;
+    const kill = () => {
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      }
+    };
+    const stop = () => {
+      kill();
+      if (processMode === "compatible" && !finished && !outputTimer) {
+        // Detached descendants may retain the pipes even after the foreground process exits.
+        outputTimer = setTimeout(() => {
+          child.stdout!.destroy();
+          child.stderr!.destroy();
+          finish(exitCode);
+        }, 250);
+      }
+    };
+    const timer =
+      options.timeout && options.timeout > 0
+        ? setTimeout(() => {
+            timeout = true;
+            stop();
+          }, options.timeout * 1000)
+        : undefined;
+    const finish = (code: number | null, error?: Error) => {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      if (outputTimer) clearTimeout(outputTimer);
+      options.signal?.removeEventListener("abort", stop);
+      child.stdout!.off("data", options.onData);
+      child.stderr!.off("data", options.onData);
+      if (error) reject(error);
+      else if (options.signal?.aborted) reject(new Error("Operation aborted"));
+      else if (timeout) reject(new Error(`timeout:${options.timeout}`));
+      else resolve({ exitCode: code });
+    };
+    options.signal?.addEventListener("abort", stop, { once: true });
+    if (options.signal?.aborted) stop();
+    child.stdout!.on("data", options.onData);
+    child.stderr!.on("data", options.onData);
+    child.once("exit", (code) => {
+      exitCode = code;
+      stop();
+    });
+    child.once("error", (error) => {
+      kill();
+      finish(null, error);
+    });
+    child.once("close", (code) => finish(code));
+  });
 }

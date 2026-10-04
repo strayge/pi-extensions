@@ -1,60 +1,217 @@
-diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
-index c3b6bd3..c65ba23 100644
---- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
-+++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
-@@ -1,5 +1,6 @@
- import { quote } from '../utils/shell-quote.js';
- import { spawn } from 'child_process';
-+import * as fs from 'fs';
- import * as path from 'path';
- import { logForDebugging } from '../utils/debug.js';
- import { whichSync } from '../utils/which.js';
-@@ -22,13 +23,24 @@ export function macGetMandatoryDenyPatterns(allowGitConfig = false) {
-         denyPaths.push(path.resolve(cwd, dirName));
-         denyPaths.push(`**/${dirName}/**`);
+diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/linux-sandbox-utils.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/linux-sandbox-utils.js
+index 4c521f6..b88bca3 100644
+--- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/linux-sandbox-utils.js
++++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/linux-sandbox-utils.js
+@@ -858,8 +858,8 @@ async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds,
+             candidatePath === allowedPath);
+         // Deny writes within allowed paths (user-specified + mandatory denies)
+         const denyPaths = [
+-            ...(writeConfig.denyWithinAllow || []),
+-            ...(await linuxGetMandatoryDenyPaths(ripgrepConfig, mandatoryDenySearchDepth, allowGitConfig, abortSignal)),
++            ...(writeConfig.explicitPolicy ? [] : writeConfig.denyWithinAllow || []),
++            ...(writeConfig.explicitPolicy ? [] : await linuxGetMandatoryDenyPaths(ripgrepConfig, mandatoryDenySearchDepth, allowGitConfig, abortSignal)),
+         ];
+         // Duplicate deny entries must be collapsed: a duplicate
+         // --ro-bind /dev/null <dest> hits a char device on the second pass and
+@@ -1154,7 +1154,7 @@ async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds,
+     //
+     // Skipped when readConfig is undefined (filesystem.disabled): no read
+     // policy means no implicit read denies either.
+-    if (readConfig && fs.existsSync('/etc/ssh/ssh_config.d')) {
++    if (readConfig && !readConfig.explicitPolicy && fs.existsSync('/etc/ssh/ssh_config.d')) {
+         readDenyPaths.push('/etc/ssh/ssh_config.d');
      }
--    // Git hooks are always blocked for security
--    denyPaths.push(path.resolve(cwd, '.git/hooks'));
--    denyPaths.push('**/.git/hooks/**');
--    // Git config - conditionally blocked based on allowGitConfig setting
--    if (!allowGitConfig) {
--        denyPaths.push(path.resolve(cwd, '.git/config'));
--        denyPaths.push('**/.git/config');
-+    const rootGitPath = path.resolve(cwd, '.git');
-+    let rootGitIsFile = false;
-+    try {
-+        const stat = fs.lstatSync(rootGitPath);
-+        rootGitIsFile = stat.isFile() && stat.size > 0;
+     // Normalize then sort shallow-first so tmpfs over ancestor dirs lands before
+@@ -1285,6 +1285,58 @@ async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds,
+     if (maskedFileStoreDir !== undefined) {
+         args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir);
+     }
++    // Ancestor pins precede private /dev and /proc, so a root pin cannot expose host facilities.
++    for (const guard of writeConfig?.explicitPolicy?.guards ?? []) {
++        if (writeConfig.explicitPolicy.bindings[guard]) args.push('--bind', guard, guard);
 +    }
-+    catch {
-+        // An absent .git still gets the mandatory patterns so it cannot be created later.
-+    }
-+    // A gitfile's resolved common metadata is intentionally writable. Normal
-+    // clones retain both root and nested-repository hook/config protection.
-+    if (!rootGitIsFile) {
-+        denyPaths.push(path.resolve(rootGitPath, 'hooks'));
-+        denyPaths.push('**/.git/hooks/**');
-+        if (!allowGitConfig) {
-+            denyPaths.push(path.resolve(rootGitPath, 'config'));
-+            denyPaths.push('**/.git/config');
++    if (writeConfig?.explicitPolicy) {
++        const sources = writeConfig.explicitPolicy.sourceFds;
++        if (!sources) throw new Error('Explicit filesystem policy requires pinned source descriptors');
++        for (let i = 0; i < args.length; i++) {
++            if (args[i] !== '--bind' && args[i] !== '--ro-bind') continue;
++            const source = args[i + 1];
++            if (sources[source] !== undefined) {
++                args[i] += '-fd';
++                args[i + 1] = String(sources[source]);
++            } else if (!(i === 0 && source === '/') && source !== '/dev/null' && source !== maskedFileStoreDir) {
++                throw new Error(`Explicit policy has no frozen binding for host mount: ${source}`);
++            }
++            i += 2;
 +        }
-     }
-     return [...new Set(denyPaths)];
- }
-diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js
-index 32831bf..d1fa878 100644
---- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js
-+++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js
-@@ -29,11 +29,7 @@ export const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'];
-  * instead we block specific paths within .git (hooks and config).
-  */
- export function getDangerousDirectories() {
--    return [
--        ...DANGEROUS_DIRECTORIES.filter(d => d !== '.git'),
--        '.claude/commands',
--        '.claude/agents',
--    ];
-+    return DANGEROUS_DIRECTORIES.filter(d => d !== '.git');
++    }
++    if (writeConfig?.explicitPolicy) {
++        const policy = writeConfig.explicitPolicy;
++        if (!Array.isArray(policy.program)) throw new Error('Explicit filesystem policy requires an effective operation program');
++        const sealed = [];
++        const within = (parent, child) => child === parent || child.startsWith(parent === '/' ? '/' : parent + '/');
++        const privatePath = (value) => within('/dev', value) || within('/proc', value);
++        for (const region of policy.program) {
++            if (privatePath(region.path)) {
++                if (region.read) throw new Error(`Host bind would reopen private facilities: ${region.path}`);
++                continue;
++            }
++            if (region.read) {
++                const fd = policy.sourceFds?.[region.path];
++                if (fd === undefined) throw new Error(`Missing frozen region binding: ${region.path}`);
++                args.push(region.write ? '--bind-fd' : '--ro-bind-fd', String(fd), region.path);
++            } else if (region.directory) {
++                args.push('--tmpfs', region.path);
++                const skeleton = new Set();
++                for (const child of policy.program) {
++                    if (child.path === region.path || !within(region.path, child.path)) continue;
++                    for (let parent = child.directory ? child.path : path.dirname(child.path); parent !== region.path; parent = path.dirname(parent)) {
++                        if (!within(region.path, parent)) throw new Error('Invalid exception mountpoint ancestry');
++                        skeleton.add(parent);
++                    }
++                }
++                for (const directory of [...skeleton].sort((a, b) => a.split('/').length - b.split('/').length)) args.push('--dir', directory);
++                sealed.push(region.path);
++            } else args.push('--ro-bind', '/dev/null', region.path);
++        }
++        for (const directory of sealed) args.push('--remount-ro', directory);
++        // Effective layers must not reopen the runtime's protected fake-file store.
++        if (maskedFileStoreDir !== undefined) args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir);
++    }
+     return args;
  }
  /**
-  * Normalizes a path for case-insensitive comparison.
+@@ -1511,6 +1563,12 @@ export async function wrapCommandWithSandboxLinux(params) {
+             // --ro-bind / / leaves /proc read-only and those writes EROFS.
+             bwrapArgs.push('--unshare-user', '--bind', '/proc', '/proc');
+         }
++        // Only negative operations may overlay private /dev and /proc after setup.
++        for (const region of writeConfig?.explicitPolicy?.program ?? []) {
++            if (region.read || !['/dev', '/proc'].some((root) => region.path === root || region.path.startsWith(root + '/'))) continue;
++            if (region.directory) bwrapArgs.push('--tmpfs', region.path, '--remount-ro', region.path);
++            else bwrapArgs.push('--ro-bind', '/dev/null', region.path);
++        }
+         // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
+         // by creating a nested user namespace. This requires the host to permit
+         // capability-bearing unprivileged user namespaces (the same requirement
+diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
+index c3b6bd3..82cb0b1 100644
+--- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
++++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js
+@@ -432,7 +432,7 @@ function generateWriteRules(config, logTag, allowGitConfig = false) {
+     // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
+     const denyPaths = [
+         ...(config.denyWithinAllow || []),
+-        ...macGetMandatoryDenyPatterns(allowGitConfig),
++        ...(config.explicitPolicy ? [] : macGetMandatoryDenyPatterns(allowGitConfig)),
+     ];
+     const denyFilters = new Set();
+     for (const pathPattern of denyPaths) {
+@@ -446,7 +446,7 @@ function generateWriteRules(config, logTag, allowGitConfig = false) {
+ /**
+  * Generate complete sandbox profile
+  */
+-function generateSandboxProfile({ readConfig, writeConfig, httpProxyPort, socksProxyPort, needsNetworkRestriction, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, allowPty, allowGitConfig = false, enableWeakerNetworkIsolation = false, allowAppleEvents = false, logTag, }) {
++function generateSandboxProfile({ readConfig, writeConfig, httpProxyPort, socksProxyPort, needsNetworkRestriction, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, allowPty, allowGitConfig = false, enableWeakerNetworkIsolation = false, allowAppleEvents = false, processMode = 'strict', logTag, }) {
+     const profile = [
+         '(version 1)',
+         `(deny default (with message "${logTag}"))`,
+@@ -727,6 +727,32 @@ function generateSandboxProfile({ readConfig, writeConfig, httpProxyPort, socksP
+         profile.push('  (regex #"^/dev/ttys")');
+         profile.push(')');
+     }
++    if (writeConfig?.explicitPolicy) {
++        const policy = writeConfig.explicitPolicy;
++        // This opt-in policy replaces broad runtime defaults, including PTY allow-backs.
++        profile.push('(deny file-read* file-write* (subpath "/"))');
++        if (!Array.isArray(policy.program)) throw new Error('Explicit filesystem policy requires an effective operation program');
++        for (const region of policy.program) {
++            const filter = `(${region.directory ? 'subpath' : 'literal'} ${JSON.stringify(region.path)})`;
++            profile.push(`(${region.read ? 'allow' : 'deny'} file-read* ${filter})`);
++            profile.push(`(${region.write ? 'allow' : 'deny'} file-write* file-write-create file-write-unlink ${filter})`);
++        }
++        profile.push('(allow file-read-metadata (vnode-type DIRECTORY))');
++        // dyld needs to open the root directory; this is not recursive read authority.
++        profile.push('(allow file-read-data (literal "/"))');
++        profile.push('(allow file-read* (vnode-type SYMLINK))');
++        for (const device of ['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom', '/dev/tty']) {
++            profile.push(`(allow file-read* file-write* (literal ${JSON.stringify(device)}))`);
++        }
++        for (const guard of policy.guards) profile.push(`(deny file-write-unlink file-write-create (literal ${JSON.stringify(guard)}))`);
++    }
++    if (processMode !== 'compatible') {
++        // Keep descendants in the executor's process group, including daemonizing children.
++        profile.push('(deny syscall-unix (syscall-number 82) (syscall-number 147))');
++        // posix_spawn can change groups without calling setpgid/setsid. ENOSYS permits
++        // runtimes such as libuv to fall back to fork/exec, where the checks above apply.
++        profile.push('(deny syscall-unix (syscall-number 244) (with errno 78))');
++    }
+     return profile.join('\n');
+ }
+ /**
+@@ -739,7 +765,7 @@ function escapePath(pathStr) {
+  * Wrap command with macOS sandbox
+  */
+ export function wrapCommandWithSandboxMacOS(params) {
+-    const { command, commandId, needsNetworkRestriction, httpProxyPort, socksProxyPort, proxyAuthToken, caCertPath, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, readConfig: readConfigIn, writeConfig, unsetEnvVars, setEnvVars, maskedFileBinds, allowPty, allowGitConfig = false, gitSafeDirectories, enableWeakerNetworkIsolation = false, allowAppleEvents = false, binShell, } = params;
++    const { command, commandId, needsNetworkRestriction, httpProxyPort, socksProxyPort, proxyAuthToken, caCertPath, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, readConfig: readConfigIn, writeConfig, unsetEnvVars, setEnvVars, maskedFileBinds, allowPty, allowGitConfig = false, gitSafeDirectories, enableWeakerNetworkIsolation = false, allowAppleEvents = false, processMode = 'strict', binShell, } = params;
+     // SBPL cannot redirect a read to different bytes, so whole-file masking
+     // degrades to read-deny on macOS: the sandboxed process gets EPERM
+     // instead of the sentinel. The DYLD interposer (a later step) lifts
+@@ -792,6 +818,7 @@ export function wrapCommandWithSandboxMacOS(params) {
+         allowGitConfig,
+         enableWeakerNetworkIsolation,
+         allowAppleEvents,
++        processMode,
+         logTag,
+     });
+     // Generate proxy environment variables using shared utility
+diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-manager.js b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-manager.js
+index 5be4a4f..20686f5 100644
+--- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-manager.js
++++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-manager.js
+@@ -1168,6 +1168,7 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal, opt
+     // its `disabled` (defaulting to false) wins outright. A global
+     // disabled=true must not silently discard a per-call tightening that
+     // omits the new key.
++    const explicitPolicy = customConfig?.filesystem?.explicitPolicy;
+     const fsDisabled = customConfig?.filesystem !== undefined
+         ? (customConfig.filesystem.disabled ?? false)
+         : (config?.filesystem.disabled ?? false);
+@@ -1198,7 +1199,8 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal, opt
+             config?.filesystem.allowWrite ??
+             []);
+         writeConfig = {
+-            allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
++            allowOnly: [...(explicitPolicy ? [] : getDefaultWritePaths()), ...userAllowWrite],
++            explicitPolicy,
+             denyWithinAllow: stripWriteGlobs(customConfig?.filesystem?.denyWrite ??
+                 config?.filesystem.denyWrite ??
+                 []),
+@@ -1236,6 +1238,7 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal, opt
+         readConfig = {
+             denyOnly: expandedDenyRead,
+             allowWithinDeny: expandedAllowRead,
++            explicitPolicy,
+         };
+     }
+     // Check if network config is specified - this determines if we need network restrictions
+@@ -1243,8 +1246,8 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal, opt
+     // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
+     // 2. OR config has network.allowedDomains defined (even if empty array = block all)
+     // An empty allowedDomains array means "no domains allowed" = block all network access
+-    const hasNetworkConfig = customConfig?.network?.allowedDomains !== undefined ||
+-        config?.network?.allowedDomains !== undefined;
++    const hasNetworkConfig = customConfig?.network?.disabled !== true &&
++        (customConfig?.network?.allowedDomains !== undefined || config?.network?.allowedDomains !== undefined);
+     // Network RESTRICTION is needed whenever network config is specified
+     // This includes empty allowedDomains which means "block all network"
+     const needsNetworkRestriction = hasNetworkConfig;
+@@ -1287,6 +1290,7 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal, opt
+                 gitSafeDirectories,
+                 enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+                 allowAppleEvents: getAllowAppleEvents(),
++                processMode: customConfig?.processMode ?? 'strict',
+                 binShell,
+             });
+         case 'linux':

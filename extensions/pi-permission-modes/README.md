@@ -1,471 +1,177 @@
 # pi-permission-modes
 
-Switchable, **user-definable** permission modes for the [pi](https://pi.dev)
-coding agent. Each mode is a JSON bundle of an **OS-level sandbox profile**
-(bubblewrap / `sandbox-exec`) plus an **allow / ask / deny policy** across every
-surface (bash, file tools, the project boundary, web search, extension tools,
-skills). Bash gating uses a real **tree-sitter** AST, not a regex.
+Scoped filesystem profiles, canonical file/tree rules, session/project/global grants, and independent subprocess networking for Pi.
 
-Four modes ship by default — **Default → Plan Mode → Build → YOLO** — and you can
-retune them or add your own in `permission-mode.json`.
+## Profiles
 
----
+- **project** (default): R/W in the canonical starting directory and `/tmp`, plus `/var/folders` on macOS.
+- **subproject**: R/W in its parent and `/tmp`, plus `/var/folders` on macOS.
+- **yolo**: unrestricted filesystem access.
 
-## Installation
+**Networking is independently open by default in every profile.** Enable restrictions with `/net restricted` or set `network.default` to `"restricted"`. Existing explicit configuration and saved session overrides are not changed by the shipped default.
 
-```bash
-pi install npm:@strayge/pi-permission-modes
-```
+On macOS, `/var/folders` resolves to `/private/var/folders` and includes OS-managed temporary files and caches beyond the current project. Default R/W access remains subject to macOS account permissions and explicit path rules. Existing policies with explicit filesystem definitions retain their configured scope; the additional default does not widen them automatically.
 
-Requires Node.js >=22.19.0 and pi.
+Names have no special authority. The built-ins and custom profiles use the same editable version-3 schema. Profiles provide baseline access; custom rules and grants can override it at more-specific canonical boundaries. R/W includes reads, creation, edits, deletion, and supported renames. Ordinary `.git`, `.env`, `node_modules`, and IDE files have no extra protections.
 
-`pi install` fetches the package and runs `npm install` for you, so
-`@anthropic-ai/sandbox-runtime` comes along automatically; the pi SDK is
-provided by the host. Useful variants:
+## Process lifecycle
 
-- `pi install npm:@strayge/pi-permission-modes@0.0.1` — pin a version (`pi update` won't advance it)
-- `pi install -l npm:@strayge/pi-permission-modes` — project-local install (`.pi/npm/`, shareable with your team)
-- `pi update --extensions` — pull the latest release later
+Top-level `processMode` is independent of filesystem profiles and networking:
 
-For development, load this checkout directly:
+- **`compatible`** (default, including policies that omit this setting): permits normal session/process-group creation and native `posix_spawn` on macOS. Command completion, cancellation, and timeout still kill the original process group, but detached descendants may survive. If they retain output pipes, capture ends after a 250 ms drain window rather than hanging the tool. Late background output is not captured.
+- **`strict`**: retains the confined-command cleanup guarantee. On macOS this denies `setsid`/`setpgid` and makes `posix_spawn` return `ENOSYS`; runtimes with fork/exec fallback continue to work, but tools that require daemonization or native spawning may fail.
 
-```bash
-pi -e ./src/index.ts
-```
+Both modes retain filesystem and network restrictions. Detached macOS descendants inherit their sandbox and original filesystem snapshot; later grant revocation, profile switches, or reloads do not retroactively rewrite that snapshot. Persistent background services are not guaranteed: networking proxies can disappear during runtime reset. Linux already supports normal session/group creation within its PID namespaces; both modes retain bwrap namespaces, parent-death handling, and the IPC/network seccomp filter, so namespace teardown may retire detached processes even in compatible mode.
 
-On **Linux** (including **WSL2**) the sandbox also needs three system packages on
-`PATH`:
+To opt into strict mode, add `"processMode": "strict"` to the user-owned version-3 policy. Repository permission policies are never read. Fully unrestricted, open-network direct execution has no sandbox preventing process-group escape, so it always uses compatible cleanup even when the policy selects strict mode.
 
-```bash
-# Debian / Ubuntu / WSL2
-sudo apt install -y bubblewrap socat ripgrep
-```
+## Setup and state compatibility
 
-- `bubblewrap` — provides the `bwrap` binary that confines bash (the package is
-  `bubblewrap`, the executable is `bwrap`).
-- `socat` — network filtering; without it the sandbox fails to init and the
-  sandboxed modes fall back to prompting.
-- `ripgrep` — provides `rg`.
+Install this package normally with Pi. On Linux, install bubblewrap (with FD bind-mount support), socat, and ripgrep using your system package manager. On macOS, scoped access requires APFS and Apple's `/usr/bin/sandbox-exec`; search uses Homebrew ripgrep (`brew install ripgrep`). No bubblewrap or socat is needed on macOS. The runtime dependency is pinned and patched by `patch-package` during installation.
 
-On **macOS** the sandbox uses the built-in `sandbox-exec` — no extra packages.
-Native **Windows** is unsupported (modes degrade to prompting); run pi under WSL
-for OS-level enforcement.
+The only policy source is `<agent-dir>/permission-mode/permission-mode.json`, normally `~/.pi/agent/permission-mode/permission-mode.json`. Repository `.pi/permission-mode.json` files are never read, imported, changed, backed up, or deleted.
 
-### Verify
+**Version 3 is a breaking reset, not a migration.** Only v3 configuration and v3 private catalogs are supported. `state-v4.json` keeps the existing sessions/projects/grants/receipts shape; old catalogs and `state-v3.json` are rejected and left untouched until an explicit reset. No old approvals, repository restrictions, or transcript entries acquire v3 authority automatically.
 
-1. Start pi in any project — the footer shows a mode indicator, e.g. `Default`.
-2. Switch to Build (`shift+tab` until `Build`, or `/perm build`):
-   - sandbox active → `Build (sandboxed in project dir)`;
-   - otherwise → `Build (!) sandbox-runtime missing ...` plus a fix-it notification.
-3. `/sandbox` prints the active sandbox configuration (or why it's unavailable).
+Rollout:
 
----
+1. Inspect and independently back up customized user policy.
+2. Run `/perm init` or `/perm reset` and explicitly acknowledge the root-UI dialog. All affected user policy/state files are backed up before replacement; approvals across projects are discarded. Repository policies remain untouched.
+3. **Restart Pi**, rather than relying on `/reload`, to discard retained owner/runtime prototypes.
+4. Reapprove required paths and manually restore reviewed custom rules using v3 syntax.
 
-## Modes
+Headless tools cannot reset policy. Cancellation before replacement changes no authority; backups finish before source files change, and failed replacements restore changed sources. Reset stays anchored to the frozen starting project even after failed initialization, extension reload, or a different command cwd. Unsupported old policy/state and malformed v3 policy retain the warned **unrestricted initialization fallback** described below until repaired/reset; do not mistake that warning for confinement.
 
-Cycle with **`shift+tab`** or set directly with **`/perm <mode>`**. The current mode
-is persisted per session (survives `/reload`, resume, and branch navigation) and
-shown in the footer.
+Example custom profile:
 
-Default, Plan Mode, and Build all run in-project `bash` inside the OS sandbox.
-The footer shows the mode, and a network chip only when the network is *not* in
-the state the mode asked for — so a bare `Build` means the allowlist is
-filtering, and `Build  Network: open` (green) means it was lifted for the
-session (see [Network](#network)). A mode whose sandbox is unavailable reports
-`Network: open` too — the missing filtering is unintended there — plus a `(!)`
-warning when the reason is known (`--no-sandbox` is not one);
-`/sandbox` prints the full state. Only YOLO is unsandboxed. Labels are plain text
-(no icons); `shift+tab` cycles in the order below. The table describes the **shipped defaults** — every mode is data and can
-be retuned, and you can add your own, in `permission-mode.json` (see
-[Configuration](#configuration)).
-
-#### Statusline slots
-
-Both chips are also published as statusline slots, so an extension implementing
-the slot protocol can place each one exactly where you want instead of taking
-the pair as one blob:
-
-| Slot id | Shows |
-|---------|-------|
-| `perm` | the mode label, in the mode's own color, with `(!) <reason>` folded in when the sandbox is unavailable |
-| `perm-network` | the network chip, published only when there is one — cleared otherwise |
-
-`perm` deliberately matches the `ctx.ui.setStatus` key, so a statusline renders
-the slot instead of repeating the same text in its catch-all row, and a stock pi
-footer still sees the combined chip. Placing `perm-network` while leaving `perm`
-unplaced is the one layout that shows the network twice — place both, or
-neither.
-
-Both ask for the last line by default, so they land where the catch-all sits in
-a stock layout, colored per mode, with no config from you. Name either slot
-explicitly to put it elsewhere.
-
-| Mode | Behavior |
-|------|----------|
-| **Default** | Confirm every `bash`/`edit`/`write`; reads are free. Approved **in-project** `bash` runs **sandboxed** (writes confined to the project). |
-| **Plan Mode** | Planning mode. Reads are free; in-project `bash` runs **sandboxed read-only** (writes/deletes fail), so only read commands effectively work. The one mutation allowed without confirmation is **creating/editing Markdown** (`*.md`/`*.markdown`) inside the project — other `edit`/`write` are blocked. A system-prompt addition steers the model: for a planning task, write the plan to `docs/plans/<YYYY-MM-DD>_<description>.md`, render it for review with the **`show_plan`** tool, then ask you to switch to Build to apply it. |
-| **Build** | Reads, writes, and `bash` **inside the project** run with no confirmation; in-project `bash` runs **sandboxed**. |
-| **YOLO** | Never prompts, never sandboxes, no protected-path backstop. Can do anything the current user can. |
-
-In every mode except YOLO: **out-of-project** access prompts. File-tool prompts show
-both the original request and an editable scope. The scope editor offers the exact
-path, progressively broader recursive directory trees, and a validated custom
-pattern. `*` includes descendants at any depth. The prompt offers **Remember for
-this project** only in trusted projects and **Remember globally** only when project
-policy does not tighten the target. Root-wide scopes such as `/*` and `*` are
-neither suggested nor accepted by this prompt. `bash` that reaches outside
-the project or **escalates privileges**
-(`su`/`sudo`/`doas`/`pkexec`/`runuser`/`setpriv`/`chroot` — detected even
-through wrappers like `env`/`nice`/`xargs` and `bash -c '…'` scripts) prompts,
-and runs **unsandboxed** once you approve it; and `edit`/`write` to
-**protected paths** (`.git/`, `.env`, dotfiles, … — see
-[below](#how-protection-works)) are hard-blocked.
-
-> **When the sandbox is unavailable** (missing dependency, init failure,
-> `--no-sandbox`, or malformed/unsafe Git metadata): Default/Plan/Build show
-> `(!) <reason>` in the footer, and in-project `bash` that would have been
-> sandboxed instead **prompts** for confirmation — you are never silently
-> unprotected.
-
-> **Sandbox placeholder cleanup:** the sandbox runtime write-protects a fixed set
-> of dotfiles/dirs at the project root (`.git`, `.gitconfig`, `.gitmodules`,
-> `.bashrc`/`.zshrc`/… shell rc files, `.npmrc`, `.ripgreprc`, `.mcp.json`,
-> `.vscode`, `.idea`). When one of these is **absent**, it blocks the path by
-> mounting `/dev/null` over the first missing component, and
-> — because the project is writable in Default/Build — bubblewrap materializes that
-> mountpoint as a **0-byte, read-only file** that survives teardown (and, for
-> `.git`, would break the next command). The extension keeps such projects **fully
-> sandboxed** and deletes these 0-byte placeholders before and after every
-> sandboxed run, so nothing accumulates. Only 0-byte *files* are removed — real
-> directories (`.vscode/`, `.git/`, …) and non-empty files (`.gitmodules`, …) are
-> never touched.
->
-> The upstream runtime also protects `.claude/{commands,agents}` for Claude Code.
-> This Pi package applies a pinned `patch-package` patch at install time to omit
-> those paths: Pi does not consume them, and mounting absent nested paths can race
-> with the runtime's temporary placeholder files. The extension's file-tool
-> backstop likewise leaves `.claude/` writable.
->
-> **Git worktrees and submodules:** when `.git` is a non-empty Git file, the
-> extension resolves its per-worktree gitdir and optional shared `commondir`.
-> Writable modes expose the resolved Git metadata directory to the sandbox so
-> normal operations such as `git add`, `git commit`, and `git fetch` can update
-> indexes, objects, and refs. Plan remains read-only. Malformed, missing, symlinked,
-> dangerously broad, or nonstandard gitfile layouts without a verifiable
-> worktree/submodule backlink fail closed and degrade to prompting.
->
-> This is intentionally a coarse write grant. For a linked worktree the shared
-> common `.git` directory is writable from sandboxed Bash, including hooks,
-> repository config, refs, objects, logs, and administrative data for sibling
-> worktrees. The local `.git` pointer file stays read-only, and normal clones keep
-> the runtime's existing `.git/hooks` and `.git/config` write protection. Direct
-> `edit`/`write` tools keep their protected-path backstop in every non-YOLO mode.
-
-> **Symlinked sandbox paths:** a mount point that *is* a symlink aborts the whole
-> sandbox — and with it every command — because bubblewrap resolves destinations
-> inside its own pivoted root, where an absolute link target doesn't exist:
-> `bwrap: Can't mount tmpfs on /newroot/home/you/.aws: No such file or directory`.
-> This hits the stock `denyRead` set whenever a home dotfile points at another
-> filesystem (`~/.aws -> /mnt/c/Users/you/.aws` under WSL), and `allowWrite` when
-> the project is reached through a symlink. The extension canonicalizes every
-> `denyRead`/`allowWrite`/`denyWrite` entry first, so the mount lands on the link's
-> target — which covers access through the link too. An entry whose target would
-> *broaden* the mount (a link to an ancestor or a top-level directory) is dropped
-> with a notification instead.
-
-### Network
-
-In the sandboxed modes, bash network traffic is filtered by the mode's **domain
-allowlist** (package registries + GitHub by default). This is no longer a silent
-wall — a request to a host outside the allowlist **pauses while you're asked**
-(*Allow for session / Allow forever / Deny*), then proceeds or fails:
-
-- **`alt+n`** toggles filtering for the session; the footer marks it (see
-  [Modes](#modes)).
-- **`/net`** — `status` (allowlist, session grants/denies), `allow <domain…>`
-  (grant for the session), `open` / `restrict` (same as `alt+n`), `reset`
-  (forget session grants/denies).
-- The model has a **`request_network_access`** tool: it names the domains and a
-  reason, you approve or deny — one prompt can cover several domains (e.g. all
-  hosts an install needs). Denied hosts stay denied for the session (no
-  prompt-storms from retrying installers), and any blocked host is reported in
-  the command output so the model knows exactly what happened instead of
-  guessing at proxies.
-- "Allow forever" persists the domain to the active mode's allowlist in your
-  global config. Set a mode's `sandbox.askOnBlockedHost` to `false` to restore
-  silent denying.
-
-Grants, denies, and the open toggle are **session-scoped** (except "Allow
-forever") and apply instantly — no sandbox restart.
-
-### CLI flags
-
-- `--perm <mode>` — start in a given mode (any defined mode name).
-- `--no-sandbox` — disable the OS sandbox for the sandboxed modes (falls back to
-  AST/heuristic gating + prompts).
-
-### Session approvals
-
-For ordinary prompts, the choices remain **Allow once / Allow for session / Deny**.
-Bash safeguards for outside/privileged execution, unavailable containment,
-unparsed or dynamically interpreted commands, and parser fallback are independent
-one-shot confirmations (**Allow once / Deny**). A remembered Bash grant can satisfy
-only the separate Bash-policy ask; it never suppresses a safeguard. Dynamic command
-heads, `eval`, sourced or file-backed shell scripts, and shell command strings produced
-by expansion have no inspectable command identity and cannot be remembered.
-Outside-project file prompts show **Allow this request once**, **Allow
-scope for session**, optional project/global memory choices, and **Deny**. `[edit]`
-(or `e`/Tab) opens the scope editor. Escape from custom input returns to the
-selector; Escape from the selector returns to the outer prompt without changing
-the committed scope; Escape from the outer prompt denies the request.
-
-Remembered approvals use one typed `permissionGrants` list. A path grant names
-`path`, `external_directory`, `read`, `write`, `edit`, `grep`, `find`, or `ls`
-plus an exact, tree, or glob scope. A Bash grant names a command pattern. Grants
-are ask-only: they satisfy a matching `ask`, never override `deny`, and never
-cross permission identities. Direct file calls prompt independently for boundary
-and operation requirements. Dismissing a prompt, or failing to write a selected
-persistent grant, denies the current requirement. Clear session grants with
-`/perm clear-approvals`.
-
-File-tool paths follow Pi's execution semantics: `~` is expanded, but `$HOME/...`
-is passed literally because Pi does not invoke a shell for file paths. Permission
-patterns may still use `$HOME` as a configured alias; that alias is expanded on
-the pattern side only, so a literal `$HOME` directory cannot be mistaken for the
-home directory. Pi read's filename fallbacks (including decomposed Unicode and
-curly-quote variants) are authorized against the candidate it will actually open.
-After approval, the tool input is rewritten to that selected canonical candidate,
-so a fallback or symlink spelling is not resolved again for execution.
-
-Bash path-policy asks are one-shot confirmations. Bash-surface asks offer the
-narrow and broad command patterns and save paired Bash grants together. These
-remembered grants are separate from explicit policy rules; `/perm allow` continues
-to write full-authority ordered `permission` maps.
-
-Use `/perm init -p` to scaffold a project file, or
-`/perm allow [-p|-g] [surface] <pattern>` to write an allow rule. Flags follow
-`allow`; only leading flags are parsed, so the remaining pattern text preserves
-spaces and may contain `-p` or `-g`. `-p` requires a trusted project.
-
----
-
-## How protection works
-
-Two independent layers compose:
-
-1. **Policy engine** (`allow` / `ask` / `deny`): every tool call resolves against
-   the active mode's policy for its surface (`bash`, `read`/`write`/`edit`/…, the
-   cross-cutting `path` gate, `external_directory`, `web_search`, `tool`,
-   `skill`). `deny` blocks, `ask` prompts, `allow` passes.
-   For **bash**, the command line is parsed with **tree-sitter** (a real AST)
-   and every command it contains — including ones nested in `$(...)`, backticks,
-   subshells, and `sh|bash|zsh|fish|… -c '…'` scripts (re-parsed recursively) —
-   is judged separately: matched against the `bash` patterns **and** the `path`
-   gate (against the joined command and each individual token, so
-   `"path": { "*.env": "deny" }` blocks `cat .env` wherever the target appears),
-   with out-of-project paths and privilege escalation (even through wrappers
-   like `env`/`nice`/`xargs`) detected structurally. If the tree-sitter grammar
-   can't load, a whole-string token-scan heuristic stands in, which is more
-   easily fooled.
-
-   **fish.** No fish grammar exists on npm, so `fish -c` scripts are read with
-   the bash grammar. That covers the common case — `fish -i -c 'cd sub && pytest
-   -k t'` is judged as `cd` and `pytest`, not as one opaque `fish` argument —
-   and fish's `and`/`or`/`not` modifiers are unwrapped so they cannot hide a
-   command head. Block constructs (`for … end`, `switch … end`, `function …
-   end`) have no bash reading and parse incompletely. Those are detected rather
-   than trusted: in sandboxed modes the command is marked **unparsed** and
-   prompts rather than letting a hidden `sudo` ride through an `allow` rule.
-   Explicitly unsandboxed modes keep their policy authoritative, so YOLO still
-   never prompts.
-2. **OS sandbox** (`@anthropic-ai/sandbox-runtime`): the real enforcement for
-   bash. When a mode's `sandbox.enabled` is true, in-project bash runs wrapped by
-   `sandbox-exec` (macOS) / `bubblewrap` (Linux), confining **writes** to the
-   profile's `allowWrite` (project + `/tmp` by default) and denying reads of the
-   profile's `denyRead` secrets — regardless of what the command does. A mode with
-   `sandbox.writable:false` (Plan) runs bash **read-only**; `sandbox.enabled:false`
-   (YOLO) runs it unsandboxed.
-
-So a `bash` command that policy says `allow` still runs **sandboxed**; `ask`
-prompts, then runs sandboxed — or **unsandboxed** for an out-of-project escape
-or privilege escalation you approve, since you authorized it; `deny` never runs.
-
-> Note: only the model's `bash` tool is OS-sandboxed. File tools (`read`/`edit`/
-> `write`/…) are governed by the policy engine and the path checks, not bubblewrap
-> — which is why the Plan-mode Markdown-only rule and the protected-path backstop
-> are enforced at the tool layer. Reads inside the sandbox stay broad (only
-> `denyRead` secrets are blocked at the kernel), and a non-sandboxing mode (YOLO)
-> confines nothing.
-
-**Sandbox awareness.** While a sandboxed mode is active, a factual
-`## Sandbox & permissions` section is injected into the system prompt each turn:
-the writable paths, denied reads, and network allowlist of the **merged** profile
-(project overlays included), plus how the prompt flow works. The model then picks
-paths and domains that actually work — project-local installs instead of `~/.npm`,
-allowlisted hosts instead of dead fetches — and knows a boundary-crossing command
-is fine to issue because you'll simply be asked. When the sandbox is degraded, the
-section says so and points at the confirmation prompts instead. Opt a mode out
-with `"injectSandboxInfo": false`; unsandboxed modes (YOLO) never inject.
-
-**Tool hiding.** A mode's `hideTools` list removes those tools from the model
-*before* it reasons (via the active-tools allowlist), so it never attempts them.
-`show_plan` is never hidden.
-
-**Skills & extension tools.** Skills are gated by name at `/skill:<name>` (the
-`skill` surface); any non-builtin/extension tool (including MCP-as-tool in a host
-that adds them) is gated by tool name (the `tool` surface). In **Default** and
-**Plan**, a tool/skill the host adds that has no rule yet **prompts on first use**
-— *Allow once · Allow this session · Allow forever · Deny*. "Allow forever"
-persists `<mode>.permission.<tool|skill>.<name>: "allow"` to your global config so
-it never asks again. **Build** and **YOLO** allow all tools/skills without
-prompting. (Set a mode's `tool`/`skill` to `"allow"` to opt that mode out of the
-first-use prompt, or to `"deny"` to block.)
-
-**Protected paths.** Unless a mode sets `bypassProtectedPaths` (only YOLO does),
-`edit`/`write` to protected paths are hard-blocked — matched by path segment, not
-loose substring, on both the literal target **and** its symlink-resolved
-canonical path (so a link pointing at `.git/` or a dotfile can't smuggle a write
-past the backstop). The set mirrors the Pi-specific sandbox-runtime mandatory-deny
-list: `.git/`, `node_modules/`, `.vscode/`, `.idea/`, `.env`/`.env.*`, and common
-dotfiles (`.bashrc`, `.zshrc`, `.profile`, `.gitconfig`, `.npmrc`, …).
-This matters most in Build, where file tools aren't OS-sandboxed.
-
-For direct `edit`/`write`, the extension re-resolves the frozen authorized target
-immediately before returning the canonical path to Pi and blocks if an absent
-component or ancestor changed into a symlink. A small TOCTOU window remains
-after that hook check because Pi subsequently performs its own path-based tool
-execution. This extension is not a complete security boundary against a hostile
-local process that can mutate the same filesystem; use OS-level isolation for
-that threat model.
-
----
-
-## Configuration
-
-Modes are data, layered in this order:
-
-1. **Stock defaults** — `permission-mode.defaults.json`, shipped with the extension
-   (the four built-in modes). This is the same format you edit; copy it to make
-   your own, or run **`/perm init`** to drop a copy at the global path below.
-2. `~/.pi/agent/permission-mode/permission-mode.json` (**global, full authority**):
-   redefine built-in modes, add your own, and set `defaultMode` / `cycleOrder`.
-   (Stable location, independent of where `pi install` placed the extension.)
-3. `<project>/.pi/permission-mode.json`: trusted projects append permission maps
-   after global maps, load `permissionGrants`, and union `allowWrite` and
-   `allowedDomains`. Duplicate permission keys move to the end. Untrusted projects use a
-   most-restrictive permission overlay and tighten every sandbox field; their
-   remembered grants are ignored. In either case, `denyRead`, `denyWrite`, denied domains, `writable`, and
-   `askOnBlockedHost` remain tighten-only; projects cannot change defaults, cycle
-   order, `sandbox.enabled`, or add modes. Unsafe domain patterns are ignored.
-   Project writers do not add an implicit `"*"`, because it could override global
-   rules.
-
-The `.pi/permission-mode.json` file alone is not a pi trust-triggering resource.
-In a cloned repository with no other `.pi` resource, its grants may therefore
-apply without a trust prompt. Session start reports the accepted project grant
-count so this limitation is visible.
-
-`outsideFileGrants` is obsolete. It is warned about and ignored on load, is not
-migrated, and is removed only from a mode when a new `permissionGrants` write
-successfully rewrites that mode. This is a breaking configuration change.
-
-### Shape
-
-```jsonc
+```json
 {
-  "$schema": "https://raw.githubusercontent.com/strayge/pi-extensions/main/extensions/pi-permission-modes/schemas/permission-mode.schema.json",
-  "defaultMode": "default",
-  "cycleOrder": ["default", "plan", "build", "yolo"],
+  "version": 3,
   "modes": {
-    "default": {                        // values here are illustrative — run /perm init for the real defaults
-      "label": "Default",
-      "color": "muted",                 // muted | mdLink | accent | error
-      "systemPrompt": "@plan",          // optional; "@plan" = the dated Plan-mode prompt
-      "injectSandboxInfo": true,        // inject the mode's sandbox boundaries into the system prompt (default true)
-      "sandbox": {
-        "enabled": true,                // false = run bash unsandboxed (YOLO-style)
-        "writable": true,               // false = bash runs read-only (Plan-style)
-        "allowWrite": [".", "/tmp"],
-        "denyRead": ["~/.ssh", "~/.aws", "~/.gnupg"],
-        "denyWrite": [],
-        "network": { "allowedDomains": ["github.com", "*.github.com"], "deniedDomains": [] },
-        "askOnBlockedHost": true          // live prompt for hosts outside the allowlist (false = silent deny)
-      },
-      "permission": {
-        "path": { "*": "allow", "*.env": "deny" },  // cross-cutting gate (deny overrides per-tool allow)
-        "external_directory": "ask",                // the out-of-project boundary
-        "read": "allow", "grep": "allow", "find": "allow", "ls": "allow",
-        "write": "ask", "edit": "ask",
-        "bash": { "*": "ask", "sudo*": "deny" },     // matched per command (name + args)
-        "web_search": "ask",
-        "tool": "allow",                            // any non-builtin/extension tool, by name
-        "skill": "allow"                            // skills, by name
-      },
-      "permissionGrants": [                          // satisfy matching asks only
-        { "permission": "external_directory", "scope": { "kind": "tree", "value": "/tmp" } },
-        { "permission": "bash", "pattern": "git fetch *" },
-        { "permission": "bash", "pattern": "git fetch" }
-      ],
-      "hideTools": []                               // tools removed from the model in this mode
+    "docs": {
+      "label": "Docs",
+      "color": "accent",
+      "filesystem": {
+        "kind": "scoped",
+        "readOnly": ["."],
+        "readWrite": ["./docs", "/tmp"],
+        "resourceReads": ["pi", "system"]
+      }
     }
   }
 }
 ```
 
-**Actions:** `allow` (pass through), `ask` (prompt), `deny` (block). A surface is
-either a single action or a `{ "<glob>": <action> }` map where **`*` matches any
-characters incl. `/`**, `?` matches one, `~`/`$HOME` expand, **the last matching
-pattern wins** (put `"*"` first as the default), and across the `path` /
-`external_directory` / per-surface layers the **most restrictive wins**.
+Profile names merge by name; a supplied `filesystem` field replaces that profile's entire filesystem definition. Profile roots must be directories. Explicit arrays replace defaults, including `pathRules`. Missing policy uses shipped defaults; a partial v3 document overrides them. Paths support `~`, `$HOME`, `$AGENT_DIR`, and project-relative paths anchored to the frozen root. UI-saved global grants use absolute canonical targets so their meaning does not change across projects.
 
-`permissionGrants` path entries use `{ "permission": "…", "scope": { "kind": "exact" | "tree" | "glob", "value": "…" } }`.
-Exact scopes keep wildcard characters literal. Tree scopes contain a canonical
-literal directory and use canonical containment; glob scopes use the recursive
-matcher and are bound to the canonical static prefix when created. Bash entries
-use `{ "permission": "bash", "pattern": "…" }`; paired narrow and broad patterns
-are stored together. Grants are consulted only after policy resolves to `ask` and
-never loosen a deny. Malformed, unsafe, control-character, overlong, or root-wide
-grants are rejected. Project grants require a trusted project, and each grant is
-scoped to the active mode. All direct-file path, boundary, and operation asks are
-independent.
+## Commands and requests
 
-### Defining your own mode
+- `/perm`, `/perm status`, `/perm grants`, `/perm inspect`: inspect resolved roots, resources, rules, ordinary approvals, and active/dormant/blocked global declarations.
+- `/perm <profile>` or **Shift+Tab**: select/cycle filesystem profiles.
+- `/perm grant read|write <path>`: request an exact-file grant for an existing regular file, or directory access with editable scope.
+- `/perm revoke <approval-id>`: revoke an ordinary grant or ask receipt.
+- `/perm revoke global:<rule-id>`: confirm removal of all current allow-valued fields of that declaration; preserve ask/deny fields and remove an empty row.
+- `/perm clear`: clear ordinary grants and ask receipts for the active owner/project, never global policy.
+- `/perm clear global`: confirm removal of all configured allow fields, including dormant/blocked positives; preserve restrictions, ordinary approvals, profiles/resources, networking, and process mode. Unknown arguments fail safely.
+- `/net`, `/net open`, `/net restricted`, **Alt+N**: inspect/change networking.
+- `/net allow <domain>`, `/net deny <domain>`: update independent network policy.
+- Model tools: `request_directory_access`, `request_path_exception`, `request_network_access`.
 
-Add a mode under `modes` in the global config and (optionally) list it in
-`cycleOrder`. Example — a "review" mode: read-only sandbox, web search off, the
-`edit`/`write` tools hidden entirely:
+The footer and statusline show **Network restricted** only while an initialized policy restricts networking; open networking has no indicator. Failed policy initialization falls back to open networking and clears that indicator. `/net` still reports the current network policy when initialized.
 
-```jsonc
+All directory grant menus, including agent-triggered requests, offer **Allow for this session** (default), **Remember for this project**, **Save globally**, **Edit directory scope**, and **Deny**. Editing returns to explicit approval of the revised scope; cancelling the edit preserves the previous scope. Exact-file menus offer the same saving choices without scope editing. Separate ask-receipt menus offer only session/project saving.
+
+R/O to R/W upgrades require approval. R/O grants do not create missing directories. R/W creation requires explicit root approval of the displayed directory, not an implicit parent grant. Winning asks are approved before requesting unrelated positive authority; equally specific asks still need their own receipts. A successful approved creation continues the triggering write for session, project, and global saving without a hidden extra grant. Pre-commit failure removes only an empty, identity-matching newly created directory; populated/replaced directories are retained with a warning.
+
+For example, `/perm grant read ~/.gitconfig` grants only that existing regular file, not its parent or siblings; `write` supplies read/write authority at the same specificity. File permissions follow the approved name through ordinary atomic regular-file replacement while pinning its parent and canonical/symlink destination. Missing paths retain explicit directory-creation semantics; nonexistent files are never inferred.
+
+Global grants are allow declarations in the user policy, not a third private approval bucket. A read save followed by a write upgrade consolidates into one current declaration; its `global:<rule-id>` identifies that declaration, not historical approval actions or an array position. Revoke removes every current allow field, not just the most recent upgrade. Global saves never overwrite restrictions or borrow private grants/ask receipts: if the requested boundary remains denied or requires ask, save is refused and the policy is unchanged. Tree grants may retain more-specific protected descendants.
+
+Confirmed global edits use a private same-directory temporary file, exclusive `.authority.lock`, content/identity/revision checks, and atomic rename. Rename is the commit point. Publication is immediate for the root and attached children, invalidates stale approval answers, does not reset networking, and does not rewrite running filesystem snapshots. Other processes need reload/restart. A later private-cache failure means **committed and active with a warning**, not rollback; restart Pi before further authority changes.
+
+## Path rules
+
+```json
 {
-  "cycleOrder": ["default", "review", "build", "yolo"],
-  "modes": {
-    "review": {
-      "label": "Review", "color": "mdLink",
-      "sandbox": { "enabled": true, "writable": false, "allowWrite": [".", "/tmp"], "denyRead": ["~/.ssh"] },
-      "permission": { "read": "allow", "bash": "allow", "web_search": "deny", "write": "deny", "edit": "deny" },
-      "hideTools": ["edit", "write"]
-    }
-  }
+  "version": 3,
+  "pathRules": [
+    { "path": "$AGENT_DIR/auth.json", "scope": "file", "read": "ask", "write": "ask" },
+    { "path": "$AGENT_DIR/permission-mode", "scope": "tree", "write": "ask" },
+    { "path": "./private", "scope": "tree", "read": "deny" },
+    { "path": "./private/notes.txt", "scope": "file", "read": "allow" }
+  ]
 }
 ```
 
-> **Linux glob limitation (sandbox filesystem only).** The sandbox-runtime drops
-> glob patterns from its `allowWrite`/`denyRead`/`denyWrite` lists on Linux — use
-> literal paths there (macOS supports globs). This applies to the **sandbox**
-> lists, not the `permission` policy globs, which are matched by this extension.
+The shipped rules protect Pi credentials and permission policy/state writes. If the active agent directory differs, defaults also protect conventional `~/.pi/agent/auth.json`. Replacing/removing `pathRules` intentionally removes those defaults. Broad Pi-directory grants can then expose credentials or let tools alter future policy; do not remove rules casually.
 
----
+Each rule declares `scope: "file" | "tree"` and `read`/`write` actions of `allow | ask | deny`. The most-specific canonical component boundary wins independently for each operation; JSON order, path character count, and alias spelling do not add priority. At equal specificity, deny wins, then unresolved ask, then allow. Every equally winning ask needs its own source/operation receipt. Session, project, and global allows have identical scope and precedence; only persistence differs. Approved asks stay conditional permissions at their declared boundary, including outside the profile or beneath broader denial.
 
-## Disabling
+Writing requires effective read and write authority. Write allow or approved write ask supplies read authority at the same specificity, subject to equal/more-specific read restrictions. A narrower read-only exception does not revive writes suppressed by a broader read denial. With baseline R/W `work` and a read denial on `work/private`, a child `read: "allow"` or approved read ask permits only reads; a child write allow or approved write ask permits R/W. Pending write asks do not newly restrict ordinary reads. Yolo bypasses custom filesystem rules, not networking.
 
-- Temporarily: launch pi with `--no-extensions` (disables all), or `--no-sandbox`
-  to keep the modes but drop OS sandboxing.
-- Permanently: `pi remove npm:@strayge/pi-permission-modes` — or remove the
-  entry from your pi settings.
+Missing positive targets are dormant; they never create placeholders or authorize a parent. Wrong types, canonical redirection, and live directory/parent identity changes block the affected positive source and warn without disabling otherwise valid policy. Ask/deny constraints remain independently validated. Adding/upgrading/rebinding authority needs a valid target; removing positive fields does not require a usable positive target, but surviving restrictions keep their original validated pins.
 
----
+Rules inspect native filesystem paths. Distinct case-sensitive filenames, Unicode-space siblings, hard-link names, and copies are not merged into one identity. Existing APFS case/Unicode aliases resolve to their native canonical spelling, and Seatbelt applies native matching to shell rules. Dangling symlinks are rejected, while normal missing-path creation and resolvable explicit symlinks work.
 
-## Credit
+Persistent permissions follow lexical/canonical pathnames, not historical inode identities. Fresh root initialization binds the current objects at those names; recreating a directory at the same canonical path therefore preserves its permissions. This deliberately accepts same-path directory substitution while Pi is stopped, but saved symlink destinations and object types remain validated. Ordinary directory-tree permissions and exact-file parent anchors stay pinned within a live owner, including across mode changes and `/reload`. Exact-file authority follows the canonical filename inside that parent (or the nearest existing ancestor for future parents), so atomic regular-file replacement remains valid. During live execution, replacing an ordinary pinned directory/parent, redirecting a path, or substituting a directory/special file fails closed. Each execution still obtains current object identities for direct-tool checks and Linux descriptor mounts.
 
-Based on [`pi-permission-modes`](https://github.com/wynainfo/pi-permission-modes)
-by Nico Merz.
+On macOS, a nonexistent rule target has no canonical spelling to compare. Direct-tool creation under that rule's nearest existing parent conservatively requires the same exception (or is denied for a hard rule), even for a different new filename, until the rule target exists. Existing unrelated files are unaffected. Shell sandbox rules remain exact; static preflight uses the conservative direct-tool check. Configuration/state paths reject user-controlled symlink redirection; Apple's protected `/tmp`, `/var`, and `/etc` aliases are accepted.
+
+## Automatic read resources
+
+`resourceReads: ["pi", "system"]` expands to inspectable directory-root and exact-file permissions:
+
+- Pi: `~/.pi`, the active agent directory, the actual running Pi package, the exact Node executable, and exact active npm/corepack package roots and npm/npx/corepack launchers. On macOS, exact linked Node dylibs are discovered using system `otool`; Homebrew Node also receives its OpenSSL configuration and CA bundle. No NVM/Homebrew prefix, parent `lib/node_modules`, sibling packages, caches, or other toolchains are granted.
+- Linux: canonical `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`; `/etc/alternatives`, certificate directories; loader configuration/cache, NSS configuration, hosts/resolver, gai, passwd/group, localtime, and os-release files.
+- macOS: `/System`, system executable/library/share directories, `/Library/Apple`, `/Library/Developer/CommandLineTools` when installed, selected hosts/resolver/services/certificate files, and dyld data. Command Line Tools are R/O and omitted when `system` resources are disabled; full Xcode installations at other paths still require explicit grants.
+
+Host-runtime resources are rediscovered at fresh initialization and `/reload`, so Pi/Node/package updates do not invalidate remembered authority. Their exact bindings live only in execution snapshots; their enclosing installation prefixes are never granted. Automatically readable `~/.pi` and agent directories remain ordinary durable boundaries, and explicit path rules keep their own anchors even inside a runtime package. Reload drains existing operations before publishing refreshed resources.
+
+Only existing baseline entries are included. Project `vendor` links and separately loaded extension package trees are not automatically granted. User shell configuration, virtual environments, package caches, and other repositories need ordinary grants.
+
+Sandbox infrastructure additionally uses private process/device facilities, network proxy sockets, and the exact bundled Linux seccomp launcher. macOS also permits directory metadata, symlink inspection, and opening the root directory for dyld (not recursive root reads). Those are execution facilities, not grants to arbitrary host file contents.
+
+## Enforcement and lifecycle
+
+| Filesystem | Network | Shell execution |
+| --- | --- | --- |
+| scoped | restricted | filesystem sandbox + filtered proxy |
+| scoped | open | filesystem sandbox |
+| unrestricted | restricted | filtered proxy, filesystem enforcement disabled |
+| unrestricted | open | direct execution |
+
+**If root policy initialization or reload fails, the extension warns and falls back to Pi's ordinary tools with unrestricted filesystem access and open networking.** The footer shows **Unrestricted (policy failed)**. Repair the configuration or filesystem boundary and `/reload` to restore enforcement; fallback does not reset saved policy or approvals. Inherited child policies do not independently fall back while their parent remains governed.
+
+After successful initialization, required-layer failure blocks execution. There is no approved-unsandboxed fallback for an active policy, and `--no-sandbox` does not bypass required layers. **Scoped authority supports macOS APFS and verified Linux ext4 (without casefold) and tmpfs paths.** Other filesystem semantics fail closed. Ext4 checks require the protected system `lsattr` executable. PowerShell uses `/usr/bin/pwsh` on Linux, or `/usr/local/bin/pwsh` / `/opt/homebrew/bin/pwsh` on macOS, through the same contained launcher. Its installation and dependencies must be readable under the selected profile; otherwise it is unavailable, not an exemption. Native Windows containment is unsupported.
+
+Bash parsing discovers reliable static paths and redirections before execution. Recognized options separate values from file operands; descriptor duplication and literal heredoc bodies are not file paths. Conditional `cd` tracks successful and failed branches separately, while subshell cwd changes stay local. Ambiguous options, dynamic scripts, physical/unknown cwd changes, and unknown syntax remain subject to the OS boundary, not command-identity prompts. Commands are never automatically retried after execution failures.
+
+One root owner publishes immutable filesystem snapshots; new operations use its current revision. Children—including isolated, extension-filtered, and nested children—attach to the same owner over the shared event bus. Resumed and reopened children reacquire an owner lease and see current grants; a retired owner cannot be resumed. Alternate cwd/worktrees do not become implicit grants. Approval dialogs route to the root UI. Reload/shutdown abort active direct/search/shell operations and descendants, then drain their leases before replacing runtime state. Late network answers cannot grant access after retirement or a failed reload; ordinary filesystem switches do not invalidate independent network approvals.
+
+A shell operation owns its original process group until foreground exit, cancellation, or timeout, and attempts to retire that group before releasing its lease, even on successful exit. Strict confined execution additionally prevents detached descendants from surviving cleanup; compatible execution uses bounded output handling and best-effort cleanup as described under **Process lifecycle**. The operation lease tracks the command, not surviving compatible-mode daemons.
+
+A running process keeps its filesystem snapshot. Proxied processes consult live network policy for each new connection; established connections are not terminated. Already-launched processes with open direct networking remain open until exit. Selecting a filesystem profile does not reset networking. Requested hosts, configured patterns, and grants use the same WHATWG host normalization as the proxy: alternate IPv4 forms such as `127.1`, `2130706433`, and `0x7f000001` cannot bypass a deny for `127.0.0.1`.
+
+Private approvals/cache are kept in user-owned `<agent-dir>/permission-mode/state-v4.json`, with atomic replacement and a whole-document exclusive writer lock shared with global policy transactions. Trusted current user policy establishes global authority before cache reconciliation. Obsolete cached declarations/receipts cannot restore removed allows or reject newer policy merely because obsolete positive targets changed. Independent ordinary grants, surviving receipts, saved shape, frozen-root/session identity, canonical destinations and object types remain validated. Runtime resources are rebuilt from current host metadata rather than restored from saved catalogs. Exact-file permissions resolve the current regular file under freshly bound parent anchors. Session restoration binds session ID, canonical session-file path, and canonical starting directory together. No-session roots keep only process-lifetime session authority. Project grants are separately keyed by canonical starting directory. Transcript navigation cannot resurrect a revoked record. Concurrent stale writers must reload. Lock-cleanup failure after a committed write does not falsely roll back in-memory authority; a remaining lock blocks subsequent writers. After a crash or cleanup failure, verify that all writers have stopped before manually recovering an orphan `.authority.lock`; no PID/age heuristic removes it automatically.
+
+## Search and important limits
+
+Direct `read`, `write`, and `edit` retain Pi presentation, image handling, cancellation, and edit behavior, while executing the exact authorized native path. `find`/`grep` share the effective evaluator, traverse authorized entries only, do not follow discovered symlinks, and report omissions separately from truncation. They never enumerate a denied parent to discover narrower exceptions; an explicitly supplied authorized file is a safe entry point. Explicit tree roots still require authorized ignore context. `ls` is nonrecursive and classifies link targets only through authorized hops; dangling or unauthorized targets retain their entry name without a directory suffix. Discovered broken links do not abort recursive search.
+
+Search reads applicable parent/nested/global ignore metadata only when authorized. A discovered metadata symlink or inaccessible required context omits its dependent subtree; if the entire search depends on it, search is unavailable. It is never silently treated as an empty ignore file. Grep streams authorized files into protected `/usr/bin/rg` on Linux. On macOS it selects a fixed Homebrew location, not PATH, and runs rg in a separate stdin-only sandbox with a minimal environment, no networking or host-file writes, and reads limited to its executable, linked dylibs, and OS runtime facilities. Changes to those dependencies may require `/reload`.
+
+A rename requires source unlink and destination creation authority. Exact-file R/W does not authorize sibling temporary/lock files or shell atomic-save helpers. Linux exact-leaf bind mounts have native rename/unlink/replace `EBUSY` limitations; directory grants are never widened to work around them. Host-side direct replacement stays bounded to its exact authorized file.
+
+Restrictions may pin an ancestor directory against rename/removal without making ordinary contents read-only. Existing or future restricted mountpoints are enforced before shell launch; unsupported literal paths/guard layouts are unavailable. Temporary future mountpoints are removed only while their recorded identity remains unchanged.
+
+Host-side direct-tool checks retain a check/use race against hostile local processes. macOS checks final effective-program equivalence immediately before launch, rejecting a stale profile if its positive sources became invalid. Seatbelt is path-based and does not provide Linux's descriptor-pinned mount snapshots against external replacement after that check. No approved source descriptors are passed to macOS commands. Trusted custom tools/extensions and the processes/network clients they launch are outside this policy. This is not secret redaction, shell environment isolation, or object-wide hard-link tracking.
+
+Native macOS tests exercise APFS case/Unicode aliases, future rules, ancestor protection, read-only/outside boundaries, Homebrew Node and grep, cancellation, concurrent immutable snapshots, unrelated runtime families, filesystem-plus-network and live network-only policy changes. Search fixtures cover Gitfiles, common directories, global/nested ignores, and cancellation against native rg/fd. Central-runner tests use real Pi sessions and shell processes with a scripted local model to exercise isolated, filtered, nested, resumed, reopened, and cancelled children. Linux-specific FD-mount tests remain separate. The v3 compact precedence matrix, symlink containment, and post-generation pin substitution are exercised through the production macOS profile. Linux generated mount ordering and patch application are checked on this host, but **native Linux v3 enforcement is unvalidated here and remains required for cross-platform acceptance**. Live PowerShell execution and an authenticated external-model roundtrip are not verified.
+
+## Development
+
+```sh
+npm run check
+```
+
+Tests cover configuration, strict paths, owner transitions, protected persistence, direct/search tools, and native macOS/Linux containment where dependencies exist. The macOS syscall regression compiles a small temporary probe with the system clang toolchain. Use an isolated temporary agent/config directory for Pi smoke tests; never reset personal permission state during validation.
