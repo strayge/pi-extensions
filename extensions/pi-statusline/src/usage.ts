@@ -25,10 +25,40 @@ interface UsageLike {
   cost?: { total?: number };
 }
 
-export function collectUsage(ctx: ExtensionContext): UsageTotals {
-  const totals: UsageTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+interface CachedUsage {
+  sessionId: string;
+  leafId: string | null;
+  entryCount: number;
+  totals: UsageTotals;
+}
 
-  for (const entry of ctx.sessionManager.getEntries()) {
+const usageCache = new WeakMap<ExtensionContext["sessionManager"], CachedUsage>();
+
+export function collectUsage(ctx: ExtensionContext): UsageTotals {
+  const manager = ctx.sessionManager;
+  const sessionId = manager.getSessionId();
+  const leafId = manager.getLeafId();
+  // The readonly extension API omits the fast count available on newer host managers.
+  const countedManager = manager as typeof manager & { getEntryCount?: () => number };
+  let entries: ReturnType<typeof manager.getEntries> | undefined;
+  let entryCount: number;
+  if (typeof countedManager.getEntryCount === "function") {
+    entryCount = countedManager.getEntryCount();
+  } else {
+    entries = manager.getEntries();
+    entryCount = entries.length;
+  }
+  const cached = usageCache.get(manager);
+  if (
+    cached?.sessionId === sessionId &&
+    cached.leafId === leafId &&
+    cached.entryCount === entryCount
+  ) {
+    return cached.totals;
+  }
+
+  const totals: UsageTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  for (const entry of entries ?? manager.getEntries()) {
     if (entry.type === "message" && entry.message.role === "assistant") {
       const usage = entry.message.usage as UsageLike | undefined;
       add(totals, usage);
@@ -45,6 +75,7 @@ export function collectUsage(ctx: ExtensionContext): UsageTotals {
     }
   }
 
+  usageCache.set(manager, { sessionId, leafId, entryCount, totals });
   return totals;
 }
 

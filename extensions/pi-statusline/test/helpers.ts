@@ -65,6 +65,9 @@ export function fakeEnv(options: FakeOptions = {}): Omit<RenderEnv, "placedStatu
     thinkingLevel: options.thinkingLevel ?? "high",
     sessionManager: {
       getSessionName: () => options.sessionName,
+      getSessionId: () => "test-session",
+      getLeafId: () => null,
+      getEntryCount: () => 0,
       getEntries: () => [],
     },
     getContextUsage: () => {
