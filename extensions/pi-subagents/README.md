@@ -34,7 +34,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
 - **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference (upstream reference)](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
-- **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
+- **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results use the same boundary/idle notification delivery as manual background completions; manage via `/agents → Scheduled jobs`
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
 ## Install
@@ -96,7 +96,7 @@ Schedule formats:
 - **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
 - **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
 
-When a schedule fires, the spawn runs in background and its completion notification arrives in the conversation through the same `subagent-notification` followUp path as a manually-spawned background agent — your parent agent reasons about the result the same way.
+When a schedule fires, the spawn runs in background and its completion uses the same boundary/idle notification delivery as a manually-spawned background agent — your parent agent reasons about the result the same way.
 
 Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`. List and cancel via `/agents → Scheduled jobs` (creation is the `Agent` tool's job — there is no parallel manual-create wizard). Storage at `<cwd>/.pi/subagent-schedules/<sessionId>.json` with PID-based file locking for cross-instance safety.
 
@@ -237,6 +237,12 @@ By default, foreground and background agents each stream their full conversation
 ```
 
 Group completions render each agent as a separate block. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
+
+Ready agent and workflow completions arrive at the next safe turn boundary while the parent is working, rather than waiting for it to stop. When idle, a brief hold batches ready messages before one model wake-up; this still applies after `Esc`. Group join timeouts below remain unchanged.
+
+`get_subagent_result` and RPC consumption suppress matching agent notices before delivery, including historical reads after live-cache cleanup. Same-ID resumes preserve older unread previews, marked **earlier run**; ID-based retrieval still targets the current/latest run. Workflow result handoff is unchanged; there is no workflow retrieval API.
+
+Closing or reloading a session clears pending runtime notices and group timers, without replaying them on reopen. Cancelling only the parent turn with `Esc` does not clear them.
 
 ## Default Agent Types
 
@@ -588,6 +594,8 @@ When background agents complete, they notify the main agent. The **join mode** c
 | `group` | Force grouping even when spawning a single agent. Useful when you know more agents will follow. |
 
 **Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
+
+Groups track invocations, not reusable agent IDs, so a resumed run cannot overwrite an older member's unread completion. Consumed members still count as finished but are excluded from the notice.
 
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode

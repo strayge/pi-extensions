@@ -245,7 +245,9 @@ describe("messaging a finished agent", () => {
 
     const [message] = vi.mocked(pi.sendMessage).mock.calls[0];
     expect(message.content).toContain("second answer");
-    expect(message.content).not.toContain("<tool-use-id>");
+    const resumed = String(message.content).match(/<task-notification>[\s\S]*?<\/task-notification>/g)
+      ?.find(block => block.includes("second answer"));
+    expect(resumed).not.toContain("<tool-use-id>");
 
   });
 

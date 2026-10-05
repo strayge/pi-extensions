@@ -15,7 +15,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Context } from "@earendil-works/pi-ai";
+import { type Context, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agentCall,
@@ -43,6 +43,94 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     await run?.dispose();
     run = undefined;
     for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it.each([
+    { label: "delivers unread completion", consume: false },
+    { label: "suppresses a consumed completion", consume: true },
+  ])("$label before the parent stops, without the host hold patch", async ({ consume }) => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-native-notification-"));
+    tmpDirs.push(cwd);
+    mkdirSync(join(cwd, ".pi"));
+    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({
+      schedulingEnabled: false, workflowsEnabled: false,
+      outputTranscript: false, defaultJoinMode: "async",
+    }));
+    const workFile = join(cwd, "parent-work.txt");
+    writeFileSync(workFile, "Parent work continues.");
+    let parentCalls = 0;
+    run = await runPrintMode({
+      cwd,
+      hold: false,
+      prompt: "Delegate, then keep working before your final answer.",
+      respond: async context => {
+        if (!contextToolNames(context).includes("Agent")) return "TIMELY-COMPLETION";
+        parentCalls++;
+        if (parentCalls === 1) return agentCall({
+          description: "Concurrent child", prompt: "Finish the child task.", run_in_background: true,
+        });
+        if (parentCalls === 2) {
+          await (globalThis as any)[Symbol.for("pi-subagents:manager")].waitForAll();
+          if (consume) {
+            const id = /Agent ID: ([\w-]+)/.exec(JSON.stringify(context.messages))![1];
+            return fauxToolCall("get_subagent_result", { agent_id: id });
+          }
+          return fauxToolCall("read", { path: workFile });
+        }
+        expect(JSON.stringify(context.messages)).toContain("TIMELY-COMPLETION");
+        return "PARENT-DONE";
+      },
+    });
+    expect(run.responseText).toBe("PARENT-DONE");
+    expect(parentCalls).toBe(3);
+    const notifications = run.parentSession.sessionManager.getBranch().filter(entry =>
+      entry.type === "custom_message" && entry.customType === "subagent-notification",
+    );
+    expect(notifications).toHaveLength(consume ? 0 : 1);
+  });
+
+  it("a detached completion starts a fresh model turn after parent cancellation", async () => {
+    let releaseChild!: (value: string) => void;
+    const childReply = new Promise<string>(resolve => { releaseChild = resolve; });
+    let releaseParent!: (value: string) => void;
+    const parentReply = new Promise<string>(resolve => { releaseParent = resolve; });
+    let parentWorking!: () => void;
+    const working = new Promise<void>(resolve => { parentWorking = resolve; });
+    const controller = new AbortController();
+    let parentCalls = 0;
+    const running = runPrintMode({
+      hold: false,
+      signal: controller.signal,
+      prompt: "Delegate and continue working.",
+      respond: context => {
+        if (!contextToolNames(context).includes("Agent")) return childReply;
+        parentCalls++;
+        if (parentCalls === 1) return agentCall({
+          description: "Detached child", prompt: "Finish independently.", run_in_background: true,
+        });
+        if (parentCalls === 2) {
+          parentWorking();
+          return parentReply;
+        }
+        expect(JSON.stringify(context.messages)).toContain("AFTER-CANCEL-RESULT");
+        return "AFTER-CANCEL-DONE";
+      },
+    });
+    try {
+      await working;
+      controller.abort();
+      releaseParent("CANCELLED-PARENT");
+      run = await running;
+      expect(run.manager?.hasRunning()).toBe(true);
+      releaseChild("AFTER-CANCEL-RESULT");
+      await vi.waitFor(() => {
+        expect(JSON.stringify(run!.parentSession.messages)).toContain("AFTER-CANCEL-DONE");
+      }, { timeout: 5_000 });
+      expect(parentCalls).toBe(3);
+    } finally {
+      releaseParent("cleanup");
+      releaseChild("cleanup");
+    }
   });
 
   // The one assumption the model/thinking display rests on, checked against a

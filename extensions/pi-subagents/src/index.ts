@@ -12,7 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { type AgentBeforeSettleEvent, type CustomMessageEntryDraft, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { waitForTerminalRecord } from "./abortable.js";
@@ -446,82 +446,208 @@ export default function (pi: ExtensionAPI) {
   }
   const pendingUsage = new PendingUsagePool();
 
-  // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
+  // Pending messages stay retractable until a turn boundary or an idle wake-up.
   const NUDGE_HOLD_MS = 200;
-  // A queued result wait must observe completion before its held notification
-  // can fire, so successful waits can still suppress that redundant nudge.
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
+  const pendingNudges = new Map<string, {
+    build: () => CustomMessageEntryDraft | undefined;
+    ready: boolean;
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
+  let notificationsClosed = false;
+  let parentActive = false;
+  let idleWakePending = false;
+  let idleRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
-      pendingNudges.delete(key);
-      try { send(); } catch { /* ignore stale completion side-effect errors */ }
-    }, delay));
+  type AgentNotificationRun = {
+    id: string;
+    source: AgentRecord;
+    consumed: boolean;
+    delivered: boolean;
+    settled: boolean;
+    completion?: {
+      entryId?: string;
+      completedAt: number;
+      content: string;
+      groupContent: string;
+      details: NotificationDetails;
+      groupDetails: NotificationDetails;
+    };
+  };
+  let nextNotificationRun = 0;
+  const agentNotificationRuns = new WeakMap<AgentRecord, AgentNotificationRun>();
+  const undeliveredAgentRuns = new Map<string, AgentNotificationRun>();
+
+  /** Invocation identity must survive timestamp collisions and same-ID resumes. */
+  function notificationRun(record: AgentRecord): AgentNotificationRun {
+    let run = agentNotificationRuns.get(record);
+    if (!run || (run.settled && (record.status === "running" || record.status === "queued"))) {
+      run = { id: `agent-run:${++nextNotificationRun}`, source: record, consumed: false, delivered: false, settled: false };
+      agentNotificationRuns.set(record, run);
+    }
+    return run;
   }
 
   function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
+    const nudge = pendingNudges.get(key);
+    if (nudge?.timer !== undefined) clearTimeout(nudge.timer);
+    pendingNudges.delete(key);
+  }
+
+  /** Reading one invocation must not consume earlier unread invocations. */
+  function consumeNotificationRun(run: AgentNotificationRun) {
+    run.consumed = true;
+    undeliveredAgentRuns.delete(run.id);
+    cancelNudge(run.id);
+  }
+
+  function consumeCurrentNotification(record: AgentRecord) {
+    const run = agentNotificationRuns.get(record);
+    if (run) {
+      run.settled = true;
+      consumeNotificationRun(run);
     }
   }
 
-  // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
-
-    const notification = formatTaskNotification(record, 500, showCost);
-    const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
-
-    pi.sendMessage<NotificationDetails>({
-      customType: "subagent-notification",
-      content: notification + footer,
-      display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+  function consumeHistoricalNotification(entryId: string) {
+    for (const run of undeliveredAgentRuns.values()) {
+      if (run.completion?.entryId === entryId) consumeNotificationRun(run);
+    }
   }
 
-  function sendIndividualNudge(record: AgentRecord) {
-    agentActivity.delete(record.id);
-    widget.markFinished(record.id);
-    fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+  function unreadNotification(run: AgentNotificationRun): boolean {
+    if (agentNotificationRuns.get(run.source) === run && run.source.resultConsumed) consumeNotificationRun(run);
+    return !!run.completion && !run.consumed && !run.delivered;
+  }
+
+  function notificationContent(run: AgentNotificationRun, group: boolean): string {
+    const completion = run.completion!;
+    const previous = agentNotificationRuns.get(run.source) !== run;
+    const prefix = previous
+      ? `Earlier run of agent ${run.source.id} completed at ${new Date(completion.completedAt).toISOString()}. `
+        + "Result lookup by this ID refers to the current/latest run, not this earlier preview.\n\n"
+      : "";
+    return prefix + (group ? completion.groupContent : completion.content);
+  }
+
+  function notificationDetails(run: AgentNotificationRun, group: boolean): NotificationDetails {
+    const details = { ...(group ? run.completion!.groupDetails : run.completion!.details) };
+    if (agentNotificationRuns.get(run.source) !== run) details.description += " (earlier run)";
+    return details;
+  }
+
+  function markNotificationDelivered(run: AgentNotificationRun) {
+    run.delivered = true;
+    undeliveredAgentRuns.delete(run.id);
+  }
+
+  function drainNudges(includeHeld: boolean): CustomMessageEntryDraft[] {
+    const entries: CustomMessageEntryDraft[] = [];
+    for (const [key, nudge] of [...pendingNudges]) {
+      if (!includeHeld && !nudge.ready) continue;
+      cancelNudge(key);
+      const entry = nudge.build();
+      if (entry) entries.push(entry);
+    }
+    return entries;
+  }
+
+  /** Idle messages are appended together before exactly one model wake-up. */
+  function flushIdleNudges() {
+    if (notificationsClosed || idleWakePending || pendingNudges.size === 0) return;
+    try {
+      if (!(currentCtx?.isIdle?.() ?? !parentActive)) {
+        // Manual compaction can be busy without producing an agent settlement event.
+        if (!parentActive && idleRetryTimer === undefined) {
+          idleRetryTimer = setTimeout(() => {
+            idleRetryTimer = undefined;
+            flushIdleNudges();
+          }, NUDGE_HOLD_MS);
+        }
+        return;
+      }
+      const entries = drainNudges(false);
+      if (entries.length === 0) return;
+      idleWakePending = true;
+      for (const [i, entry] of entries.entries()) {
+        pi.sendMessage(entry, { deliverAs: "followUp", triggerTurn: i === entries.length - 1 });
+      }
+    } catch { /* a disposed runtime can invalidate a delayed completion callback */ }
+  }
+
+  function scheduleNudge(key: string, build: () => CustomMessageEntryDraft | undefined) {
+    if (notificationsClosed) return;
+    cancelNudge(key);
+    const nudge = { build, ready: false, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+    pendingNudges.set(key, nudge);
+    nudge.timer = setTimeout(() => {
+      nudge.timer = undefined;
+      nudge.ready = true;
+      flushIdleNudges();
+    }, NUDGE_HOLD_MS);
+  }
+
+  function deliverAtBoundary(event: TurnEndEvent | AgentBeforeSettleEvent, ctx: ExtensionContext) {
+    if (notificationsClosed || event.outcome !== "completed" || ctx.signal?.aborted) return;
+    if (batchFinalizeTimer !== undefined) {
+      clearTimeout(batchFinalizeTimer);
+      finalizeBatch();
+    }
+    const entries = drainNudges(true);
+    if (entries.length > 0) return { entries: [...event.entries, ...entries], continue: true };
+  }
+
+  pi.on("agent_start", () => { parentActive = true; idleWakePending = false; });
+  pi.on("turn_end", deliverAtBoundary);
+  pi.on("agent_before_settle", deliverAtBoundary);
+  pi.on("agent_settled", () => { parentActive = false; flushIdleNudges(); });
+
+  function sendIndividualNudge(run: AgentNotificationRun) {
+    agentActivity.delete(run.source.id);
+    widget.markFinished(run.source.id);
+    fleet.onAgentFinished(run.source.id);
+    scheduleNudge(run.id, () => {
+      if (!unreadNotification(run)) return;
+      const entry: CustomMessageEntryDraft = {
+        type: "custom_message",
+        customType: "subagent-notification",
+        content: notificationContent(run, false),
+        display: true,
+        details: notificationDetails(run, false),
+      };
+      markNotificationDelivered(run);
+      return entry;
+    });
     widget.update();
   }
 
-  // ---- Group join manager ----
-  const groupJoin = new GroupJoinManager(
-    (records, partial) => {
-      for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
-
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) { widget.update(); return; }
-
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
+  const groupJoin = new GroupJoinManager<AgentNotificationRun>(
+    (runs, partial) => {
+      for (const run of runs) {
+        agentActivity.delete(run.source.id);
+        widget.markFinished(run.source.id);
+        fleet.onAgentFinished(run.source.id);
+      }
+      scheduleNudge(`group:${runs.map(run => run.id).join(",")}`, () => {
+        const unread = runs.filter(unreadNotification);
+        if (unread.length === 0) return;
         const label = partial
-          ? `${unconsumed.length} agent(s) finished (partial — others still running)`
-          : `${unconsumed.length} agent(s) finished`;
-
-        const [first, ...rest] = unconsumed;
-        const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
-        if (rest.length > 0) {
-          details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
-        }
-
-        pi.sendMessage<NotificationDetails>({
+          ? `${unread.length} agent(s) finished (partial — others still running)`
+          : `${unread.length} agent(s) finished`;
+        const [first, ...rest] = unread;
+        const details = notificationDetails(first, true);
+        if (rest.length > 0) details.others = rest.map(run => notificationDetails(run, true));
+        const entry: CustomMessageEntryDraft = {
+          type: "custom_message",
           customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+          content: `Background agent group completed: ${label}\n\n`
+            + unread.map(run => notificationContent(run, true)).join("\n\n")
+            + "\n\nUse get_subagent_result for the current/latest run's full output.",
           display: true,
           details,
-        }, { deliverAs: "followUp", triggerTurn: true });
+        };
+        for (const run of unread) markNotificationDelivered(run);
+        return entry;
       });
       widget.update();
     },
@@ -583,18 +709,40 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
+    const run = notificationRun(record);
+    run.settled = true;
     // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
+    const savedRecord = {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
       ...(record.modelProgressWatchdog !== undefined && {
         modelProgressWatchdog: record.modelProgressWatchdog,
       }),
-    });
+    };
+    pi.appendEntry("subagents:record", savedRecord);
+    run.completion = {
+      completedAt: record.completedAt ?? Date.now(),
+      content: formatTaskNotification(record, 500, showCost)
+        + (record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : ""),
+      groupContent: formatTaskNotification(record, 300, showCost),
+      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
+      groupDetails: buildNotificationDetails(record, 300, agentActivity.get(record.id)),
+    };
+    const branch = currentCtx?.sessionManager.getBranch() ?? [];
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const entry = branch[i];
+      if (entry.type === "custom" && entry.data === savedRecord) {
+        run.completion.entryId = entry.id;
+        break;
+      }
+    }
+    run.consumed ||= record.resultConsumed === true;
+    if (!run.consumed && !notificationsClosed) undeliveredAgentRuns.set(run.id, run);
 
-    // Skip notification if result was already consumed via get_subagent_result
-    if (record.resultConsumed) {
+    // Consumed members still finish their group, without producing a notice.
+    if (run.consumed) {
+      if (groupJoin.isGrouped(run.id)) groupJoin.onAgentComplete(run);
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
       fleet.onAgentFinished(record.id);
@@ -604,20 +752,21 @@ export default function (pi: ExtensionAPI) {
 
     // If this agent is pending batch finalization (debounce window still open),
     // don't send an individual nudge — finalizeBatch will pick it up retroactively.
-    if (currentBatchAgents.some(a => a.id === record.id)) {
+    if (currentBatchAgents.some(a => a.run === run)) {
       widget.update();
       return;
     }
 
-    const result = groupJoin.onAgentComplete(record);
+    const result = groupJoin.onAgentComplete(run);
     if (result === 'pass') {
-      sendIndividualNudge(record);
+      sendIndividualNudge(run);
     }
     // 'held' → do nothing, group will fire later
     // 'delivered' → group callback already fired
     widget.update();
   }, undefined, (record) => {
     if (!isTopLevelAgent(record)) return;
+    notificationRun(record);
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
     if (currentCtx?.hasUI) {
@@ -834,7 +983,7 @@ export default function (pi: ExtensionAPI) {
             if (!record || record.parentAgentId) return false;
             if (record.status === "running" || record.status === "queued") return false;
             record.resultConsumed = true;
-            cancelNudge(record.id);
+            consumeCurrentNotification(record);
             return true;
           },
         },
@@ -1131,9 +1280,14 @@ export default function (pi: ExtensionAPI) {
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
+    notificationsClosed = true;
+    for (const key of pendingNudges.keys()) cancelNudge(key);
+    if (idleRetryTimer !== undefined) clearTimeout(idleRetryTimer);
+    if (batchFinalizeTimer !== undefined) clearTimeout(batchFinalizeTimer);
+    currentBatchAgents = [];
+    undeliveredAgentRuns.clear();
+    groupJoin.dispose();
     manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
     fleet.dispose();
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
@@ -1245,7 +1399,7 @@ export default function (pi: ExtensionAPI) {
   // Uses a debounced timer: each new agent resets the 100ms window so that all
   // parallel tool calls (which may be dispatched across multiple microtasks by the
   // framework) are captured in the same batch.
-  let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
+  let currentBatchAgents: { run: AgentNotificationRun; joinMode: JoinMode }[] = [];
   let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
   let batchCounter = 0;
 
@@ -1258,27 +1412,15 @@ export default function (pi: ExtensionAPI) {
     const smartAgents = batchAgents.filter(a => a.joinMode === 'smart' || a.joinMode === 'group');
     if (smartAgents.length >= 2) {
       const groupId = `batch-${++batchCounter}`;
-      const ids = smartAgents.map(a => a.id);
-      groupJoin.registerGroup(groupId, ids);
-      // Retroactively process agents that already completed during the debounce window.
-      // Their onComplete fired but was deferred (agent was in currentBatchAgents),
-      // so we feed them into the group now.
-      for (const id of ids) {
-        const record = manager.getRecord(id);
-        if (!record) continue;
-        record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
-          groupJoin.onAgentComplete(record);
-        }
+      groupJoin.registerGroup(groupId, smartAgents.map(a => a.run.id));
+      for (const { run } of smartAgents) {
+        cancelNudge(run.id);
+        if (agentNotificationRuns.get(run.source) === run) run.source.groupId = groupId;
+        if (run.completion) groupJoin.onAgentComplete(run);
       }
     } else {
-      // No group formed — send individual nudges for any agents that completed
-      // during the debounce window and had their notification deferred.
-      for (const { id } of batchAgents) {
-        const record = manager.getRecord(id);
-        if (record?.completedAt != null && !record.resultConsumed) {
-          sendIndividualNudge(record);
-        }
+      for (const { run } of batchAgents) {
+        if (unreadNotification(run)) sendIndividualNudge(run);
       }
     }
   }
@@ -1330,7 +1472,7 @@ export default function (pi: ExtensionAPI) {
     // resume must behave the same. Passing it would abort this agent when
     // the parent turn is interrupted (user Esc), while agents started with
     // run_in_background in that same turn keep going.
-    const record = await manager.resume(id, prompt, undefined, {
+    const resume = manager.resume(id, prompt, undefined, {
       isBackground: true,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
@@ -1345,10 +1487,12 @@ export default function (pi: ExtensionAPI) {
         }
       },
     });
+    notificationRun(existing);
+    const record = await resume;
     if (!record) return undefined;
 
     if (joinMode != null && joinMode !== 'async') {
-      currentBatchAgents.push({ id, joinMode });
+      currentBatchAgents.push({ run: notificationRun(record), joinMode });
       if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
       batchFinalizeTimer = setTimeout(finalizeBatch, 100);
     }
@@ -2035,10 +2179,14 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const resume = manager.resume(params.resume, params.prompt, signal);
+        notificationRun(existing);
+        const record = await resume;
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
+        record.resultConsumed = true;
+        consumeCurrentNotification(record);
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
@@ -2108,9 +2256,9 @@ Terse command-style prompts produce shallow, generic work.
 
         if (joinMode == null || joinMode === 'async') {
           // Foreground/no join mode or explicit async — not part of any batch
-        } else {
+        } else if (record) {
           // smart or group — add to current batch
-          currentBatchAgents.push({ id, joinMode });
+          currentBatchAgents.push({ run: notificationRun(record), joinMode });
           // Debounce: reset timer on each new agent so parallel tool calls
           // dispatched across multiple event loop ticks are captured together
           if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
@@ -2399,34 +2547,30 @@ Terse command-style prompts produce shallow, generic work.
     }
   }
 
-  /**
-   * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, delivered as a follow-up that
-   * triggers a turn, rendered by the existing `subagent-notification` renderer.
-   */
+  /** Workflow completions must share the same safe delivery boundary as agents. */
   function notifyWorkflowFinished(task: WorkflowTask) {
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
-    scheduleNudge(task.id, () => {
-      pi.sendMessage<NotificationDetails>({
-        customType: "subagent-notification",
-        content: formatWorkflowNotification(task),
-        display: true,
-        details: {
-          id: task.id,
-          description: `Workflow ${task.workflowName ?? task.id}`,
-          status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
-          toolUses: task.totalToolCalls,
-          // A workflow has agents, not turns; rendering "turns: 0" would be noise.
-          turnCount: 0,
-          totalTokens: task.totalTokens,
-          durationMs: elapsedMs(task, Date.now()),
-          error: task.error,
-          resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
-        },
-      }, { deliverAs: "followUp", triggerTurn: true });
-    });
+    const notification: CustomMessageEntryDraft = {
+      type: "custom_message",
+      customType: "subagent-notification",
+      content: formatWorkflowNotification(task),
+      display: true,
+      details: {
+        id: task.id,
+        description: `Workflow ${task.workflowName ?? task.id}`,
+        status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
+        toolUses: task.totalToolCalls,
+        // A workflow has agents, not turns; rendering "turns: 0" would be noise.
+        turnCount: 0,
+        totalTokens: task.totalTokens,
+        durationMs: elapsedMs(task, Date.now()),
+        error: task.error,
+        resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
+      } satisfies NotificationDetails,
+    };
+    scheduleNudge(task.id, () => notification);
   }
 
   // Defined unconditionally, registered only when the feature is on — the same
@@ -2818,6 +2962,7 @@ Terse command-style prompts produce shallow, generic work.
           if (params.verbose) {
             output += "\n\nFull conversation is unavailable for historical results; the child session is not reopened.";
           }
+          consumeHistoricalNotification(entry.id);
           return textResult(output);
         }
         return textResult(`Agent not found: "${params.agent_id}". No saved completion is available for this exact ID on the current parent-session branch.`);
@@ -2864,7 +3009,7 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        consumeCurrentNotification(record);
       }
 
       // Verbose: include full conversation

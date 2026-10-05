@@ -17,6 +17,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
@@ -967,6 +968,29 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(card).toContain("done");
   });
 
+  it("delivers workflows at a busy-parent boundary rather than queuing a follow-up", async () => {
+    const ctx = workflowCtx();
+    await booted.lifecycle.get("agent_start")?.({}, ctx);
+    const result = await tools.get("SubagentWorkflow").execute("tc-busy", {
+      script: `${inlineScript}return "BOUNDARY-RESULT";\n`,
+    }, undefined, undefined, ctx);
+    await vi.waitFor(() => {
+      const card = tools.get("SubagentWorkflow")
+        .renderResult(result, { expanded: false, isPartial: false }, plainTheme, { isError: false });
+      expect(String(card.text)).toContain("· done");
+    });
+    expect(booted.pi.sendMessage).not.toHaveBeenCalled();
+    const delivered = await booted.lifecycle.get("turn_end")?.({
+      entries: [], continue: false, outcome: "completed",
+    }, ctx);
+    expect(delivered.continue).toBe(true);
+    expect(delivered.entries).toHaveLength(1);
+    expect(delivered.entries[0].content).toContain("BOUNDARY-RESULT");
+    expect(await booted.lifecycle.get("agent_before_settle")?.({
+      entries: [], continue: false, outcome: "completed",
+    }, ctx)).toBeUndefined();
+  });
+
   /** Wait for the completion notification a background run sends for `taskId`. */
   async function awaitNotification(taskId: string) {
     await vi.waitFor(
@@ -984,16 +1008,23 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   it("kills a still-running workflow (and its worker thread) on session shutdown", async () => {
     // A never-returning script: only the run's own abort signal can stop it, so
     // abortAll() over the agent records would leave the worker spinning.
+    const terminate = vi.spyOn(Worker.prototype, "terminate");
     const result = await tools.get("SubagentWorkflow").execute(
       "tc-shutdown",
-      { script: `${inlineScript}await new Promise(() => {});\n` },
+      { script: `${inlineScript}log("shutdown-worker-started"); await new Promise(() => {});\n` },
       undefined, undefined, workflowCtx(),
     );
 
+    await vi.waitFor(() => {
+      const card = tools.get("SubagentWorkflow")
+        .renderResult(result, { expanded: false, isPartial: false }, plainTheme, { isError: false });
+      expect(String(card.text)).toContain("shutdown-worker-started");
+    });
     await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
-
-    const sent = await awaitNotification(startedTaskId(result));
-    expect(String(sent[0].content)).toContain("<status>Stopped</status>");
+    await vi.waitFor(() => expect(terminate).toHaveBeenCalled());
+    await Promise.all(terminate.mock.results.map(result => result.value));
+    await new Promise(resolve => setTimeout(resolve, 250));
+    expect(booted.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {

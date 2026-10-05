@@ -8,12 +8,12 @@
 
 import type { AgentRecord } from "./types.js";
 
-export type DeliveryCallback = (records: AgentRecord[], partial: boolean) => void;
+export type DeliveryCallback<T extends { id: string } = AgentRecord> = (records: T[], partial: boolean) => void;
 
-interface AgentGroup {
+interface AgentGroup<T> {
   groupId: string;
   agentIds: Set<string>;
-  completedRecords: Map<string, AgentRecord>;
+  completedRecords: Map<string, T>;
   timeoutHandle?: ReturnType<typeof setTimeout>;
   delivered: boolean;
   /** Shorter timeout for stragglers after a partial delivery. */
@@ -25,18 +25,18 @@ const DEFAULT_TIMEOUT = 30_000;
 /** Straggler re-batch timeout: 15s. */
 const STRAGGLER_TIMEOUT = 15_000;
 
-export class GroupJoinManager {
-  private groups = new Map<string, AgentGroup>();
+export class GroupJoinManager<T extends { id: string } = AgentRecord> {
+  private groups = new Map<string, AgentGroup<T>>();
   private agentToGroup = new Map<string, string>();
 
   constructor(
-    private deliverCb: DeliveryCallback,
+    private deliverCb: DeliveryCallback<T>,
     private groupTimeout = DEFAULT_TIMEOUT,
   ) {}
 
   /** Register a group of agent IDs that should be joined. */
   registerGroup(groupId: string, agentIds: string[]): void {
-    const group: AgentGroup = {
+    const group: AgentGroup<T> = {
       groupId,
       agentIds: new Set(agentIds),
       completedRecords: new Map(),
@@ -56,7 +56,7 @@ export class GroupJoinManager {
    * - 'held'      — result held, waiting for group completion
    * - 'delivered'  — this completion triggered the group notification
    */
-  onAgentComplete(record: AgentRecord): 'delivered' | 'held' | 'pass' {
+  onAgentComplete(record: T): 'delivered' | 'held' | 'pass' {
     const groupId = this.agentToGroup.get(record.id);
     if (!groupId) return 'pass';
 
@@ -82,7 +82,7 @@ export class GroupJoinManager {
     return 'held';
   }
 
-  private onTimeout(group: AgentGroup): void {
+  private onTimeout(group: AgentGroup<T>): void {
     if (group.delivered) return;
     group.timeoutHandle = undefined;
 
@@ -107,7 +107,7 @@ export class GroupJoinManager {
     // Timeout will be started when the next straggler completes
   }
 
-  private deliver(group: AgentGroup, partial: boolean): void {
+  private deliver(group: AgentGroup<T>, partial: boolean): void {
     if (group.timeoutHandle) {
       clearTimeout(group.timeoutHandle);
       group.timeoutHandle = undefined;
