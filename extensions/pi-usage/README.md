@@ -2,7 +2,8 @@
 
 Provider usage for [pi](https://github.com/earendil-works/pi): how much of the
 current account's quota is left, in the statusline and behind `/usage`.
-`/speed` separately reports historical model-request speed without live queries.
+`/speed` reports historical model-request speed; a separate `speed` statusline
+item shows the current session's median. Neither makes live queries.
 
 Supports OpenAI ChatGPT subscription windows for `/login openai` (`openai`)
 and legacy `openai-codex` sessions, OpenRouter API-key spend limits, and OpenCode
@@ -27,7 +28,7 @@ pi -e ./src/index.ts
 | Command | Effect |
 | --- | --- |
 | `/usage` | Show current usage, historical usage, refresh, saved-reset, and display actions |
-| `/speed [range]` | Show one historical model-speed table; select a range when omitted |
+| `/speed [range]` | Show historical model speed with an inline range selector; defaults to `1d` |
 
 `/usage` takes no arguments — history, refresh, and display options are menu
 actions, not flags. `/speed` accepts `1d`, `2d`, `3d`, `5d`, `7d`, or `14d`.
@@ -141,6 +142,29 @@ change in `/usage` does, because it runs the same code.
 
 The quota itself is tinted past 70% and 90% spent, which a statusline that
 understands per-segment colors will show; the countdown beside it is left alone.
+
+### Current-session speed
+
+A separate `speed` item shows **median effective output tokens/second** for the
+selected provider/model, for example `123.4 tok/s`. It works independently of
+quota-provider support and can be placed in `/statusline` as:
+
+```jsonc
+{ "type": "slot", "id": "speed" }
+```
+
+Without an explicit placement it appears with the other extension statuses,
+including in the stock footer. It stays hidden until there is a usable measured
+request. The value uses the current session's **selected branch and ancestors**,
+combines reasoning levels, and excludes abandoned branches and subagents. It
+updates after persisted responses, on model/branch changes, and on session
+start or resume; reloading does not reset its history.
+
+The calculation and success/timing filters match `/speed`: output tokens include
+reasoning and are divided by approximate whole-request time, excluding tool
+execution. This is a median of individual request rates, not pure generation
+speed or a ratio of totals. Only the in-memory branch is read; there are no new
+history scans, provider requests, or telemetry writes.
 
 ## Display options
 
@@ -368,16 +392,17 @@ discoverable, and ephemeral compaction work is absent from `.output`.
 
 ## Historical model speed
 
-Run `/speed` to select a range, or use `/speed 7d` directly. A single table groups
-requests by exact provider/model, requested thinking level, and explicit versus
-inferred effort. `*` marks effort inferred from the nearest ancestor
-`thinking_level_change` on that request's branch. Explicit message metadata wins;
-unknown effort stays unknown. Explicit and inferred groups are never merged.
+Run `/speed` to open the `1d` report, or `/speed 7d` to start on another range.
+The range selector stays above the results; Left/Right changes the range
+immediately without reloading history. Each exact provider/model has one row,
+combining reasoning levels. Models without usable measurements in the selected
+period are omitted.
 
-The table shows observed sample counts (`N now/prev`), selected-period median
-effective output tokens/second, median whole-request seconds, and **Trend**.
-Up/Down and PageUp/PageDown scroll; Left/Right reveals columns on narrow terminals;
-Escape closes. UI-capable non-terminal clients receive the same table in a dialog.
+The table shows median effective output tokens/second, **total output tokens**,
+**total request time**, and **Trend**. Totals cover the same measured requests as
+the speed calculation, not failed or untimed calls. Up/Down and PageUp/PageDown
+scroll; Shift+Left/Right reveals columns on narrow terminals; Escape closes.
+UI-capable non-terminal clients receive the table and range choices in one dialog.
 Nothing is posted into model context.
 
 The report reuses historical usage discovery and deduplication across **all
@@ -396,7 +421,9 @@ embedded message-start and later session-entry timestamps. It approximates the
 extension-handler overhead, but excluding subsequent tool execution. It is not
 time-to-first-token or intrinsic generation-phase speed. Output tokens already
 include reasoning tokens; the rate is `output / elapsed seconds`. The table takes
-medians of per-request rates and durations, not a ratio of summed tokens and time.
+the median of per-request rates, not a ratio of summed tokens and time. Total
+request time sums those measured durations; concurrent requests overlap, so it
+is not wall-clock active time or pure generation time.
 
 Only successful `stop` and `toolUse` responses with positive finite elapsed time
 and output tokens contribute to observations or comparison cohorts. `length`,
@@ -414,28 +441,33 @@ history horizon.
 
 Within each table row, comparable cohorts also match:
 
+- requested thinking level and explicit versus inferred effort provenance;
 - approximate context (`input + cacheRead + cacheWrite`): `<16k`, `16–64k`,
   `64–128k`, `≥128k`;
 - output size: `<500`, `500–2k`, `2–8k`, `≥8k`;
 - response stop/type (`stop` versus `toolUse`).
+
+Effort comes from explicit message metadata or, when missing, the nearest ancestor
+`thinking_level_change` on that request's branch. Unknown effort matches only
+unknown; inferred and explicit effort stay separate for comparisons, even though
+the overview pools them. This avoids treating a changed reasoning mix as a speed
+change.
 
 Here `k` means 1,000 tokens. Each cohort needs **at least 10 observed requests in
 each period**. Its percentage change is
 `(current median rate / previous median rate - 1) × 100`.
 Trend shows that percentage for one eligible cohort, or the minimum…maximum
 percentage changes and cohort count for several; it never averages them into one
-aggregate. Without an eligible cohort it says `insufficient`, even if the row's
-overall sample counts are large. Row counts include all observed requests, not
-only matched cohorts.
+aggregate. Without an eligible cohort it says `insufficient`, even if the row has
+many measurements. Row totals include all observed requests, not only matched
+cohorts.
 
 Changes are descriptive observations, not higher/lower/stable verdicts,
 statistical confidence claims, controlled benchmarks, or model recommendations.
-Coarse bins cannot control workload, cache effects, provider routing/load,
-reasoning mix, or network changes. The coverage line counts selected-period,
-attributed, timestamped assistant usage records: observed, unsuccessful, untimed,
-and no usable output. Malformed usage or unresolvable routes may be absent from
-those counts and produce warnings; undated warnings are explicitly unscoped.
-Discovery, missing/unflushed files, and ambiguous deduplication limit completeness.
+Coarse bins cannot control workload, cache effects, provider routing/load, or
+network changes. The compact report omits coverage and warning details. Malformed
+usage, unresolvable routes, discovery gaps, missing/unflushed files, and ambiguous
+deduplication limit completeness.
 
 ## Usage snapshots
 

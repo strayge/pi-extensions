@@ -100,6 +100,8 @@ test("pi-usage registers usage and speed with its existing lifecycle hooks", () 
     "session_shutdown",
     "session_start",
     "session_tree",
+    "tool_execution_start",
+    "turn_end",
     "turn_start",
   ]);
 });
@@ -1357,7 +1359,7 @@ test("a report is never served across accounts", async (t) => {
   assert.equal(fetches, 2);
 });
 
-test("/speed selects or accepts a preset without auth, quota fetches, snapshots, or status changes", async (t) => {
+test("/speed opens results directly and changes range without reloading or live side effects", async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => {
     globalThis.fetch = originalFetch;
@@ -1383,19 +1385,22 @@ test("/speed selects or accepts a preset without auth, quota fetches, snapshots,
       modelRegistry: { getProviderAuth: async () => assert.fail("speed must not resolve auth") },
       select: async (title: string, options: string[]) => {
         selections.push(title);
-        if (title.startsWith("Speed range")) {
-          assert.deepEqual(options, ["1d", "2d", "3d", "5d", "7d", "14d"]);
-          return "2d";
-        }
-        assert.deepEqual(options, ["Close"]);
-        assert.match(title, args ? /7d vs previous 7d/ : /2d vs previous 2d/);
+        assert.deepEqual(options, ["1d", "2d", "3d", "5d", "7d", "14d", "Close"]);
+        assert.match(
+          title,
+          selections.length === 1
+            ? args
+              ? /7d vs previous 7d/
+              : /1d vs previous 1d/
+            : /14d vs previous 14d/,
+        );
         assert.match(title, /Provider\/model/);
-        return "Close";
+        return selections.length === 1 ? "14d" : "Close";
       },
     });
     await mock.commands.get("speed")?.handler(args, ctx);
     assert.equal(loads, 1);
-    assert.equal(selections.length, args ? 1 : 2);
+    assert.equal(selections.length, 2);
     assert.equal(loadSignal?.aborted, true);
     assert.equal(statuses.size, 0);
     assert.deepEqual(notifications, []);
@@ -1405,7 +1410,7 @@ test("/speed selects or accepts a preset without auth, quota fetches, snapshots,
   }
 });
 
-test("/speed rejects invalid arguments and no-UI contexts before loading; cancelling selection does not load", async () => {
+test("/speed rejects invalid arguments and no-UI contexts before loading", async () => {
   const mock = createMockPi();
   usageExtension(mock.pi, { load: async () => assert.fail("must not load"), show: async () => {} });
   for (const args of ["30d", "1d 2d", "invalid"]) {
@@ -1421,18 +1426,6 @@ test("/speed rejects invalid arguments and no-UI contexts before loading; cancel
   const noUI = createMockContext();
   await mock.commands.get("speed")?.handler("1d", noUI.ctx);
   assert.match(noUI.notifications[0]?.message ?? "", /requires an interactive/);
-  let selected = false;
-  const cancelled = createMockContext({
-    hasUI: true,
-    mode: "rpc",
-    select: async () => {
-      selected = true;
-      return undefined;
-    },
-  });
-  await mock.commands.get("speed")?.handler("", cancelled.ctx);
-  assert.equal(selected, true);
-  assert.deepEqual(cancelled.notifications, []);
 });
 
 test("/speed aborts a superseded load and a shutdown load without showing stale results", async () => {

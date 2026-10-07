@@ -43,6 +43,7 @@ import {
   SNAPSHOT_ENTRY_TYPE,
 } from "./snapshot.ts";
 import { SPEED_RANGES, showSpeedReport, speedRange } from "./speed.ts";
+import { registerSpeedStatus } from "./speed-status.ts";
 import { applyUsageSlotOptions, usageSlotDefaults, usageSlotFields } from "./statusline-schema.ts";
 import { publishStatuslineItem, registerStatuslineSlot } from "./statusline-slot.ts";
 import type {
@@ -722,7 +723,7 @@ export default function usageExtension(
       const preset = speedRange(argument);
       if (argument && !preset) {
         ctx.ui.notify(
-          `/speed accepts: ${SPEED_RANGES.join(", ")}, or no argument to select a range.`,
+          `/speed accepts: ${SPEED_RANGES.join(", ")}, or no argument to open the 1d report.`,
           "warning",
         );
         return;
@@ -735,16 +736,7 @@ export default function usageExtension(
       const controller = new AbortController();
       speedController = controller;
       try {
-        const range =
-          preset ??
-          speedRange(
-            (await ctx.ui.select(
-              "Speed range (compared to previous equal period)",
-              [...SPEED_RANGES],
-              { signal: controller.signal },
-            )) ?? "",
-          );
-        if (!range || controller.signal.aborted) return;
+        const range = preset ?? "1d";
         const loaded = await runWithLoader(
           ctx,
           "Loading model speed history…",
@@ -821,6 +813,7 @@ export default function usageExtension(
     failures.clear();
     safeSetStatus(ctx, undefined);
   });
+  registerSpeedStatus(pi);
 }
 
 function availableResetCredits(outcome: QueryOutcome): number {
