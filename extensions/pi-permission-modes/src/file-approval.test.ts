@@ -20,7 +20,11 @@ function fixture(t: { after: (cleanup: () => void) => void }) {
 }
 
 function context(cwd: string, ui: Partial<ExtensionContext["ui"]>): ExtensionContext {
-  return { cwd, hasUI: true, ui } as ExtensionContext;
+  return { cwd, hasUI: true, ui: {
+    ...ui,
+    select: async (...args: Parameters<ExtensionContext["ui"]["select"]>) => args[0].startsWith("Choose directory scope")
+      ? "Enter a path manually…" : ui.select!(...args),
+  } } as ExtensionContext;
 }
 
 const directoryOptions = ["Allow for this session", "Remember for this project", "Save globally", "Edit directory scope", "Deny and block for this session", "Deny"];
@@ -33,8 +37,7 @@ test("directory approval chooses scope and lifetime in one menu", async (t) => {
       select: async (title, options) => {
         prompts++;
         assert.deepEqual(options, directoryOptions);
-        assert.ok(title.includes(`R/W ${f.directory}`));
-        assert.ok(title.includes(f.request.reason));
+        assert.equal(title, `Directory access · Read/write\n\nPath    ${f.directory}\nScope   Directory and all descendants\n\nReason\n${f.request.reason}\n\nNote: Blocking write access does not block reads.\n      Reads still require permission.`);
         return choice;
       },
     }));
@@ -67,17 +70,18 @@ test("edited scope returns to explicit approval and refreshes the creation warni
       prompts++;
       assert.deepEqual(options, directoryOptions);
       if (prompts === 1) {
-        assert.ok(title.includes("The approved directory will be created."));
+        assert.ok(title.includes("On approval\nThe displayed directory will be created."));
         return "Edit directory scope";
       }
       assert.equal(edits, 1);
-      assert.ok(title.includes(`R/W ${f.directory}`));
+      assert.ok(title.includes(`Path       ${f.directory}`));
+      assert.ok(title.includes(`Requested  ${path.join(f.directory, "missing")}`));
       assert.ok(!title.includes("will be created"));
       return "Remember for this project";
     },
     input: async (title, initial) => {
       edits++;
-      assert.equal(title, "Directory scope");
+      assert.ok(title.startsWith("Directory to authorize\n\n"));
       assert.equal(initial, path.join(f.directory, "missing"));
       return "directory";
     },
@@ -96,7 +100,7 @@ test("repeated edits use the current scope and cancellation preserves it", async
   const ask = approvalUI(() => context(f.root, {
     select: async (title) => {
       prompts++;
-      assert.ok(title.includes(prompts === 1 ? f.directory : `R/W ${f.root}`));
+      assert.ok(title.includes(prompts === 1 ? f.directory : `Path       ${f.root}`));
       return prompts <= 3 ? "Edit directory scope" : "Allow for this session";
     },
     input: async (_title, initial) => {
@@ -133,7 +137,8 @@ test("exact-file approval offers global saving without widening the scope", asyn
   const f = fixture(t);
   const ask = approvalUI(() => context(f.root, {
     select: async (title, options) => {
-      assert.ok(title.includes("Exact-file grant"));
+      assert.ok(title.startsWith("File access · Read/write\n\n"));
+      assert.ok(title.includes("Scope   This file only"));
       assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Save globally", "Deny and block for this session", "Deny"]);
       return "Save globally";
     },
@@ -147,7 +152,9 @@ test("path-rule exceptions keep one menu without scope editing", async (t) => {
   const ask = approvalUI(() => context(f.root, {
     select: async (title, options) => {
       prompts++;
-      assert.ok(title.includes(`Separate path-rule exception: R/O ${f.directory}`));
+      assert.ok(title.startsWith("Path-rule exception · Read-only\n\n"));
+      assert.ok(title.includes(`Path    ${f.directory}`));
+      assert.ok(title.includes("This requires separate approval under a path rule."));
       assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Deny and block for this session", "Deny"]);
       return "Allow for this session";
     },
@@ -162,8 +169,8 @@ test("explicit session blocking shows scope and denial semantics without selecti
     const ask = approvalUI(() => context(f.root, {
       select: async (title, options) => {
         assert.ok(options.includes("Deny and block for this session"));
-        assert.ok(title.includes(`Scope: ${scope}`));
-        assert.ok(title.includes(access === "read" ? "R/O denial also denies writes" : "R/W denial blocks writes only"));
+        assert.ok(title.includes(`Scope   ${scope === "file" ? "This file only" : "Directory and all descendants"}`));
+        assert.ok(title.includes(access === "read" ? "Blocking read access also blocks writes" : "Blocking write access does not block reads"));
         return "Deny and block for this session";
       },
     }));
@@ -179,7 +186,7 @@ test("edited blocking returns the binding explicitly displayed in the second men
   const ask = approvalUI(() => context(f.root, {
     select: async (title) => {
       if (++prompts === 1) return "Edit directory scope";
-      assert.ok(title.includes(`R/W ${f.root}`));
+      assert.ok(title.includes(`Path       ${f.root}`));
       return "Deny and block for this session";
     },
     input: async () => f.root,
@@ -213,4 +220,27 @@ test("cancellation during scope editing stops before another approval menu", asy
   }));
   await assert.rejects(ask(f.request, controller.signal), { name: "AbortError" });
   assert.equal(prompts, 1);
+});
+
+test("parent shortcuts return to approval with the requested target and selected scope visible", async (t) => {
+  const f = fixture(t);
+  let prompts = 0;
+  const ctx = { cwd: f.root, hasUI: true, ui: {
+    select: async (title: string, options: string[]) => {
+      prompts++;
+      if (prompts === 1) return "Edit directory scope";
+      if (prompts === 2) {
+        assert.ok(title.startsWith("Choose directory scope"));
+        assert.ok(options.includes(f.root));
+        return f.root;
+      }
+      assert.ok(title.includes(`Path       ${f.root}\nRequested  ${f.directory}`));
+      assert.deepEqual(options, directoryOptions);
+      return "Allow for this session";
+    },
+  } } as unknown as ExtensionContext;
+  assert.deepEqual(await approvalUI(() => ctx)(f.request), {
+    action: "grant", lifetime: "session", directory: f.root, binding: bindPath(f.root),
+  });
+  assert.equal(prompts, 3);
 });

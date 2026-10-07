@@ -143,7 +143,7 @@ test("perm grant detects files without granting their directory and retains ordi
     let prompts = 0;
     f.ctx.ui.select = async (title, options) => {
       prompts++;
-      assert.ok(title.includes("Exact-file grant"));
+      assert.ok(title.startsWith("File access · Read-only\n\n"));
       assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Save globally", "Deny and block for this session", "Deny"]);
       return "Remember for this project";
     };
@@ -157,7 +157,7 @@ test("perm grant detects files without granting their directory and retains ordi
     await f.reloadExtension();
     assert.match(JSON.stringify(await f.execute("read", { path: file })), /GLOBAL-CONFIG/);
     f.ctx.ui.select = async (title, options) => {
-      assert.ok(title.includes("Directory grant"));
+      assert.ok(title.startsWith("Directory access · Read-only\n\n"));
       assert.ok(options.includes("Edit directory scope"));
       return "Allow for this session";
     };
@@ -318,13 +318,23 @@ test("reset removes backed-up legacy state so migration cannot resurrect old aut
   } finally { await f.close(); }
 });
 
-test("cancelled reset leaves policy, state, and active authority untouched", async () => {
+test("init and reset previews explain losses and defaults while cancellation preserves active authority", async () => {
   const f = fixture();
   try {
     await f.start(); writeFileSync(f.state, "saved-state", { mode: 0o600 });
     const before = [f.global, f.projectFile, f.state].map((file) => readFileSync(file, "utf8"));
-    f.confirm(false); await f.reset();
-    assert.deepEqual([f.global, f.projectFile, f.state].map((file) => readFileSync(file, "utf8")), before);
+    let prompts = 0;
+    f.ctx.ui.confirm = async (title, message) => {
+      prompts++;
+      assert.equal(title, "Initialize permission policy v3?");
+      assert.equal(message, "Backed up\nAll user permission policy and state files before reset\n\nDiscarded\nStored approvals across projects. They are not migrated.\n\nUnchanged\nRepository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted");
+      return false;
+    };
+    for (const action of ["init", "reset"]) {
+      await f.perm(action);
+      assert.deepEqual([f.global, f.projectFile, f.state].map((file) => readFileSync(file, "utf8")), before);
+    }
+    assert.equal(prompts, 2);
     assert.equal(await f.blocked(), false);
     assert.ok(!readdirSync(path.dirname(f.global)).some((name) => name.includes("backup")));
   } finally { await f.close(); }

@@ -251,7 +251,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         if (
           !(await ctx.ui.confirm(
             "Initialize permission policy v3?",
-            "All user permission policy/state files will be backed up before reset. Stored approvals across projects are discarded, not migrated. Repository policy files are untouched. New defaults use project filesystem access and unrestricted networking.",
+            "Backed up\nAll user permission policy and state files before reset\n\nDiscarded\nStored approvals across projects. They are not migrated.\n\nUnchanged\nRepository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted",
           ))
         )
           return;

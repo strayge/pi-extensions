@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AskApproval } from "./approvals.ts";
-import { bindPath, modelPath } from "./paths.ts";
+import { editDirectoryScope } from "./directory-scope.ts";
+import { bindPath } from "./paths.ts";
 import type { NetAsk } from "./network.ts";
 
 /** Only the root UI can approve authority; a headless child never silently grants it. */
@@ -11,9 +12,31 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
     signal?.throwIfAborted();
     let directory = request.path;
     let binding = bindPath(directory);
+    const requested = binding.canonical;
     for (;;) {
+      const edited = request.kind === "directory" && directory !== request.path;
+      const field = (label: string, value: string) => label.padEnd(edited ? 11 : 8) + value;
+      const scope = request.kind === "file" || (request.kind === "exception" && request.scope === "file") ? "This file only" : "Directory and all descendants";
+      const blocking = request.access === "read" ? "Blocking read access also blocks writes." : "Blocking write access does not block reads.\n      Reads still require permission.";
+      const title = [
+        `${request.kind === "exception" ? "Path-rule exception" : request.kind === "file" ? "File access" : "Directory access"} · ${request.access === "read" ? "Read-only" : "Read/write"}`,
+        "",
+        field("Path", directory),
+        ...(edited ? [field("Requested", request.path)] : []),
+        field("Scope", scope),
+        "",
+        "Reason",
+        request.reason,
+        "",
+        request.kind === "exception" ? `Note: This requires separate approval under a path rule.\n      ${blocking}` : `Note: ${blocking}`,
+        ...(request.kind === "directory" && binding.missing.length ? [
+          "",
+          "On approval",
+          request.access === "write" ? "The displayed directory will be created.\nBlocking access does not create it." : "Read-only access does not create missing directories.",
+        ] : []),
+      ].join("\n");
       const choice = await ctx.ui.select(
-        `${request.kind === "exception" ? "Separate path-rule exception" : request.kind === "file" ? "Exact-file grant" : "Directory grant"}: ${request.access === "write" ? "R/W" : "R/O"} ${directory}\n${request.reason}\nScope: ${request.kind === "directory" ? "tree" : request.kind === "file" ? "file" : request.scope}. ${request.access === "read" ? "R/O denial also denies writes." : "R/W denial blocks writes only; reads still require ordinary permission."}${request.kind === "directory" && binding.missing.length ? "\nThe approved directory will be created. Blocking never creates a directory." : ""}`,
+        title,
         request.kind === "directory"
           ? ["Allow for this session", "Remember for this project", "Save globally", "Edit directory scope", "Deny and block for this session", "Deny"]
           : request.kind === "file"
@@ -23,10 +46,10 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
       );
       signal?.throwIfAborted();
       if (request.kind === "directory" && choice === "Edit directory scope") {
-        const entered = await ctx.ui.input("Directory scope", directory, { signal });
+        const selected = await editDirectoryScope(ctx, requested, directory, request.access, signal);
         signal?.throwIfAborted();
-        if (entered) {
-          binding = bindPath(modelPath(entered, ctx.cwd));
+        if (selected) {
+          binding = selected;
           directory = binding.canonical;
         }
         continue;

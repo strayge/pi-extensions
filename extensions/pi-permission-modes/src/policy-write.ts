@@ -106,7 +106,7 @@ export class GlobalPolicyWriter {
       const retained = rules.filter((r) => !signatures.includes(JSON.stringify(r)));
       retained.splice(index, 0, replacement);
       rules.splice(0, rules.length, ...retained);
-      message = `${mutation.access === "write" ? "R/W" : "R/O"} ${target.canonical} (${mutation.scope}). Applies to all scoped profiles and projects. A tree grant covers the displayed directory, not just its triggering file; more-specific restrictions remain protected.`;
+      message = `Path     ${target.canonical}\nAccess   ${mutation.access === "write" ? "Read/write" : "Read-only"}\nScope    ${mutation.scope === "file" ? "This file only" : "Directory and all descendants"}\nApplies  All scoped profiles and projects\n\nNote: ${mutation.scope === "tree" ? "This covers the entire displayed directory,\n      not just the file that triggered the request.\n      " : ""}More-specific restrictions remain protected.`;
     } else {
       const affected = current.rules.filter((r) => (mutation.kind === "clear" || r.id === mutation.id) && (r.read === "allow" || r.write === "allow"));
       if (mutation.kind === "revoke" && affected.length !== 1) throw new Error("Global declaration ID is stale or unavailable; reload before revoking");
@@ -119,7 +119,12 @@ export class GlobalPolicyWriter {
         if (!rule.read && !rule.write) rules.splice(i, 1);
         else successors.set(current.rules[i]!.id, rule);
       }
-      message = `Remove all current allow fields from ${affected.length} global declaration(s):\n${affected.map((r) => `global:${r.id}: ${r.path} (${r.scope})`).join("\n")}\nAsk/deny fields, ordinary approvals, profiles, networking and process mode remain unchanged.`;
+      message = [
+        ...(mutation.kind === "clear" ? [`Affected declarations · ${affected.length}`] : []),
+        ...affected.map((r) => `Path    ${r.path}\nScope   ${r.scope === "file" ? "This file only" : "Directory and all descendants"}\nRule    global:${r.id}`),
+        `Will remove\nAll allow permissions in ${mutation.kind === "clear" ? "the listed declarations" : "this declaration"}, including dormant or blocked permissions.`,
+        "Will preserve\nAsk and deny restrictions, ordinary approvals, session blocks, profiles, networking, and process mode.",
+      ].join("\n\n");
     }
     document.pathRules = rules;
     const config = mergeConfig(defaults, document);
@@ -142,7 +147,7 @@ export class GlobalPolicyWriter {
       const next = catalog.rules.find((r) => r.path === successor.path && r.scope === successor.scope && r.read === successor.read && r.write === successor.write)!;
       ruleIds.set(id, next.id);
     }
-    return { version, revision, catalog, document, mutation, ruleIds, preview: { title: mutation.kind === "save" ? "Save global filesystem permission?" : "Remove global filesystem permissions?", message } };
+    return { version, revision, catalog, document, mutation, ruleIds, preview: { title: mutation.kind === "save" ? "Save global filesystem permission?" : mutation.kind === "revoke" ? "Remove global filesystem permission?" : "Remove all global filesystem permissions?", message } };
   }
   commit(prepared: PreparedPolicy, checkRevision: (revision: number) => void, signal?: AbortSignal): ResolvedCatalog {
     this.checkDirectory();

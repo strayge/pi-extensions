@@ -33,6 +33,34 @@ function fixture(change?: (config: PermissionModeConfig, outside: string) => voi
   return { directory, project, outside, config, context, root, store, file, writer, warnings, owner, close: () => rmSync(directory, { recursive: true, force: true }) };
 }
 
+test("global save previews expose canonical boundaries without narrowing tree authority to a triggering file", async () => {
+  for (const scope of ["file", "tree"] as const) {
+    for (const access of ["read", "write"] as const) {
+      const f = fixture();
+      try {
+        const file = path.join(f.outside, `notes-${"x".repeat(180)}`); writeFileSync(file, "NOTE");
+        const alias = path.join(f.outside, "alias"); symlinkSync(file, alias);
+        const target = scope === "file" ? file : f.outside;
+        const before = readFileSync(f.file, "utf8"); let prompts = 0;
+        f.owner.confirmGlobal = async (preview) => {
+          prompts++;
+          assert.deepEqual(preview, {
+            title: "Save global filesystem permission?",
+            message: `Path     ${target}\nAccess   ${access === "read" ? "Read-only" : "Read/write"}\nScope    ${scope === "file" ? "This file only" : "Directory and all descendants"}\nApplies  All scoped profiles and projects\n\nNote: ${scope === "tree" ? "This covers the entire displayed directory,\n      not just the file that triggered the request.\n      " : ""}More-specific restrictions remain protected.`,
+          });
+          assert.equal(readFileSync(f.file, "utf8"), before);
+          return true;
+        };
+        await f.owner.changeGlobal({ kind: "save", binding: scope === "file" ? bindFile(bindPath(alias)) : bindPath(target), scope, access });
+        assert.equal(prompts, 1);
+        assert.deepEqual(loadConfig(f.directory, f.directory).global.pathRules, [{ path: target, scope, read: "allow", ...(access === "write" ? { write: "allow" } : {}) }]);
+        assert.equal(decide(f.owner.snapshot(), bindPath(file), access).action, "allow");
+        assert.equal(decide(f.owner.snapshot(), bindPath(path.join(f.outside, "sibling")), access).action, scope === "tree" ? "allow" : "ask");
+      } finally { f.close(); }
+    }
+  }
+});
+
 test("global exact-file saves publish immediately, consolidate upgrades and revoke the current declaration", async () => {
   const f = fixture();
   try {
@@ -49,6 +77,13 @@ test("global exact-file saves publish immediately, consolidate upgrades and revo
     assert.deepEqual(f.owner.network.snapshot(), network);
     const id = f.owner.snapshot().rules[0]!.id;
     rmSync(file); mkdirSync(file);
+    f.owner.confirmGlobal = async (preview) => {
+      assert.deepEqual(preview, {
+        title: "Remove global filesystem permission?",
+        message: `Path    ${file}\nScope   This file only\nRule    global:${id}\n\nWill remove\nAll allow permissions in this declaration, including dormant or blocked permissions.\n\nWill preserve\nAsk and deny restrictions, ordinary approvals, session blocks, profiles, networking, and process mode.`,
+      });
+      return true;
+    };
     await f.owner.changeGlobal({ kind: "revoke", id });
     assert.deepEqual(loadConfig(f.directory, f.directory).global.pathRules, []);
     assert.equal(f.owner.snapshot().rules.length, 0);
@@ -85,7 +120,7 @@ test("global clear removes blocked and dormant positives without usable targets 
     config.pathRules = [
       { path: path.join(outside, "redirect"), scope: "file", read: "allow" },
       { path: path.join(outside, "pinned", "file"), scope: "file", write: "allow" },
-      { path: path.join(outside, "missing"), scope: "file", read: "allow" },
+      { path: path.join(outside, "missing"), scope: "tree", read: "allow" },
       { path: directory, scope: "file", write: "allow" },
       { path: outside, scope: "tree", read: "ask" },
     ];
@@ -94,9 +129,26 @@ test("global clear removes blocked and dormant positives without usable targets 
     rmSync(path.join(f.outside, "redirect")); symlinkSync("other", path.join(f.outside, "redirect"));
     renameSync(path.join(f.outside, "pinned"), path.join(f.outside, "pinned-old"));
     mkdirSync(path.join(f.outside, "pinned")); writeFileSync(path.join(f.outside, "pinned", "file"), "REPLACED");
+    let prompts = 0;
+    f.owner.confirmGlobal = async (preview) => {
+      prompts++;
+      const affected = f.owner.snapshot().rules.filter((r) => r.read === "allow" || r.write === "allow");
+      assert.deepEqual(preview, {
+        title: "Remove all global filesystem permissions?",
+        message: [
+          `Affected declarations · ${affected.length}`,
+          ...affected.map((r) => `Path    ${r.path}\nScope   ${r.scope === "file" ? "This file only" : "Directory and all descendants"}\nRule    global:${r.id}`),
+          "Will remove\nAll allow permissions in the listed declarations, including dormant or blocked permissions.",
+          "Will preserve\nAsk and deny restrictions, ordinary approvals, session blocks, profiles, networking, and process mode.",
+        ].join("\n\n"),
+      });
+      return true;
+    };
     await f.owner.changeGlobal({ kind: "clear" });
     assert.deepEqual(loadConfig(f.directory, f.directory).global.pathRules, [{ path: f.outside, scope: "tree", read: "ask" }]);
     assert.equal(f.owner.snapshot().grants.length, 0);
+    await f.owner.changeGlobal({ kind: "clear" });
+    assert.equal(prompts, 2);
   } finally { f.close(); }
 });
 
