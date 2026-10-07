@@ -110,6 +110,8 @@ export function createChildExtensionUI(
   };
   Object.defineProperty(childUI, CHILD_EXTENSION_UI_MARKER, {
     value: true,
+    // Pi spreads UI contexts when wrapping prompts; child identity must survive.
+    enumerable: true,
   });
   return childUI;
 }

@@ -44,12 +44,12 @@ function parentUI(select: ExtensionUIContext["select"]): ExtensionUIContext {
 }
 
 describe("child extension UI", () => {
-  it("identifies the proxy without exposing the marker to UI consumers", () => {
+  it("preserves child identity when Pi spreads the UI context", () => {
     const child = createChildExtensionUI(parentUI(vi.fn(async () => undefined)), "Explore");
+    const wrapped = { ...child };
 
     expect(Reflect.get(child, CHILD_EXTENSION_UI_MARKER)).toBe(true);
-    expect(Object.getOwnPropertySymbols(child)).toContain(CHILD_EXTENSION_UI_MARKER);
-    expect(Object.getOwnPropertyDescriptor(child, CHILD_EXTENSION_UI_MARKER)?.enumerable).toBe(false);
+    expect(Reflect.get(wrapped, CHILD_EXTENSION_UI_MARKER)).toBe(true);
   });
 
   it("forwards permission dialogs with the subagent identity", async () => {
