@@ -179,3 +179,19 @@ test("missing models and non-UI sessions do not inspect history or show a value"
     assert.equal(statuses.get("speed"), undefined);
   }
 });
+
+test("stale contexts suppress status writes after session replacement", () => {
+  const mock = createMockPi();
+  registerSpeedStatus(mock.pi);
+  const { ctx } = createMockContext({
+    hasUI: true,
+    model: MODEL,
+    sessionManager: { getBranch: () => [assistant()] },
+    ui: {
+      setStatus: () => {
+        throw new Error("This extension ctx is stale after session replacement or reload");
+      },
+    },
+  });
+  assert.doesNotThrow(() => mock.events.get("session_start")?.[0]?.({}, ctx));
+});

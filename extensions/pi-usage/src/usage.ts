@@ -42,8 +42,6 @@ import {
   deriveUsageSnapshotIdentity,
   SNAPSHOT_ENTRY_TYPE,
 } from "./snapshot.ts";
-import { SPEED_RANGES, showSpeedReport, speedRange } from "./speed.ts";
-import { registerSpeedStatus } from "./speed-status.ts";
 import { applyUsageSlotOptions, usageSlotDefaults, usageSlotFields } from "./statusline-schema.ts";
 import { publishStatuslineItem, registerStatuslineSlot } from "./statusline-slot.ts";
 import type {
@@ -167,7 +165,6 @@ export default function usageExtension(
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   /** The open menu, if any, so shutdown can close it. Only one can be open. */
   let menuController: AbortController | undefined;
-  let speedController: AbortController | undefined;
 
   const clearRefreshTimer = () => {
     if (refreshTimer) clearTimeout(refreshTimer);
@@ -716,46 +713,6 @@ export default function usageExtension(
     }
   };
 
-  pi.registerCommand("speed", {
-    description: "Show historical model request speed and descriptive cohort changes",
-    handler: async (args, ctx) => {
-      const argument = args.trim();
-      const preset = speedRange(argument);
-      if (argument && !preset) {
-        ctx.ui.notify(
-          `/speed accepts: ${SPEED_RANGES.join(", ")}, or no argument to open the 1d report.`,
-          "warning",
-        );
-        return;
-      }
-      if (!ctx.hasUI) {
-        ctx.ui.notify("/speed requires an interactive Pi mode.", "warning");
-        return;
-      }
-      speedController?.abort();
-      const controller = new AbortController();
-      speedController = controller;
-      try {
-        const range = preset ?? "1d";
-        const loaded = await runWithLoader(
-          ctx,
-          "Loading model speed history…",
-          controller.signal,
-          (signal) => history.load(ctx, { signal }),
-        );
-        if (!loaded || controller.signal.aborted) return;
-        await showSpeedReport(ctx, loaded, range, controller.signal);
-      } catch (error) {
-        if (controller.signal.aborted || isAbortError(error) || isStaleExtensionContextError(error))
-          return;
-        ctx.ui.notify("Could not load model speed history.", "warning");
-      } finally {
-        controller.abort();
-        if (speedController === controller) speedController = undefined;
-      }
-    },
-  });
-
   pi.registerCommand("usage", {
     description: "Show usage for the current runtime account",
     handler: async (args, ctx) => {
@@ -808,12 +765,10 @@ export default function usageExtension(
     cancelRefresh();
     // Leaves an open /usage dialog waiting on a session that is gone.
     menuController?.abort();
-    speedController?.abort();
     cache.clear();
     failures.clear();
     safeSetStatus(ctx, undefined);
   });
-  registerSpeedStatus(pi);
 }
 
 function availableResetCredits(outcome: QueryOutcome): number {

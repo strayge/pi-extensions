@@ -18,13 +18,11 @@ const NOW = Date.parse("2026-09-12T12:00:00Z");
 
 function call(overrides: Partial<NormalizedCall> = {}): NormalizedCall {
   return {
-    key: "call",
     kind: "assistant",
     provider: "provider",
     model: "model",
     timestamp: NOW - 1_000,
     timestampFidelity: "embedded",
-    preciseTimestamp: true,
     stopReason: "stop",
     durationMs: 1_000,
     thinkingLevel: "high",
@@ -38,13 +36,12 @@ function call(overrides: Partial<NormalizedCall> = {}): NormalizedCall {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
     source: { kind: "session", id: "session" },
-    conversationId: "session",
     ...overrides,
   };
 }
 
 function history(calls: NormalizedCall[]): LoadedHistory {
-  return { now: NOW, calls, snapshots: [], warnings: [], subagents: [] };
+  return { now: NOW, calls, warnings: [] };
 }
 
 function batch(
@@ -54,7 +51,7 @@ function batch(
 ): NormalizedCall[] {
   return Array.from({ length: count }, (_, index) =>
     call({
-      key: `${previous}:${index}`,
+      entryId: `${previous}:${index}`,
       timestamp: NOW - (previous ? DAY + 1_000 : 1_000) - index,
       ...overrides,
     }),
@@ -176,7 +173,7 @@ test("exact provider/model rows pool effort and inferred provenance without pool
   assert.deepEqual(split.rows[0]?.changes, []);
 });
 
-test("coverage counts only current assistant requests and excludes failures, missing data, and accounting work", () => {
+test("coverage counts only current assistant requests and excludes failures and missing measurements", () => {
   const calls = [
     call(),
     call({ stopReason: "toolUse" }),
@@ -185,10 +182,6 @@ test("coverage counts only current assistant requests and excludes failures, mis
       call({ durationMs }),
     ),
     ...[0, Number.NaN].map((output) => call({ usage: { ...call().usage, output } })),
-    ...["usage", "compaction", "branch_summary"].map((kind) =>
-      call({ kind: kind as NormalizedCall["kind"] }),
-    ),
-    call({ kind: undefined }),
     call({ timestamp: undefined }),
     call({ timestamp: NOW - DAY - 1, stopReason: "error" }),
   ];

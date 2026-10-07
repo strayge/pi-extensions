@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { isStaleExtensionContextError } from "./query.ts";
+import { isStaleExtensionContextError } from "./core.ts";
+import { publishStatuslineItem } from "./publish.ts";
 import { medianRequestRate } from "./speed.ts";
-import { publishStatuslineItem } from "./statusline-slot.ts";
 
 /** Rebuild from the selected branch so reloads and tree navigation cannot leak other requests. */
 export function registerSpeedStatus(pi: ExtensionAPI): void {

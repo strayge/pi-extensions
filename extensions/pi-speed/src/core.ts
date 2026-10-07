@@ -1,3 +1,14 @@
+export function isStaleExtensionContextError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("This extension ctx is stale after session replacement or reload")
+  );
+}
+
+export function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
 export function sanitizeDisplayText(value: string, maxChars = 160): string {
   let result = "";
   for (let index = 0; index < value.length; ) {
