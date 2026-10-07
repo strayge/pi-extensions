@@ -460,12 +460,13 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
             }
           : undefined;
         const initialRoot = prior?.rootIdentity ?? { family: randomUUID(), binding: rootPath };
-        resolveCatalog(loaded.global, initialRoot, resolution);
+        const startupResolution = { ...resolution, macExecutableFilesCache: new Map<string, string[]>() };
+        resolveCatalog(loaded.global, initialRoot, startupResolution);
         const store = new PermissionStore(agentDir);
-        const restored = store.load(binding, rootPath.canonical, resolution, loaded.global);
+        const restored = store.load(binding, rootPath.canonical, startupResolution, loaded.global);
         const previous = restored.session?.catalog ?? restored.project.catalog;
         const root = { family: prior?.id ?? restored.session?.catalog.root.family ?? initialRoot.family, binding: rootPath };
-        const catalog = resolveCatalog(loaded.global, root, resolution, previous);
+        const catalog = resolveCatalog(loaded.global, root, startupResolution, previous);
         const grants = [
           ...(restored.session?.grants.filter((g) => g.lifetime === "session") ?? []),
           ...restored.project.grants,

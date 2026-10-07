@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { syncBuiltinESMExports } from "node:module";
@@ -73,6 +74,44 @@ function fixture() {
     },
   };
 }
+
+test("macOS startup and state restoration share dependency inspection while reload discovers changes", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = fixture(); const spawn = childProcess.spawnSync;
+  try {
+    const first = path.join(f.dir, "first.dylib"); const second = path.join(f.dir, "second.dylib");
+    for (const file of [first, second]) writeFileSync(file, "fixture");
+    let dependency = first; let inspections = 0;
+    const node = bindPath(process.execPath).canonical;
+    t.mock.method(childProcess, "spawnSync", (...args: Parameters<typeof spawn>) => {
+      if (args[0] !== "/usr/bin/otool") return spawn(...args);
+      inspections++;
+      const [flag, file] = args[1] as string[];
+      const stdout = flag === "-l" ? "" : `${file}:\n${file === node ? `\t${dependency} (compatibility version 1.0.0, current version 1.0.0)\n` : ""}`;
+      return { pid: 0, output: [], stdout, stderr: "", status: 0, signal: null };
+    });
+    syncBuiltinESMExports();
+    const config = JSON.parse(readFileSync(f.global, "utf8"));
+    for (const name of ["project", "subproject"]) config.modes[name].filesystem.resourceReads = ["pi"];
+    writeFileSync(f.global, JSON.stringify(config));
+    await f.start();
+    assert.equal(f.governed(), true);
+    assert.equal(inspections, 4);
+    assert.ok((await f.awareness()).includes(first));
+    f.ctx.ui.select = async () => "Remember for this project";
+    await f.perm(`grant read ${f.other}`);
+    await f.start("switch");
+    assert.equal(f.governed(), true);
+    assert.equal(inspections, 8);
+    assert.match(await f.awareness(), /other \(tree, project, id /);
+    dependency = second;
+    await f.reloadExtension();
+    assert.equal(f.governed(), true);
+    assert.equal(inspections, 12);
+    const awareness = await f.awareness();
+    assert.ok(awareness.includes(second)); assert.ok(!awareness.includes(first));
+    assert.match(awareness, /other \(tree, project, id /);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
+});
 
 test("obsolete transcript entries carry no authority and unsupported configuration falls back to unrestricted tools", async () => {
   const f = fixture();

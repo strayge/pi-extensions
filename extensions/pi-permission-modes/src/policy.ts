@@ -19,6 +19,8 @@ export interface ResolutionContext {
   home: string;
   piPackage?: string;
   node?: string;
+  /** Dependency paths may be shared only within one synchronous resolution operation. */
+  macExecutableFilesCache?: Map<string, string[]>;
 }
 
 export function freeze<T>(value: T): T {
@@ -119,7 +121,12 @@ export function automaticResources(selectors: ("pi" | "system")[], context: Reso
     const prefix = path.dirname(path.dirname(node));
     paths.push(path.join(context.home, ".pi"), context.agentDir, piPackage, node);
     if (process.platform === "darwin") {
-      paths.push(...macExecutableFiles(node));
+      let executableFiles = context.macExecutableFilesCache?.get(node);
+      if (!executableFiles) {
+        executableFiles = macExecutableFiles(node);
+        context.macExecutableFilesCache?.set(node, executableFiles);
+      }
+      paths.push(...executableFiles);
       for (const brew of ["/opt/homebrew", "/usr/local"]) {
         if (within(brew, node)) paths.push(path.join(brew, "etc/openssl@3/openssl.cnf"), path.join(brew, "etc/ca-certificates/cert.pem"));
       }
@@ -195,6 +202,10 @@ export function resolveCatalog(
     : automaticWorktreeGrants(root.binding);
   for (const grant of worktreeGrants) resolvePermissionBinding(grant.binding);
   const profiles: Record<string, ResolvedProfile> = Object.create(null);
+  const resourceContext = {
+    ...context,
+    macExecutableFilesCache: context.macExecutableFilesCache ?? new Map<string, string[]>(),
+  };
   for (const [name, mode] of Object.entries(config.modes)) {
     const prior = previous?.profiles[name];
     const unchanged = prior && definition(previous?.config.modes[name]?.filesystem) === definition(mode.filesystem) ? prior : undefined;
@@ -204,7 +215,7 @@ export function resolveCatalog(
       profiles[name] = { kind: "unrestricted", grants: [] };
       continue;
     }
-    const grants: ResourceGrant[] = automaticResources(mode.filesystem.resourceReads, context).map((resource) => {
+    const grants: ResourceGrant[] = automaticResources(mode.filesystem.resourceReads, resourceContext).map((resource) => {
       const saved = prior?.grants.find((g) => g.definition === resource.definition);
       if (saved && !resource.runtime) {
         resolvePermissionBinding(saved.binding);

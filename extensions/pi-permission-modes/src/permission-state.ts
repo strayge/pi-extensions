@@ -221,7 +221,7 @@ export class PermissionStore {
 
   load(binding: SessionBinding | undefined, cwd: string, context: ResolutionContext = { agentDir: path.dirname(this.directory), home: homedir() }, current?: PermissionModeConfig): { session?: SavedState; project: ProjectState } {
     this.binding = binding;
-    this.context = context;
+    this.context = { ...context, macExecutableFilesCache: undefined };
     return this.transaction((document) => {
       const project = document.projects[key(cwd)] ?? { generation: 0, grants: [], exceptions: [] };
       shape(project, ["generation", "grants", "exceptions"], ["catalog"]);

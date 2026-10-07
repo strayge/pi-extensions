@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs, { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -50,6 +51,41 @@ test("macOS system resources discover optional read-only Command Line Tools with
     t.mock.method(fs, "existsSync", (file: fs.PathLike) => String(file) !== tools && exists(file));
     syncBuiltinESMExports();
     assert.ok(!automaticResources(["system"], f.context).some((g) => g.definition === `resource:${tools}`));
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); f.dispose(); }
+});
+
+test("macOS catalogs inspect dependencies once per build and do not cache them across builds", { skip: process.platform !== "darwin" }, (t) => {
+  const f = fixture(); const spawn = childProcess.spawnSync;
+  try {
+    const runtime = path.join(f.dir, "runtime"); const agent = path.join(f.dir, "agent"); const pi = path.join(f.dir, "pi");
+    for (const directory of [runtime, agent, pi]) mkdirSync(directory);
+    const node = path.join(bindPath(runtime).canonical, "node");
+    const first = path.join(bindPath(runtime).canonical, "first.dylib");
+    const second = path.join(bindPath(runtime).canonical, "second.dylib");
+    for (const file of [node, first, second]) writeFileSync(file, "fixture");
+    let dependency = first; let inspections = 0;
+    t.mock.method(childProcess, "spawnSync", (...args: Parameters<typeof spawn>) => {
+      if (args[0] !== "/usr/bin/otool") return spawn(...args);
+      inspections++;
+      const [flag, file] = args[1] as string[];
+      const stdout = flag === "-l" ? "" : `${file}:\n${file === node ? `\t${dependency} (compatibility version 1.0.0, current version 1.0.0)\n` : ""}`;
+      return { pid: 0, output: [], stdout, stderr: "", status: 0, signal: null };
+    });
+    syncBuiltinESMExports();
+    for (const name of ["project", "subproject"])
+      f.config.modes[name]!.filesystem = { kind: "scoped", readOnly: [], readWrite: [], resourceReads: ["pi"] };
+    const context = { ...f.context, agentDir: agent, piPackage: pi, node };
+    const initial = resolveCatalog(f.config, f.root, context);
+    assert.equal(inspections, 4);
+    assert.deepEqual(initial.profiles.project!.grants, initial.profiles.subproject!.grants);
+    const grant = initial.profiles.project!.grants.find((item) => item.binding.canonical === first)!;
+    assert.equal(grant.scope, "file"); assert.equal(grant.access, "read"); assert.equal(grant.runtime, true);
+    assert.ok(!initial.profiles.project!.grants.some((item) => item.binding.canonical === path.dirname(node)));
+    dependency = second;
+    const refreshed = resolveCatalog(f.config, f.root, context, initial);
+    assert.equal(inspections, 8);
+    assert.ok(refreshed.profiles.project!.grants.some((item) => item.binding.canonical === second));
+    assert.ok(!refreshed.profiles.project!.grants.some((item) => item.binding.canonical === first));
   } finally { t.mock.restoreAll(); syncBuiltinESMExports(); f.dispose(); }
 });
 
