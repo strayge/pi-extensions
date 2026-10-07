@@ -1,0 +1,15 @@
+pi-cmux includes a modified copy of cmux's generated Pi extension.
+
+Copyright (c) 2024-present Manaflow, Inc.
+Other contributors and third parties retain copyright in their material.
+Licensed under GPL-3.0-or-later; see LICENSE.
+
+Upstream: https://github.com/manaflow-ai/cmux
+Source: CLI/CMUXCLI+PiExtensionSource.swift and its source parts
+Baseline: installed cmux Pi extension, managed template marker v4,
+          captured on 2026-10-07.
+
+Local modifications (2026-10-07): repository-owned entry point and stock-hook
+suppression; a separate opt-out; stripped stock-disable environment for cmux
+commands; top-level session ownership; deferred completion while subagents run;
+pi-ask started/completed notification integration.

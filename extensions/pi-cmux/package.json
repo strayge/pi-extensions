@@ -1,0 +1,54 @@
+{
+  "name": "@strayge/pi-cmux",
+  "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/strayge/pi-extensions.git",
+    "directory": "extensions/pi-cmux"
+  },
+  "homepage": "https://github.com/strayge/pi-extensions/tree/main/extensions/pi-cmux#readme",
+  "bugs": {
+    "url": "https://github.com/strayge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Repository-managed cmux bridge with background-agent activity and pi-ask notifications.",
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "cmux",
+    "notification"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "biome check . && tsc --noEmit && npm test",
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.0.2"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.6",
+    "@earendil-works/pi-coding-agent": "1.0.2",
+    "@types/node": "25.5.0",
+    "typescript": "7.0.2"
+  }
+}
