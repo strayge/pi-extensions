@@ -5,7 +5,6 @@ import {
   sliceByColumn,
   truncateToWidth,
   visibleWidth,
-  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { sanitizeDisplayText } from "./core.ts";
 import type { LoadedHistory, NormalizedCall } from "./history.ts";
@@ -21,12 +20,11 @@ export function speedRange(value: string): SpeedRange | undefined {
 export interface SpeedRow {
   provider: string;
   model: string;
-  thinkingLevel?: string;
-  inferred: boolean;
   samples: number;
   previousSamples: number;
   medianRate?: number;
-  medianSeconds?: number;
+  totalOutputTokens: number;
+  totalSeconds: number;
   changes: number[];
 }
 
@@ -58,24 +56,26 @@ function positive(value: number | undefined): value is number {
   return value !== undefined && Number.isFinite(value) && value > 0;
 }
 
-function rate(call: NormalizedCall): number {
+type SpeedSample = Pick<NormalizedCall, "stopReason" | "durationMs" | "usage">;
+
+function rate(call: SpeedSample): number {
   return call.usage.output / ((call.durationMs as number) / 1_000);
 }
 
-function exclusion(call: NormalizedCall): "unsuccessful" | "untimed" | "noOutput" | undefined {
+function exclusion(call: SpeedSample): "unsuccessful" | "untimed" | "noOutput" | undefined {
   if (call.stopReason !== "stop" && call.stopReason !== "toolUse") return "unsuccessful";
   if (!positive(call.durationMs)) return "untimed";
   if (!positive(call.usage.output) || !positive(rate(call))) return "noOutput";
   return undefined;
 }
 
+/** Keep the session status and historical report on the same measured-request definition. */
+export function medianRequestRate(calls: SpeedSample[]): number | undefined {
+  return median(calls.filter((call) => !exclusion(call)).map(rate));
+}
+
 function rowKey(call: NormalizedCall): string {
-  return JSON.stringify([
-    call.provider,
-    call.model,
-    call.thinkingLevel ?? null,
-    call.thinkingLevelInferred === true,
-  ]);
+  return JSON.stringify([call.provider, call.model]);
 }
 
 function bin(value: number, boundaries: number[]): number {
@@ -89,6 +89,8 @@ function cohortKey(call: NormalizedCall): string {
     bin(context, [16_000, 64_000, 128_000]),
     bin(call.usage.output, [500, 2_000, 8_000]),
     call.stopReason,
+    call.thinkingLevel ?? null,
+    call.thinkingLevelInferred === true,
   ]);
 }
 
@@ -106,7 +108,7 @@ export function deriveSpeedReport(history: LoadedHistory, range: SpeedRange): Sp
   };
   const groups = new Map<
     string,
-    { row: SpeedRow; current: NormalizedCall[]; previous: NormalizedCall[]; active: boolean }
+    { row: SpeedRow; current: NormalizedCall[]; previous: NormalizedCall[] }
   >();
   for (const call of history.calls) {
     const at = call.timestamp;
@@ -118,6 +120,13 @@ export function deriveSpeedReport(history: LoadedHistory, range: SpeedRange): Sp
       at > history.now
     )
       continue;
+    const excluded = exclusion(call);
+    if (at >= since) {
+      coverage.assistants += 1;
+      if (excluded) coverage[excluded] += 1;
+      else coverage.observed += 1;
+    }
+    if (excluded) continue;
     const key = rowKey(call);
     let group = groups.get(key);
     if (!group) {
@@ -125,36 +134,32 @@ export function deriveSpeedReport(history: LoadedHistory, range: SpeedRange): Sp
         row: {
           provider: call.provider,
           model: call.model,
-          thinkingLevel: call.thinkingLevel,
-          inferred: call.thinkingLevelInferred === true,
           samples: 0,
           previousSamples: 0,
+          totalOutputTokens: 0,
+          totalSeconds: 0,
           changes: [],
         },
         current: [],
         previous: [],
-        active: false,
       };
       groups.set(key, group);
     }
-    const excluded = exclusion(call);
-    if (at >= since) {
-      group.active = true;
-      coverage.assistants += 1;
-      if (excluded) coverage[excluded] += 1;
-      else coverage.observed += 1;
-      // Retain rows with missing observations so coverage is not mistaken for no activity.
-      if (!excluded) group.current.push(call);
-    } else if (!excluded) group.previous.push(call);
+    if (at >= since) group.current.push(call);
+    else group.previous.push(call);
   }
   const rows: SpeedRow[] = [];
   for (const group of groups.values()) {
-    if (!group.active) continue;
+    if (group.current.length === 0) continue;
     const { row, current, previous } = group;
     row.samples = current.length;
     row.previousSamples = previous.length;
-    row.medianRate = median(current.map(rate));
-    row.medianSeconds = median(current.map((call) => (call.durationMs as number) / 1_000));
+    row.medianRate = medianRequestRate(current);
+    row.totalOutputTokens = current.reduce((total, call) => total + call.usage.output, 0);
+    row.totalSeconds = current.reduce(
+      (total, call) => total + (call.durationMs as number) / 1_000,
+      0,
+    );
     const cohorts = new Map<string, { current: number[]; previous: number[] }>();
     for (const [period, calls] of [
       ["current", current],
@@ -175,13 +180,7 @@ export function deriveSpeedReport(history: LoadedHistory, range: SpeedRange): Sp
     }
     rows.push(row);
   }
-  rows.sort(
-    (a, b) =>
-      a.provider.localeCompare(b.provider) ||
-      a.model.localeCompare(b.model) ||
-      (a.thinkingLevel ?? "").localeCompare(b.thinkingLevel ?? "") ||
-      Number(a.inferred) - Number(b.inferred),
-  );
+  rows.sort((a, b) => a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model));
   const warnings = new Map<string, number>();
   for (const warning of history.warnings) {
     if (warning.code === "malformed-snapshot" || warning.code === "imprecise-gap-timing") continue;
@@ -201,8 +200,23 @@ export function deriveSpeedReport(history: LoadedHistory, range: SpeedRange): Sp
   };
 }
 
-function number(value: number | undefined): string {
-  return value === undefined ? "—" : value.toFixed(1);
+function number(value: number | undefined, digits = 1): string {
+  return value === undefined || !Number.isFinite(value)
+    ? "—"
+    : value
+        .toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })
+        .replaceAll(",", " ");
+}
+
+function tokens(value: number): string {
+  return value >= 1_000_000 ? `${number(value / 1_000_000, 2)} M` : number(value, 0);
+}
+
+function duration(seconds: number): string {
+  if (seconds < 60) return `${number(seconds)}s`;
+  if (seconds < 3_600) return `${number(seconds / 60)}m`;
+  if (seconds < 86_400) return `${number(seconds / 3_600)}h`;
+  return `${number(seconds / 86_400)}d`;
 }
 
 export function speedTrend(changes: number[]): string {
@@ -227,28 +241,19 @@ function speedTable(report: SpeedReport): string[] {
       Math.max(width, Math.min(40, visibleWidth(label(`${row.provider}/${row.model}`)))),
     14,
   );
-  const effortWidth = report.rows.reduce(
-    (width, row) =>
-      Math.max(
-        width,
-        Math.min(16, visibleWidth(label(row.thinkingLevel ?? "unknown")) + Number(row.inferred)),
-      ),
-    7,
-  );
   const values = [
-    ["Provider/model", "Effort", "N now/prev", "tok/s", "Request s", "Trend"],
+    ["Provider/model", "Median tok/s", "Total output tokens", "Total request time", "Trend"],
     ...report.rows.map((row) => [
       label(`${row.provider}/${row.model}`),
-      `${truncateToWidth(label(row.thinkingLevel ?? "unknown"), effortWidth - Number(row.inferred), "")}${row.inferred ? "*" : ""}`,
-      `${row.samples}/${row.previousSamples}`,
       number(row.medianRate),
-      number(row.medianSeconds),
+      tokens(row.totalOutputTokens),
+      duration(row.totalSeconds),
       speedTrend(row.changes),
     ]),
   ];
-  const widths = [routeWidth, effortWidth, 11, 9, 9, 12];
+  const widths = [routeWidth, 12, 19, 18, 12];
   for (const row of values) {
-    for (let index = 2; index < widths.length; index += 1) {
+    for (let index = 1; index < widths.length; index += 1) {
       widths[index] = Math.max(widths[index] as number, visibleWidth(row[index] as string));
     }
   }
@@ -257,82 +262,97 @@ function speedTable(report: SpeedReport): string[] {
   );
 }
 
+function title(report: SpeedReport): string {
+  return `Speed · ${report.range} vs previous ${report.range}`;
+}
+
+const EMPTY_MESSAGE = "No measured requests in selected period";
+
 /** Keep a single table even on narrow terminals; horizontal navigation reveals clipped columns. */
 export function speedReportLines(
   report: SpeedReport,
   width: number,
   horizontalOffset = 0,
 ): string[] {
-  const boundedWidth = Math.max(1, width);
+  if (width <= 0) return [];
   const table = speedTable(report);
-  const maxPan = Math.max(0, visibleWidth(table[0] as string) - boundedWidth);
+  const maxPan = Math.max(0, visibleWidth(table[0] as string) - width);
   const pan = Math.min(Math.max(0, horizontalOffset), maxPan);
-  const wrap = (text: string) => wrapTextWithAnsi(text, boundedWidth);
-  const c = report.coverage;
   return [
-    ...wrap(`Speed · ${report.range} vs previous ${report.range} · discoverable project histories`),
-    ...table.map((line) => sliceByColumn(line, pan, boundedWidth)),
-    ...(report.rows.length === 0 ? wrap("No assistant requests in selected period") : []),
-    ...wrap(
-      `Coverage (now): ${c.observed}/${c.assistants} observed · ${c.unsuccessful} unsuccessful · ${c.untimed} untimed · ${c.noOutput} no usable output`,
-    ),
-    ...wrap(
-      "N: observed now/previous. Medians: effective output tok/s (includes reasoning), approximate whole request seconds; excludes tool execution.",
-    ),
-    ...wrap(
-      "* inferred requested effort (separate rows); unknown stays unknown. Trend: descriptive cohort median % changes, min…max (cohort count); ≥10 requests each period. Not generation speed or statistical confidence.",
-    ),
-    ...(report.warnings.length
-      ? wrap(`Warnings (comparison period or unscoped): ${report.warnings.join(", ")}`)
-      : []),
-  ].map((line) => truncateToWidth(line, boundedWidth, ""));
+    title(report),
+    ...table.map((line) => sliceByColumn(line, pan, width)),
+    ...(report.rows.length === 0 ? [EMPTY_MESSAGE] : []),
+  ].map((line) => truncateToWidth(line, width, ""));
 }
 
 export function createSpeedComponent(
-  report: SpeedReport,
+  history: LoadedHistory,
+  initialRange: SpeedRange,
   theme: Pick<Theme, "fg">,
   requestRender: () => void,
   done: () => void,
   height: () => number,
 ): Component & { dispose?: () => void } {
+  let rangeIndex = SPEED_RANGES.indexOf(initialRange);
+  let report = deriveSpeedReport(history, initialRange);
+  let table = speedTable(report);
   let scroll = 0;
   let pan = 0;
-  let contentLength = 0;
-  let viewport = 1;
+  let contentLength = Math.max(1, report.rows.length);
+  let viewport = 0;
   let maxPan = 0;
-  const tableWidth = visibleWidth(speedTable(report)[0] as string);
   return {
     render(width) {
-      maxPan = Math.max(0, tableWidth - Math.max(1, width));
+      const panelHeight = Math.max(0, Math.min(20, Math.floor(height())));
+      if (width <= 0 || panelHeight === 0) return [];
+      maxPan = Math.max(0, visibleWidth(table[0] as string) - width);
       pan = Math.min(pan, maxPan);
-      const content = speedReportLines(report, width, pan);
-      contentLength = content.length;
-      const panelHeight = Math.max(1, Math.min(20, height()));
-      viewport = Math.max(1, panelHeight - 1);
+      const selector = SPEED_RANGES.map((range) =>
+        range === report.range ? theme.fg("accent", `[${range}]`) : theme.fg("dim", range),
+      ).join(" ");
+      const rangeLine =
+        visibleWidth(`Range: ${selector}`) <= width
+          ? `Range: ${selector}`
+          : theme.fg("accent", `[${report.range}]`);
+      const headers = [rangeLine, title(report), sliceByColumn(table[0] as string, pan, width)];
+      const hint = panelHeight >= 5;
+      viewport = Math.max(0, panelHeight - headers.length - Number(hint));
       scroll = Math.min(scroll, Math.max(0, contentLength - viewport));
-      const lines = content.slice(scroll, scroll + viewport);
-      if (panelHeight > 1)
-        lines.push(
-          theme.fg(
-            "dim",
-            `↑↓/PgUp/PgDn scroll · ←→ columns · Esc close (${scroll + 1}/${contentLength})`,
-          ),
-        );
-      return lines.map((line) => truncateToWidth(line, Math.max(1, width), ""));
+      const content =
+        report.rows.length === 0
+          ? [EMPTY_MESSAGE]
+          : table.slice(1).map((line) => sliceByColumn(line, pan, width));
+      const lines = [...headers.slice(0, panelHeight), ...content.slice(scroll, scroll + viewport)];
+      if (hint)
+        lines.push(theme.fg("dim", "←→ range · ↑↓/PgUp/PgDn rows · Shift+←→ columns · Esc close"));
+      return lines.map((line) => truncateToWidth(line, width, ""));
     },
     handleInput(data) {
       if (matchesKey(data, "escape")) {
         done();
         return;
       }
-      if (matchesKey(data, "up")) scroll = Math.max(0, scroll - 1);
+      if (matchesKey(data, "left") || matchesKey(data, "right")) {
+        const nextIndex = Math.max(
+          0,
+          Math.min(SPEED_RANGES.length - 1, rangeIndex + (matchesKey(data, "right") ? 1 : -1)),
+        );
+        if (nextIndex !== rangeIndex) {
+          rangeIndex = nextIndex;
+          report = deriveSpeedReport(history, SPEED_RANGES[rangeIndex] as SpeedRange);
+          table = speedTable(report);
+          contentLength = Math.max(1, report.rows.length);
+          scroll = 0;
+          pan = 0;
+        }
+      } else if (matchesKey(data, "up")) scroll = Math.max(0, scroll - 1);
       else if (matchesKey(data, "down"))
         scroll = Math.min(Math.max(0, contentLength - viewport), scroll + 1);
       else if (matchesKey(data, "pageUp")) scroll = Math.max(0, scroll - viewport);
       else if (matchesKey(data, "pageDown"))
         scroll = Math.min(Math.max(0, contentLength - viewport), scroll + viewport);
-      else if (matchesKey(data, "left")) pan = Math.max(0, pan - 8);
-      else if (matchesKey(data, "right")) pan = Math.min(maxPan, pan + 8);
+      else if (matchesKey(data, "shift+left")) pan = Math.max(0, pan - 8);
+      else if (matchesKey(data, "shift+right")) pan = Math.min(maxPan, pan + 8);
       else return;
       requestRender();
     },
@@ -347,9 +367,19 @@ export async function showSpeedReport(
   signal: AbortSignal,
 ): Promise<void> {
   if (signal.aborted) return;
-  const report = deriveSpeedReport(history, range);
   if (ctx.mode !== "tui") {
-    await ctx.ui.select(speedReportLines(report, 140).join("\n"), ["Close"], { signal });
+    let selectedRange = range;
+    while (!signal.aborted) {
+      const report = deriveSpeedReport(history, selectedRange);
+      const selected = await ctx.ui.select(
+        speedReportLines(report, 140).join("\n"),
+        [...SPEED_RANGES, "Close"],
+        { signal },
+      );
+      const nextRange = selected === undefined ? undefined : speedRange(selected);
+      if (!nextRange) return;
+      selectedRange = nextRange;
+    }
     return;
   }
   let cleanup: (() => void) | undefined;
@@ -360,7 +390,8 @@ export async function showSpeedReport(
       signal.addEventListener("abort", stop, { once: true });
       if (signal.aborted) stop();
       const component = createSpeedComponent(
-        report,
+        history,
+        range,
         theme,
         () => tui.requestRender(),
         stop,
