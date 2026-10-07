@@ -1,0 +1,55 @@
+{
+  "name": "@strayge/pi-worktree",
+  "version": "0.0.1",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "git",
+    "worktree"
+  ],
+  "description": "Agent-assisted Git worktree management with conversation-preserving workspace switches.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/strayge/pi-extensions.git",
+    "directory": "extensions/pi-worktree"
+  },
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "UPSTREAM.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "biome check . && tsc --noEmit && npm test",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.0.4",
+    "@earendil-works/pi-tui": ">=1.0.4",
+    "typebox": "*"
+  },
+  "dependencies": {
+    "@narumitw/pi-tui-kit": "0.59.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.6",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-tui": "1.0.4",
+    "@types/node": "26.6.4",
+    "typescript": "7.0.2",
+    "typebox": "1.3.27"
+  }
+}
