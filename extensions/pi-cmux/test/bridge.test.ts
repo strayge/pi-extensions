@@ -224,6 +224,28 @@ test("ordinary turns notify only after final settlement and never twice", async 
   await harness.event("session_shutdown");
 });
 
+test("completion notices cannot mistake answer prose for an approval or error", async () => {
+  const harness = setup();
+  await harness.start();
+  const text = "Reviewed permission approvals and error handling. No files changed.";
+  await turn(harness, text);
+  assert.equal(payload("notification").message, "Task completed");
+  assert.deepEqual(payload("notification").notification, { type: "completed" });
+  assert.equal(payload("stop").last_assistant_message, text);
+  assert.equal(payload("stop").cmux_notification_routed, true);
+  await harness.event("session_shutdown");
+});
+
+test("assistant questions retain their input request and notification text", async () => {
+  const harness = setup();
+  await harness.start();
+  const text = "Which option would you prefer?";
+  await turn(harness, text);
+  assert.equal(payload("notification").message, text);
+  assert.deepEqual(payload("notification").notification, { type: "question" });
+  await harness.event("session_shutdown");
+});
+
 test("running or queued background work defers completion without blocking settlement", async () => {
   const manager = background();
   registry[managerKey] = manager;

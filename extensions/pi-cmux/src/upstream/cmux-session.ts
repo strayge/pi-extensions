@@ -1737,7 +1737,11 @@ async function publishPendingCompletion(
     stopPayload.cmux_notification_routed = true;
   } else if (feedDelivered) {
     const notificationRouted = await sendHook(dispatcher, "notification", context, {
-      message: completion.lastAssistantMessage || "Task completed",
+      // cmux scans notification bodies before completion signals, so answer
+      // text mentioning approvals or errors can override the settled state.
+      message: completion.notificationType === "question"
+        ? completion.lastAssistantMessage || "Waiting for input"
+        : "Task completed",
       turn_id: completion.turnId,
       notification: { type: completion.notificationType },
     });

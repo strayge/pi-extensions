@@ -13,6 +13,10 @@ resume behavior, with two additions:
   filesystem/network approvals and global-grant confirmations from
   `pi-permission-modes`, remain covered.
 
+Completion notifications use “Task completed” rather than the answer text, so
+mentions of permissions or errors cannot be mistaken for requests for input.
+Assistant questions and approval notifications remain unchanged.
+
 Requires Pi >=1.0.2 and Node.js >=22.19.0. Outside a cmux surface, it does nothing.
 
 ## Installation
