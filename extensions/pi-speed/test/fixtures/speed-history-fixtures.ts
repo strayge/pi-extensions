@@ -1,3 +1,5 @@
+import type { StreamMeasurement } from "../../src/measurement.ts";
+
 export const FIXED_NOW = Date.parse("2026-09-12T12:00:00.000Z");
 export const DAY_MS = 24 * 60 * 60_000;
 
@@ -84,6 +86,7 @@ export function assistantEntry(options: {
       content: [{ type: "text", text: `fixture-${options.id}` }],
       provider: options.provider ?? "fixture-provider",
       model: options.model ?? "fixture-model",
+      api: "fixture-api",
       usage: options.usage ?? usage(options.output),
       stopReason: options.stopReason ?? "stop",
       ...(start === null ? {} : { timestamp: start }),
@@ -102,6 +105,33 @@ export function thinkingEntry(
 
 export function metadataEntry(id: string, parentId: string | null): FixtureRow {
   return { type: "custom", id, parentId, customType: "fixture:metadata", data: {} };
+}
+
+/** Annotations can live anywhere in a session tree, independently of the selected branch. */
+export function streamEntry(
+  assistant: FixtureRow,
+  overrides: Partial<StreamMeasurement> = {},
+): FixtureRow {
+  const message = assistant.message as FixtureRow;
+  return {
+    type: "custom",
+    id: `stream-${assistant.id}`,
+    parentId: assistant.id,
+    customType: "pi-speed:stream",
+    data: {
+      version: 1,
+      entryId: assistant.id,
+      provider: message.provider,
+      model: message.model,
+      api: message.api,
+      messageTimestamp: message.timestamp,
+      outputTokens: 300,
+      totalOutputTokens: (message.usage as FixtureRow).output,
+      durationMs: 2_000,
+      chunks: 3,
+      ...overrides,
+    },
+  };
 }
 
 export function accountingEntry(options: {
@@ -216,47 +246,14 @@ export const discoveryFixture = {
     since: FIXED_NOW - DAY_MS,
     previousSince: FIXED_NOW - 2 * DAY_MS,
     now: FIXED_NOW,
-    rows: [
-      {
-        provider: "provider-a",
-        model: "alpha",
-        samples: 2,
-        previousSamples: 0,
-        medianRate: 100,
-        totalOutputTokens: 300,
-        totalSeconds: 3,
-        changes: [],
-      },
-      {
-        provider: "provider-b",
-        model: "beta",
-        samples: 1,
-        previousSamples: 0,
-        medianRate: 30,
-        totalOutputTokens: 120,
-        totalSeconds: 4,
-        changes: [],
-      },
-      {
-        provider: "provider-d",
-        model: "subagent",
-        samples: 1,
-        previousSamples: 0,
-        medianRate: 50,
-        totalOutputTokens: 50,
-        totalSeconds: 1,
-        changes: [],
-      },
-    ],
-    coverage: { assistants: 4, observed: 4, unsuccessful: 0, untimed: 0, noOutput: 0 },
+    rows: [],
+    coverage: { assistants: 4, observed: 0, unsuccessful: 0, untimed: 4, noOutput: 0 },
     warnings: [],
   },
   expectedVisibleLines: [
-    "Speed · 1d vs previous 1d",
-    "Provider/model      Median tok/s Total output tokens Total request time Trend       ",
-    "provider-a/alpha    100.0        300                 3.0s               insufficient",
-    "provider-b/beta     30.0         120                 4.0s               insufficient",
-    "provider-d/subagent 50.0         50                  1.0s               insufficient",
+    "Streaming speed · 1d vs previous 1d",
+    "Provider/model Median tok/s Total output tokens Total stream time  Trend       ",
+    "No measured requests in selected period",
   ],
 } as const;
 
@@ -457,47 +454,14 @@ export const normalizationFixture = {
     since: FIXED_NOW - DAY_MS,
     previousSince: FIXED_NOW - 2 * DAY_MS,
     now: FIXED_NOW,
-    rows: [
-      {
-        provider: "provider-a",
-        model: "alpha",
-        samples: 11,
-        previousSamples: 10,
-        medianRate: 50,
-        totalOutputTokens: 1_300,
-        totalSeconds: 21,
-        changes: [-50],
-      },
-      {
-        provider: "provider-a",
-        model: "beta",
-        samples: 3,
-        previousSamples: 0,
-        medianRate: 50,
-        totalOutputTokens: 150,
-        totalSeconds: 3.5,
-        changes: [],
-      },
-      {
-        provider: "provider-a",
-        model: "boundary",
-        samples: 2,
-        previousSamples: 2,
-        medianRate: 10,
-        totalOutputTokens: 20,
-        totalSeconds: 2,
-        changes: [],
-      },
-    ],
-    coverage: { assistants: 22, observed: 16, unsuccessful: 1, untimed: 4, noOutput: 1 },
+    rows: [],
+    coverage: { assistants: 22, observed: 0, unsuccessful: 1, untimed: 21, noOutput: 0 },
     warnings: ["invalid-usage (2)", "untimestamped-call (1)"],
   },
   expectedVisibleLines: [
-    "Speed · 1d vs previous 1d",
-    "Provider/model      Median tok/s Total output tokens Total request time Trend       ",
-    "provider-a/alpha    50.0         1 300               21.0s              -50.0%      ",
-    "provider-a/beta     50.0         150                 3.5s               insufficient",
-    "provider-a/boundary 10.0         20                  2.0s               insufficient",
+    "Streaming speed · 1d vs previous 1d",
+    "Provider/model Median tok/s Total output tokens Total stream time  Trend       ",
+    "No measured requests in selected period",
   ],
 } as const;
 
@@ -800,59 +764,8 @@ export function buildLineageFixture(paths: LineageFixturePaths) {
       since: FIXED_NOW - DAY_MS,
       previousSince: FIXED_NOW - 2 * DAY_MS,
       now: FIXED_NOW,
-      rows: [
-        {
-          provider: "provider-l",
-          model: "cycle",
-          samples: 2,
-          previousSamples: 0,
-          medianRate: 62.5,
-          totalOutputTokens: 200,
-          totalSeconds: 5,
-          changes: [],
-        },
-        {
-          provider: "provider-l",
-          model: "invalid-copy",
-          samples: 1,
-          previousSamples: 0,
-          medianRate: 40,
-          totalOutputTokens: 80,
-          totalSeconds: 2,
-          changes: [],
-        },
-        {
-          provider: "provider-l",
-          model: "main",
-          samples: 2,
-          previousSamples: 0,
-          medianRate: 35,
-          totalOutputTokens: 200,
-          totalSeconds: 7,
-          changes: [],
-        },
-        {
-          provider: "provider-l",
-          model: "missing",
-          samples: 1,
-          previousSamples: 0,
-          medianRate: 50,
-          totalOutputTokens: 100,
-          totalSeconds: 2,
-          changes: [],
-        },
-        {
-          provider: "provider-order",
-          model: "ordering",
-          samples: 3,
-          previousSamples: 0,
-          medianRate: 100,
-          totalOutputTokens: 300,
-          totalSeconds: 3,
-          changes: [],
-        },
-      ],
-      coverage: { assistants: 12, observed: 9, unsuccessful: 1, untimed: 1, noOutput: 1 },
+      rows: [],
+      coverage: { assistants: 12, observed: 0, unsuccessful: 1, untimed: 11, noOutput: 0 },
       warnings: ["cyclic-lineage (1)", "broken-lineage (1)", "invalid-usage (1)"],
     },
   };
@@ -879,8 +792,8 @@ export const outputFixture = {
     output: 999,
   }).message as FixtureRow,
   expectedVisibleLines: [
-    "Speed · 1d vs previous 1d",
-    "Provider/model       Median tok/s Total output tokens Total request time Trend       ",
-    "provider-o/persisted 50.0         100                 2.0s               insufficient",
+    "Streaming speed · 1d vs previous 1d",
+    "Provider/model Median tok/s Total output tokens Total stream time  Trend       ",
+    "No measured requests in selected period",
   ],
 } as const;

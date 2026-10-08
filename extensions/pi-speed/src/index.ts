@@ -7,6 +7,7 @@ import { isAbortError, isStaleExtensionContextError } from "./core.ts";
 import { loadHistory } from "./history.ts";
 import { SPEED_RANGES, showSpeedReport, speedRange } from "./speed.ts";
 import { registerSpeedStatus } from "./speed-status.ts";
+import { registerStreamCollector } from "./stream.ts";
 
 type LoaderResult<T> = { ok: true; value: T } | { ok: false; error: unknown };
 type HistoryLoader = typeof loadHistory;
@@ -46,7 +47,7 @@ export default function speedExtension(pi: ExtensionAPI, load: HistoryLoader = l
   let speedController: AbortController | undefined;
 
   pi.registerCommand("speed", {
-    description: "Show historical model request speed and descriptive cohort changes",
+    description: "Show historical output streaming speed and descriptive cohort changes",
     handler: async (args, ctx) => {
       const argument = args.trim();
       const preset = speedRange(argument);
@@ -88,5 +89,6 @@ export default function speedExtension(pi: ExtensionAPI, load: HistoryLoader = l
   pi.on("session_shutdown", () => {
     speedController?.abort();
   });
+  registerStreamCollector(pi);
   registerSpeedStatus(pi);
 }

@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isStaleExtensionContextError } from "./core.ts";
+import { measurementForMessage, readStreamMeasurements } from "./measurement.ts";
 import { publishStatuslineItem } from "./publish.ts";
 import { medianRequestRate } from "./speed.ts";
 
@@ -19,19 +20,20 @@ export function registerSpeedStatus(pi: ExtensionAPI): void {
 
   const refresh = (ctx: ExtensionContext, model = ctx.model) => {
     if (!ctx.hasUI) return;
+    const measurements = model
+      ? readStreamMeasurements(ctx.sessionManager.getEntries())
+      : new Map();
     const calls = model
       ? ctx.sessionManager.getBranch().flatMap((entry) => {
           if (entry.type !== "message" || entry.message.role !== "assistant") return [];
           const message = entry.message;
           if (message.provider !== model.provider || message.model !== model.id || !message.usage)
             return [];
-          const start = message.timestamp;
-          const end = Date.parse(entry.timestamp);
           return [
             {
               usage: message.usage,
               stopReason: message.stopReason,
-              durationMs: Number.isFinite(start) && start >= 0 ? end - start : undefined,
+              stream: measurementForMessage(measurements, entry.id, message),
             },
           ];
         })
@@ -43,7 +45,7 @@ export function registerSpeedStatus(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => refresh(ctx));
   pi.on("session_tree", (_event, ctx) => refresh(ctx));
   pi.on("model_select", (event, ctx) => refresh(ctx, event.model));
-  // message_end runs before persistence; these boundaries can read the recorded request end.
+  // The collector registers first so turn_end can read the newly appended annotation.
   pi.on("tool_execution_start", (_event, ctx) => refresh(ctx));
   pi.on("turn_end", (_event, ctx) => refresh(ctx));
   pi.on("session_shutdown", (_event, ctx) => setStatus(ctx, undefined));

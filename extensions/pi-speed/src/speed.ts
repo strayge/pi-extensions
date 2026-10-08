@@ -8,6 +8,11 @@ import {
 } from "@earendil-works/pi-tui";
 import { sanitizeDisplayText } from "./core.ts";
 import type { LoadedHistory, NormalizedCall } from "./history.ts";
+import {
+  MIN_OUTPUT_TOKENS,
+  parseStreamMeasurement,
+  type StreamMeasurement,
+} from "./measurement.ts";
 
 export const SPEED_RANGES = ["1d", "2d", "3d", "5d", "7d", "14d"] as const;
 export type SpeedRange = (typeof SPEED_RANGES)[number];
@@ -56,16 +61,22 @@ function positive(value: number | undefined): value is number {
   return value !== undefined && Number.isFinite(value) && value > 0;
 }
 
-type SpeedSample = Pick<NormalizedCall, "stopReason" | "durationMs" | "usage">;
+type SpeedSample = Pick<NormalizedCall, "stopReason" | "stream">;
 
 function rate(call: SpeedSample): number {
-  return call.usage.output / ((call.durationMs as number) / 1_000);
+  const stream = call.stream as StreamMeasurement;
+  return stream.outputTokens / (stream.durationMs / 1_000);
 }
 
 function exclusion(call: SpeedSample): "unsuccessful" | "untimed" | "noOutput" | undefined {
   if (call.stopReason !== "stop" && call.stopReason !== "toolUse") return "unsuccessful";
-  if (!positive(call.durationMs)) return "untimed";
-  if (!positive(call.usage.output) || !positive(rate(call))) return "noOutput";
+  if (
+    call.stream &&
+    (!positive(call.stream.outputTokens) || call.stream.outputTokens < MIN_OUTPUT_TOKENS)
+  )
+    return "noOutput";
+  if (!parseStreamMeasurement(call.stream)) return "untimed";
+  if (!positive(rate(call))) return "noOutput";
   return undefined;
 }
 
@@ -87,7 +98,7 @@ function cohortKey(call: NormalizedCall): string {
   const context = call.usage.input + call.usage.cacheRead + call.usage.cacheWrite;
   return JSON.stringify([
     bin(context, [16_000, 64_000, 128_000]),
-    bin(call.usage.output, [500, 2_000, 8_000]),
+    bin((call.stream as StreamMeasurement).outputTokens, [500, 2_000, 8_000]),
     call.stopReason,
     call.thinkingLevel ?? null,
     call.thinkingLevelInferred === true,
@@ -155,9 +166,12 @@ export function deriveSpeedReport(history: LoadedHistory, range: SpeedRange): Sp
     row.samples = current.length;
     row.previousSamples = previous.length;
     row.medianRate = medianRequestRate(current);
-    row.totalOutputTokens = current.reduce((total, call) => total + call.usage.output, 0);
+    row.totalOutputTokens = current.reduce(
+      (total, call) => total + (call.stream as StreamMeasurement).outputTokens,
+      0,
+    );
     row.totalSeconds = current.reduce(
-      (total, call) => total + (call.durationMs as number) / 1_000,
+      (total, call) => total + (call.stream as StreamMeasurement).durationMs / 1_000,
       0,
     );
     const cohorts = new Map<string, { current: number[]; previous: number[] }>();
@@ -242,7 +256,7 @@ function speedTable(report: SpeedReport): string[] {
     14,
   );
   const values = [
-    ["Provider/model", "Median tok/s", "Total output tokens", "Total request time", "Trend"],
+    ["Provider/model", "Median tok/s", "Total output tokens", "Total stream time", "Trend"],
     ...report.rows.map((row) => [
       label(`${row.provider}/${row.model}`),
       number(row.medianRate),
@@ -263,7 +277,7 @@ function speedTable(report: SpeedReport): string[] {
 }
 
 function title(report: SpeedReport): string {
-  return `Speed · ${report.range} vs previous ${report.range}`;
+  return `Streaming speed · ${report.range} vs previous ${report.range}`;
 }
 
 const EMPTY_MESSAGE = "No measured requests in selected period";

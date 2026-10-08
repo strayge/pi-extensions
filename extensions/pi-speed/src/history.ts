@@ -7,6 +7,14 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 
+import {
+  measurementForMessage,
+  parseStreamMeasurement,
+  readStreamMeasurements,
+  STREAM_ENTRY_TYPE,
+  type StreamMeasurement,
+} from "./measurement.ts";
+
 export const HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 export const HISTORY_BOUNDARY_TOLERANCE_MS = 30 * 60 * 1000;
 
@@ -44,6 +52,7 @@ export interface NormalizedCall {
   usage: NormalizedUsage;
   stopReason?: string;
   kind: "assistant";
+  stream?: StreamMeasurement;
   durationMs?: number;
   thinkingLevel?: string;
   thinkingLevelInferred: boolean;
@@ -112,6 +121,7 @@ interface NormalizedCandidate {
   usage: NormalizedUsage;
   stopReason?: string;
   kind: CandidateKind;
+  stream?: StreamMeasurement;
   durationMs?: number;
   thinkingLevel?: string;
   thinkingLevelInferred: boolean;
@@ -238,6 +248,10 @@ function projectSessionRow(value: Record<string, unknown>): Record<string, unkno
     parentId: value.parentId,
     timestamp: value.timestamp,
   };
+  if (value.type === "custom" && value.customType === STREAM_ENTRY_TYPE) {
+    const data = parseStreamMeasurement(value.data);
+    return data ? { ...base, customType: STREAM_ENTRY_TYPE, data } : base;
+  }
   if (value.type === "model_change") {
     return { ...base, provider: value.provider, modelId: value.modelId };
   }
@@ -261,6 +275,7 @@ function projectSessionRow(value: Record<string, unknown>): Record<string, unkno
         role: "assistant",
         provider: message.provider,
         model: message.model,
+        api: message.api,
         timestamp: message.timestamp,
         usage: message.usage === undefined ? undefined : projectUsage(message.usage),
         stopReason: message.stopReason,
@@ -623,6 +638,7 @@ function normalizePersistedSession(
 ): NormalizedCandidate[] {
   const calls: NormalizedCandidate[] = [];
   const routes = inheritedRoutes(session.entries, signal);
+  const measurements = readStreamMeasurements(session.entries);
   const entriesById = new Map<string, Record<string, unknown>>();
   for (const entry of session.entries) {
     if (typeof entry.id === "string") entriesById.set(entry.id, entry);
@@ -663,6 +679,7 @@ function normalizePersistedSession(
     let fidelity: TimestampFidelity = "entry";
     let kind: CandidateKind;
     let durationMs: number | undefined;
+    let stream: StreamMeasurement | undefined;
     let effort: string | undefined;
     let effortInferred = false;
 
@@ -685,6 +702,7 @@ function normalizePersistedSession(
       model = typeof message.model === "string" ? message.model : undefined;
       stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
       kind = "assistant";
+      stream = measurementForMessage(measurements, entryId, message);
       const embedded = timestamp(message.timestamp);
       const end = timestamp(entry.timestamp);
       if (embedded !== undefined && embedded >= 0 && end !== undefined && end > embedded) {
@@ -761,6 +779,7 @@ function normalizePersistedSession(
       usage,
       stopReason,
       kind,
+      stream,
       durationMs,
       thinkingLevel: effort,
       thinkingLevelInferred: effortInferred,
@@ -967,6 +986,7 @@ export async function loadHistory(
       usage: call.usage,
       stopReason: call.stopReason,
       kind: "assistant",
+      stream: call.stream,
       durationMs: call.durationMs,
       thinkingLevel: call.thinkingLevel,
       thinkingLevelInferred: call.thinkingLevelInferred,

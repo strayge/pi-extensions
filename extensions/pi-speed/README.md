@@ -1,6 +1,6 @@
 # pi-speed
 
-Model-request speed reporting for [pi](https://github.com/earendil-works/pi).
+Output-stream speed reporting for [pi](https://github.com/earendil-works/pi).
 The extension owns the historical `/speed` report and the current-session
 `speed` statusline item. It makes no provider, quota, auth, or model requests.
 
@@ -31,9 +31,9 @@ enabling `pi-speed`; loading both owners would create command and status
 collisions. Then add `pi-speed` separately and reload Pi. Updating `pi-usage`
 alone does not activate speed reporting.
 
-Existing session files and statusline layouts need no migration. The command
-name and `speed` slot ID are unchanged, and no speed database, telemetry record,
-or storage schema is introduced.
+The command name and `speed` slot ID are unchanged. Existing statusline layouts
+continue to work, but legacy sessions without stream measurements cannot supply
+speed values.
 
 ## Historical model speed
 
@@ -45,9 +45,9 @@ load, so every range shares the same fixed end time.
 Each exact provider/model has one row, with reasoning levels pooled. Models
 without usable measurements in the selected period are hidden. The table shows:
 
-- median effective output tokens/second;
-- measured total output tokens;
-- measured total request time; and
+- median streaming output tokens/second;
+- measured text and tool-call output tokens, excluding reasoning;
+- measured total output-stream time; and
 - descriptive Trend values for sufficiently populated comparable cohorts.
 
 Up/Down and PageUp/PageDown scroll rows. Shift+Left/Right pans columns on narrow
@@ -65,7 +65,7 @@ counted twice. Persisted subagent sessions remain eligible when Pi's session
 listing discovers them; arbitrary custom roots are not globally discoverable.
 
 Only persisted sessions are read. Temporary transcript/output artifacts are not
-scanned because they do not provide the request duration required for a visible
+scanned because they do not provide the stream measurements required for a visible
 speed measurement. Quota snapshots, provider adapters, credentials, and usage
 configuration are not read.
 
@@ -76,26 +76,40 @@ report incomplete.
 
 ### Measurements and comparisons
 
-For each eligible persisted assistant response:
+For each eligible assistant response:
 
 ```text
-rate = recorded output tokens
-       / ((session-entry timestamp - embedded message timestamp) / 1000)
+rate = provider-accounted text + tool-call output tokens (excluding reasoning)
+       / ((last payload arrival - first payload arrival) / 1000)
 ```
 
-Output includes reasoning tokens. The elapsed interval approximates the whole
-model request, including network/provider latency and persistence-time extension
-handler overhead, while excluding subsequent tool execution. It is not
-time-to-first-token, pure generation speed, or output-stream timing.
+The extension timestamps actual text and tool-argument payloads through
+`provider_stream_event`, then records compact timing and token counts after the
+assistant entry is persisted. Response content is not copied. Measurements
+survive reload and are excluded from model context.
 
-Only successful `stop` and `toolUse` responses with positive finite elapsed time
-and output contribute. `length`, `error`, `aborted`, unknown stop reasons,
-untimed requests, and zero-output requests are excluded. Standalone usage,
+Supported API families are Codex/OpenAI Responses, OpenAI Chat Completions,
+Anthropic Messages, and Gemini, including OpenCode models using those APIs.
+Missing reasoning counts are not assumed to be zero. Responses without reliable
+non-reasoning accounting, with detected interleaved reasoning, or with ambiguous
+completion-only output are excluded.
+
+Only successful `stop` and `toolUse` responses with at least 250 non-reasoning
+output tokens, two payload chunks, and 1,000 ms from first to last payload
+arrival contribute. Missing, malformed, mismatched, or conflicting measurements
+are excluded; request timestamps are never a fallback. Old history recorded
+without this telemetry is unavailable for speed reporting. Standalone usage,
 compaction, and branch-summary accounting records are never speed observations.
 
+This is approximate observed streaming throughput, not time-to-first-token or
+a pure generation benchmark. The interval omits the wait for the first chunk,
+even though token totals include that chunk. Provider/network buffering and
+parsed-event delivery can distort arrival times. Reasoning-only payloads and
+subsequent tool execution do not count.
+
 A row's speed is the median of individual request rates, not a ratio of summed
-tokens and time. Its token and request-time totals use those same eligible
-requests. Concurrent request durations can overlap, so the total is not
+tokens and time. Its non-reasoning token and stream-time totals use those same
+eligible requests. Concurrent stream durations can overlap, so the total is not
 wall-clock active time.
 
 Every selected range is compared with the immediately preceding equal-length
@@ -105,7 +119,7 @@ provider/model row, comparison cohorts also match:
 - requested thinking level and explicit versus inferred effort provenance;
 - context size (`input + cacheRead + cacheWrite`): `<16k`, `16–64k`, `64–128k`,
   or `>=128k`;
-- output size: `<500`, `500–2k`, `2–8k`, or `>=8k`; and
+- non-reasoning output size: `<500`, `500–2k`, `2–8k`, or `>=8k`; and
 - stop reason: `stop` or `toolUse`.
 
 Effort comes from explicit message metadata or the nearest ancestor
@@ -138,9 +152,9 @@ sessions. Reasoning levels are pooled. The item stays hidden until a usable
 measurement exists.
 
 It refreshes on session start or resume, tree navigation, model selection, tool
-execution start, and turn end. Reload restores the value from recorded branch
-entries. Sampling does not use `message_end`, which Pi emits before persisting
-the assistant entry.
+execution start, and turn end. Reload restores values from recorded stream
+annotations matched to assistant entries on the selected branch. A finalized
+message alone is not a speed measurement.
 
 The value is written through Pi's stock `ctx.ui.setStatus("speed", ...)` channel
 and also published as a placeable statusline slot. Existing layouts continue to
@@ -152,9 +166,8 @@ work:
 
 Without explicit placement, stock footers and statusline catch-all behavior
 remain unchanged. The slot replays its latest value when a later-loaded
-statusline requests it and clears on session shutdown. Status refresh reads only
-the in-memory selected branch; it performs no disk scan, provider request, or
-telemetry write.
+statusline requests it and clears on session shutdown. Status refresh uses
+in-memory session entries; it performs no disk scan or provider request.
 
 ## Development
 

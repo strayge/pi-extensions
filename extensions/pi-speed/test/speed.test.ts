@@ -3,9 +3,11 @@ import { getEventListeners } from "node:events";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { LoadedHistory, NormalizedCall } from "../src/history.ts";
+import type { StreamMeasurement } from "../src/measurement.ts";
 import {
   createSpeedComponent,
   deriveSpeedReport,
+  medianRequestRate,
   SPEED_RANGES,
   showSpeedReport,
   speedRange,
@@ -16,6 +18,22 @@ import {
 const DAY = 24 * 60 * 60_000;
 const NOW = Date.parse("2026-09-12T12:00:00Z");
 
+function stream(overrides: Partial<StreamMeasurement> = {}): StreamMeasurement {
+  return {
+    version: 1,
+    entryId: "response",
+    provider: "provider",
+    model: "model",
+    api: "test-api",
+    messageTimestamp: NOW - 1_000,
+    outputTokens: 300,
+    totalOutputTokens: 900,
+    durationMs: 1_000,
+    chunks: 2,
+    ...overrides,
+  };
+}
+
 function call(overrides: Partial<NormalizedCall> = {}): NormalizedCall {
   return {
     kind: "assistant",
@@ -24,15 +42,16 @@ function call(overrides: Partial<NormalizedCall> = {}): NormalizedCall {
     timestamp: NOW - 1_000,
     timestampFidelity: "embedded",
     stopReason: "stop",
-    durationMs: 1_000,
+    durationMs: 90_000,
+    stream: stream(),
     thinkingLevel: "high",
     thinkingLevelInferred: false,
     usage: {
       input: 10_000,
-      output: 100,
+      output: 900,
       cacheRead: 0,
       cacheWrite: 0,
-      totalTokens: 10_100,
+      totalTokens: 10_900,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
     source: { kind: "session", id: "session" },
@@ -58,12 +77,12 @@ function batch(
   );
 }
 
-test("observed medians use each whole request, not summed tokens over summed time", () => {
+test("observed medians use each output stream, not legacy duration or summed tokens over time", () => {
   const report = deriveSpeedReport(
     history(
       [1, 3, 5, 7].map((seconds, index) =>
         call({
-          durationMs: seconds * 1_000,
+          stream: stream({ durationMs: seconds * 1_000 }),
           thinkingLevel: ["high", "low", undefined, "high"][index],
           thinkingLevelInferred: index === 3,
         }),
@@ -73,9 +92,9 @@ test("observed medians use each whole request, not summed tokens over summed tim
   );
   assert.equal(report.rows.length, 1);
   assert.equal(report.rows[0]?.samples, 4);
-  assert.equal(report.rows[0]?.totalOutputTokens, 400);
+  assert.equal(report.rows[0]?.totalOutputTokens, 1_200);
   assert.equal(report.rows[0]?.totalSeconds, 16);
-  assert.ok(Math.abs((report.rows[0]?.medianRate ?? 0) - (100 / 3 + 20) / 2) < 1e-8);
+  assert.ok(Math.abs((report.rows[0]?.medianRate ?? 0) - (300 / 3 + 60) / 2) < 1e-8);
   assert.deepEqual(report.rows[0]?.changes, []);
   assert.equal(speedTrend([]), "insufficient");
 });
@@ -88,7 +107,7 @@ test("cohorts require ten successful timed requests in each equal-length period"
   ]) {
     const report = deriveSpeedReport(
       history([
-        ...batch(current as number, false, { durationMs: 2_000 }),
+        ...batch(current as number, false, { stream: stream({ durationMs: 2_000 }) }),
         ...batch(previous as number, true),
       ]),
       "1d",
@@ -103,9 +122,9 @@ test("Trend preserves conflicting cohort median changes as a range, not an aggre
   const largeContext = { ...call().usage, cacheRead: 60_000 };
   const report = deriveSpeedReport(
     history([
-      ...batch(10, false, { durationMs: 2_000 / 3 }),
-      ...batch(10, true),
-      ...batch(10, false, { usage: largeContext, durationMs: 1_250 }),
+      ...batch(10, false, { stream: stream({ durationMs: 2_000 }) }),
+      ...batch(10, true, { stream: stream({ durationMs: 3_000 }) }),
+      ...batch(10, false, { usage: largeContext, stream: stream({ durationMs: 1_250 }) }),
       ...batch(10, true, { usage: largeContext }),
     ]),
     "1d",
@@ -121,9 +140,9 @@ test("context, output, and response-type boundaries cannot supply one another's 
     { usage: { ...call().usage, input: 16_000 } },
     { usage: { ...call().usage, input: 64_000 } },
     { usage: { ...call().usage, input: 128_000 } },
-    { usage: { ...call().usage, output: 500 } },
-    { usage: { ...call().usage, output: 2_000 } },
-    { usage: { ...call().usage, output: 8_000 } },
+    { stream: stream({ outputTokens: 500 }) },
+    { stream: stream({ outputTokens: 2_000, totalOutputTokens: 2_000 }) },
+    { stream: stream({ outputTokens: 8_000, totalOutputTokens: 8_000 }) },
     { stopReason: "toolUse" },
   ]) {
     const report = deriveSpeedReport(
@@ -153,10 +172,10 @@ test("exact provider/model rows pool effort and inferred provenance without pool
   const pooled = report.rows.find((row) => row.provider === "provider" && row.model === "model");
   assert.equal(pooled?.samples, 40);
   assert.equal(pooled?.previousSamples, 40);
-  assert.equal(pooled?.totalOutputTokens, 4_000);
+  assert.equal(pooled?.totalOutputTokens, 12_000);
   assert.equal(pooled?.totalSeconds, 40);
   assert.deepEqual(pooled?.changes, [0, 0, 0, 0]);
-  assert.ok(report.rows.every((row) => row.medianRate === 100));
+  assert.ok(report.rows.every((row) => row.medianRate === 300));
   for (const variant of variants.slice(1)) {
     const unmatched = deriveSpeedReport(
       history([...batch(10, false, variant), ...batch(10, true)]),
@@ -178,10 +197,11 @@ test("coverage counts only current assistant requests and excludes failures and 
     call(),
     call({ stopReason: "toolUse" }),
     ...["error", "aborted", "length", undefined].map((stopReason) => call({ stopReason })),
-    ...[undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY].map((durationMs) =>
-      call({ durationMs }),
+    call({ stream: undefined }),
+    ...[0, 999, Number.NaN, Number.POSITIVE_INFINITY].map((durationMs) =>
+      call({ stream: stream({ durationMs }) }),
     ),
-    ...[0, Number.NaN].map((output) => call({ usage: { ...call().usage, output } })),
+    ...[0, 249].map((outputTokens) => call({ stream: stream({ outputTokens }) })),
     call({ timestamp: undefined }),
     call({ timestamp: NOW - DAY - 1, stopReason: "error" }),
   ];
@@ -194,10 +214,10 @@ test("coverage counts only current assistant requests and excludes failures and 
     noOutput: 2,
   });
   assert.equal(report.rows[0]?.samples, 2);
-  assert.equal(report.rows[0]?.totalOutputTokens, 200);
+  assert.equal(report.rows[0]?.totalOutputTokens, 600);
   assert.equal(report.rows[0]?.totalSeconds, 2);
   const missingOnly = deriveSpeedReport(
-    history([call({ durationMs: undefined }), ...batch(10, true)]),
+    history([call({ stream: undefined }), ...batch(10, true)]),
     "1d",
   );
   assert.deepEqual(missingOnly.rows, []);
@@ -205,6 +225,51 @@ test("coverage counts only current assistant requests and excludes failures and 
     speedReportLines(missingOnly, 140).join("\n"),
     /No measured requests in selected period/,
   );
+});
+
+test("shared medians validate stream floors and shape and never fall back to legacy usage or timing", () => {
+  const eligible = call({ stream: stream({ outputTokens: 250, durationMs: 1_000, chunks: 2 }) });
+  assert.equal(medianRequestRate([eligible]), 250);
+  for (const invalid of [
+    { outputTokens: 249 },
+    { durationMs: 999 },
+    { chunks: 1 },
+    { chunks: 2.5 },
+    { totalOutputTokens: 299 },
+    { entryId: "" },
+    { outputTokens: 300.5 },
+  ]) {
+    const rejected = call({ stream: stream(invalid) });
+    assert.equal(medianRequestRate([rejected]), undefined);
+    assert.deepEqual(deriveSpeedReport(history([rejected]), "1d").rows, []);
+  }
+  const malformed = call({ stream: { ...stream(), version: 2 } as unknown as StreamMeasurement });
+  assert.equal(medianRequestRate([malformed]), undefined);
+  const legacy = call({ stream: undefined, durationMs: 1_000 });
+  assert.equal(medianRequestRate([legacy]), undefined);
+  assert.equal(deriveSpeedReport(history([legacy]), "1d").coverage.untimed, 1);
+  assert.equal(medianRequestRate([call({ durationMs: undefined })]), 300);
+});
+
+test("trend output cohorts use nonreason output rather than raw assistant output", () => {
+  const rawReasoningHeavy = { ...call().usage, output: 20_000 };
+  const matched = deriveSpeedReport(
+    history([
+      ...batch(10, false, {
+        usage: rawReasoningHeavy,
+        stream: stream({ totalOutputTokens: 20_000 }),
+      }),
+      ...batch(10, true),
+    ]),
+    "1d",
+  );
+  assert.deepEqual(matched.rows[0]?.changes, [0]);
+  assert.equal(matched.rows[0]?.totalOutputTokens, 3_000);
+  const unmatched = deriveSpeedReport(
+    history([...batch(10, false, { stream: stream({ outputTokens: 500 }) }), ...batch(10, true)]),
+    "1d",
+  );
+  assert.deepEqual(unmatched.rows[0]?.changes, []);
 });
 
 test("range boundaries use the frozen load time and do not count a boundary in both periods", () => {
@@ -318,23 +383,26 @@ test("single-table rendering and scrolling stay width/height safe for Unicode an
 test("table labels distinguish pooled medians and measured totals with compact units", () => {
   const report = deriveSpeedReport(
     history([
-      call({ model: "seconds", usage: { ...call().usage, output: 1_234 } }),
-      call({ model: "minutes", durationMs: 90_000 }),
-      call({ model: "hours", durationMs: 5_400_000 }),
+      call({ model: "seconds", stream: stream({ outputTokens: 1_234, totalOutputTokens: 1_234 }) }),
+      call({ model: "minutes", stream: stream({ durationMs: 90_000 }) }),
+      call({ model: "hours", stream: stream({ durationMs: 5_400_000 }) }),
       call({
         model: "days",
-        durationMs: 129_600_000,
-        usage: { ...call().usage, output: 1_250_000 },
+        stream: stream({
+          durationMs: 129_600_000,
+          outputTokens: 1_250_000,
+          totalOutputTokens: 1_250_000,
+        }),
       }),
     ]),
     "1d",
   );
   const lines = speedReportLines(report, 140);
-  assert.match(lines[1] ?? "", /Median tok\/s\s+Total output tokens\s+Total request time\s+Trend/);
+  assert.match(lines[1] ?? "", /Median tok\/s\s+Total output tokens\s+Total stream time\s+Trend/);
   assert.match(lines.join("\n"), /1 234\s+1\.0s/);
   assert.match(lines.join("\n"), /1\.25 M\s+1\.5d/);
-  assert.match(lines.join("\n"), /100\s+1\.5m/);
-  assert.match(lines.join("\n"), /100\s+1\.5h/);
+  assert.match(lines.join("\n"), /300\s+1\.5m/);
+  assert.match(lines.join("\n"), /300\s+1\.5h/);
   assert.equal(lines.length, 6);
 });
 
@@ -458,9 +526,9 @@ test("RPC range choices update the report directly from the loaded history witho
   await showSpeedReport(ctx as never, loaded, "1d", signal);
   assert.equal(titles.length, 3);
   assert.match(titles[0] ?? "", /1d vs previous 1d/);
-  assert.match(titles[0] ?? "", /100\s+1\.0s/);
+  assert.match(titles[0] ?? "", /300\s+1\.0s/);
   assert.match(titles[1] ?? "", /2d vs previous 2d/);
-  assert.match(titles[1] ?? "", /200\s+2\.0s/);
+  assert.match(titles[1] ?? "", /600\s+2\.0s/);
   assert.match(titles[2] ?? "", /14d vs previous 14d/);
   assert.ok(
     titles.every((title) => title.includes("Median tok/s") && !/Coverage|Warnings/.test(title)),

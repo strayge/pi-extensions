@@ -22,9 +22,11 @@ import {
   discoveryFixture,
   FIXED_NOW,
   type FixtureRow,
+  metadataEntry,
   normalizationFixture,
   outputFixture,
   sessionHeader,
+  streamEntry,
 } from "./fixtures/speed-history-fixtures.ts";
 
 function manager(options: {
@@ -163,18 +165,10 @@ test("golden discovery uses default listing, custom fallback, canonical aliases,
   );
   assert.equal(memoryHistory.calls[0]?.source.kind, "active");
   assert.equal(memoryHistory.calls[0]?.source.path, undefined);
-  assert.deepEqual(oneDay(memoryHistory).rows, [
-    {
-      provider: "provider-c",
-      model: "memory",
-      samples: 1,
-      previousSamples: 0,
-      medianRate: 30,
-      totalOutputTokens: 90,
-      totalSeconds: 3,
-      changes: [],
-    },
-  ]);
+  assert.equal(memoryHistory.calls[0]?.usage.output, 90);
+  assert.equal(memoryHistory.calls[0]?.durationMs, 3_000);
+  assert.equal(memoryHistory.calls[0]?.stream, undefined);
+  assert.deepEqual(oneDay(memoryHistory).rows, []);
 });
 
 test("on-disk age pruning retains only the 30-day boundary tolerance", async (t) => {
@@ -219,18 +213,10 @@ test("on-disk age pruning retains only the 30-day boundary tolerance", async (t)
     history.calls.map((call) => call.entryId),
     ["retained-within-tolerance"],
   );
-  assert.deepEqual(oneDay(history).rows, [
-    {
-      provider: "provider-age",
-      model: "boundary",
-      samples: 1,
-      previousSamples: 0,
-      medianRate: 100,
-      totalOutputTokens: 100,
-      totalSeconds: 1,
-      changes: [],
-    },
-  ]);
+  assert.equal(history.calls[0]?.timestamp, FIXED_NOW - 60_000);
+  assert.equal(history.calls[0]?.usage.output, 100);
+  assert.equal(history.calls[0]?.durationMs, 1_000);
+  assert.deepEqual(oneDay(history).rows, []);
 });
 
 test("golden lineage keeps conservative roots and baseline canonical-copy claimants", async (t) => {
@@ -454,7 +440,9 @@ test("temporary outputs are never read and cannot change visible speed rows", as
   const report = oneDay(history);
   assert.deepEqual(reads, [persisted]);
   assert.deepEqual(speedReportLines(report, 140), outputFixture.expectedVisibleLines);
-  assert.equal(report.coverage.untimed, 0);
+  assert.equal(report.coverage.untimed, 1);
+  assert.equal(history.calls[0]?.entryId, "persisted-output");
+  assert.equal(history.calls[0]?.durationMs, 2_000);
   assert.equal(
     history.warnings.some((warning) => warning.source?.includes(".output")),
     false,
@@ -472,13 +460,13 @@ test("malformed, incomplete, missing-header, and unreadable persisted files keep
     provider: "provider-m",
     model: "survivor",
     start: FIXED_NOW - 10_000,
-    durationMs: 2_000,
-    output: 60,
+    durationMs: 60_000,
+    output: 900,
   });
   await mkdir(dirname(partial), { recursive: true });
   await writeFile(
     partial,
-    `${JSON.stringify(sessionHeader("partial"))}\n{malformed}\n${JSON.stringify(valid)}\n{"partial"`,
+    `${JSON.stringify(sessionHeader("partial"))}\n{malformed}\n${JSON.stringify(valid)}\n${JSON.stringify(streamEntry(valid))}\n{"partial"`,
   );
   await writeJsonl(noHeader, [valid]);
   await writeJsonl(changing, [sessionHeader("changing")]);
@@ -497,8 +485,8 @@ test("malformed, incomplete, missing-header, and unreadable persisted files keep
       model: "survivor",
       samples: 1,
       previousSamples: 0,
-      medianRate: 30,
-      totalOutputTokens: 60,
+      medianRate: 150,
+      totalOutputTokens: 300,
       totalSeconds: 2,
       changes: [],
     },
@@ -515,10 +503,171 @@ test("malformed, incomplete, missing-header, and unreadable persisted files keep
     1,
   );
   assert.deepEqual(speedReportLines(report, 140), [
-    "Speed · 1d vs previous 1d",
-    "Provider/model      Median tok/s Total output tokens Total request time Trend       ",
-    "provider-m/survivor 30.0         60                  2.0s               insufficient",
+    "Streaming speed · 1d vs previous 1d",
+    "Provider/model      Median tok/s Total output tokens Total stream time  Trend       ",
+    "provider-m/survivor 150.0        300                 2.0s               insufficient",
   ]);
+});
+
+test("active and disk annotations attach across all entries, survive reload, and use compact stream data", async (t) => {
+  const root = await workspace(t);
+  const disk = join(root, "disk.jsonl");
+  const activeFile = join(root, "active.jsonl");
+  const active = assistantEntry({ id: "active-stream", output: 900, end: "invalid" });
+  const persisted = assistantEntry({ id: "disk-stream", output: 900, durationMs: 90_000 });
+  const annotation = streamEntry(active, { durationMs: 1_000 });
+  (annotation.data as FixtureRow).privatePayload = { secret: "never project this" };
+  const activeEntries = [
+    active,
+    metadataEntry("later-branch", null),
+    { ...annotation, parentId: "later-branch" },
+    { ...annotation, customType: "other:stream", data: { secret: "unrelated" } },
+  ];
+  await writeJsonl(disk, [sessionHeader("disk"), persisted, streamEntry(persisted)]);
+  await writeJsonl(activeFile, [sessionHeader("active"), ...activeEntries]);
+  const loaded = await loadHistory(
+    context(manager({ id: "active", file: activeFile, dir: root, entries: activeEntries })),
+    { now: FIXED_NOW, listAll: async () => [listed(activeFile), listed(disk)] },
+  );
+  assert.equal(loaded.calls.length, 2);
+  assert.equal(
+    loaded.calls.find((call) => call.entryId === "active-stream")?.durationMs,
+    undefined,
+  );
+  assert.equal(loaded.calls.find((call) => call.entryId === "disk-stream")?.durationMs, 90_000);
+  assert.ok(loaded.calls.every((call) => call.stream?.totalOutputTokens === 900));
+  assert.doesNotMatch(JSON.stringify(loaded), /privatePayload|secret|unrelated/);
+  assert.deepEqual(oneDay(loaded).rows, [
+    {
+      provider: "fixture-provider",
+      model: "fixture-model",
+      samples: 2,
+      previousSamples: 0,
+      medianRate: 225,
+      totalOutputTokens: 600,
+      totalSeconds: 3,
+      changes: [],
+    },
+  ]);
+  const reloaded = await loadHistory(context(manager({ dir: root })), {
+    now: FIXED_NOW,
+    listAll: async () => [listed(disk), listed(activeFile)],
+  });
+  assert.deepEqual(oneDay(reloaded).rows, oneDay(loaded).rows);
+  assert.deepEqual(
+    reloaded.calls.map((call) => [call.entryId, call.stream]).sort(),
+    loaded.calls.map((call) => [call.entryId, call.stream]).sort(),
+  );
+});
+
+test("identity mismatches, malformed annotations, and conflicting valid duplicates never supply speed", async (t) => {
+  const root = await workspace(t);
+  const disk = join(root, "identity.jsonl");
+  const entries: FixtureRow[] = [];
+  const rejected = [
+    { entryId: "wrong-entry" },
+    { provider: "wrong-provider" },
+    { model: "wrong-model" },
+    { api: "wrong-api" },
+    { messageTimestamp: FIXED_NOW },
+    { totalOutputTokens: 901 },
+    { version: 2 },
+    { outputTokens: 249 },
+    { outputTokens: 1_000 },
+    { durationMs: 999 },
+    { chunks: 1 },
+    { chunks: 2.5 },
+    { durationMs: Number.NaN },
+  ];
+  for (const [index, override] of rejected.entries()) {
+    const assistant = assistantEntry({ id: `rejected-${index}`, output: 900 });
+    const annotation = streamEntry(assistant);
+    Object.assign(annotation.data as FixtureRow, override);
+    entries.push(assistant, annotation);
+  }
+  const conflict = assistantEntry({ id: "conflict", output: 900 });
+  entries.push(
+    conflict,
+    streamEntry(conflict),
+    streamEntry(conflict, { durationMs: 3_000 }),
+    streamEntry(conflict),
+  );
+  const accepted = assistantEntry({ id: "identical-duplicates", output: 900 });
+  entries.push(accepted, streamEntry(accepted), streamEntry(accepted));
+  const repaired = assistantEntry({ id: "invalid-does-not-conflict", output: 900 });
+  entries.push(repaired, streamEntry(repaired, { chunks: 1 }), streamEntry(repaired));
+  await writeJsonl(disk, [sessionHeader("identity"), ...entries]);
+  for (const fromDisk of [false, true]) {
+    const loaded = await loadHistory(
+      context(manager({ dir: root, entries: fromDisk ? [] : entries })),
+      {
+        now: FIXED_NOW,
+        listAll: async () => (fromDisk ? [listed(disk)] : []),
+      },
+    );
+    assert.equal(loaded.calls.length, rejected.length + 3);
+    assert.deepEqual(
+      loaded.calls
+        .filter((call) => call.stream)
+        .map((call) => call.entryId)
+        .sort(),
+      ["identical-duplicates", "invalid-does-not-conflict"],
+    );
+    assert.ok(loaded.calls.every((call) => call.durationMs === 1_000));
+    assert.equal(oneDay(loaded).coverage.untimed, rejected.length + 1);
+    assert.equal(oneDay(loaded).rows[0]?.samples, 2);
+  }
+});
+
+test("canonical lineage claimants retain their own telemetry without importing measured fork copies", async (t) => {
+  const root = await workspace(t);
+  const canonical = join(root, "canonical.jsonl");
+  const fork = join(root, "fork.jsonl");
+  const unrelated = join(root, "unrelated.jsonl");
+  const missing = assistantEntry({ id: "unmeasured-canonical", output: 900 });
+  const measured = assistantEntry({ id: "measured-canonical", output: 900 });
+  const accounting = accountingEntry({ id: "accounting-claim", output: 900 });
+  const accountingCopy = assistantEntry({ id: "accounting-claim", output: 900 });
+  await writeJsonl(canonical, [
+    sessionHeader("canonical"),
+    missing,
+    measured,
+    streamEntry(measured),
+    accounting,
+  ]);
+  await writeJsonl(fork, [
+    sessionHeader("fork", canonical),
+    missing,
+    streamEntry(missing),
+    measured,
+    streamEntry(measured, { durationMs: 4_000 }),
+    accountingCopy,
+    streamEntry(accountingCopy),
+    accountingEntry({ id: "later-accounting", at: FIXED_NOW - 10_000 }),
+  ]);
+  await writeJsonl(unrelated, [sessionHeader("unrelated"), missing, streamEntry(missing)]);
+  const loaded = await loadHistory(context(manager({ dir: root })), {
+    now: FIXED_NOW,
+    listAll: async () => [fork, unrelated, canonical].map(listed),
+  });
+  assert.equal(loaded.calls.length, 3);
+  const canonicalCalls = loaded.calls.filter((call) => call.source.path === canonical);
+  assert.equal(canonicalCalls.find((call) => call.entryId === missing.id)?.stream, undefined);
+  assert.equal(
+    canonicalCalls.find((call) => call.entryId === measured.id)?.stream?.durationMs,
+    2_000,
+  );
+  assert.equal(
+    loaded.calls.some((call) => call.source.path === fork),
+    false,
+  );
+  assert.equal(
+    loaded.calls.some((call) => call.entryId === accounting.id),
+    false,
+  );
+  assert.equal(oneDay(loaded).coverage.untimed, 1);
+  assert.equal(oneDay(loaded).rows[0]?.samples, 2);
+  assert.equal(oneDay(loaded).rows[0]?.totalSeconds, 4);
 });
 
 test("history cancellation remains prompt at entry, discovery, and source-read boundaries", async (t) => {
@@ -599,5 +748,8 @@ test("one load captures now once before asynchronous discovery", async (t) => {
   const report = oneDay(history);
   assert.equal(report.now, FIXED_NOW);
   assert.equal(report.since, FIXED_NOW - DAY_MS);
-  assert.equal(report.rows[0]?.samples, 1);
+  assert.equal(history.calls[0]?.timestamp, FIXED_NOW - DAY_MS);
+  assert.equal(history.calls[0]?.durationMs, 1_000);
+  assert.equal(report.coverage.untimed, 1);
+  assert.deepEqual(report.rows, []);
 });

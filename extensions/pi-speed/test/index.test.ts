@@ -27,14 +27,16 @@ test("pi-speed owns only the speed command and speed lifecycle hooks", () => {
   assert.deepEqual([...mock.commands.keys()], ["speed"]);
   assert.equal(mock.commands.get("speed")?.getArgumentCompletions, undefined);
   assert.deepEqual([...mock.events.keys()].sort(), [
+    "message_end",
     "model_select",
+    "provider_stream_event",
     "session_shutdown",
     "session_start",
     "session_tree",
     "tool_execution_start",
     "turn_end",
+    "turn_start",
   ]);
-  assert.equal(mock.events.has("message_end"), false);
 });
 
 test("/speed opens results directly and changes range without reloading or live side effects", async (t) => {
