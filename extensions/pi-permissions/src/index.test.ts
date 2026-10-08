@@ -10,7 +10,7 @@ import { createEventBus, SessionManager, type BashOperations, type ExtensionAPI,
 import { defaultConfig } from "./config-load.ts";
 import permissionExtension from "./index.ts";
 import { bindPath } from "./paths.ts";
-import { LEGACY_STATE_FILE, STATE_FILE } from "./permission-state.ts";
+import { STATE_FILE } from "./permission-state.ts";
 
 type Hook = (event: never, context: ExtensionContext) => unknown;
 function fixture() {
@@ -23,10 +23,11 @@ function fixture() {
   config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: [] };
   config.modes.subproject = config.modes.project!;
   const global = path.join(agentDir, "permissions", "config.json");
-  const projectFile = path.join(project, ".pi", "permission-mode.json");
+  mkdirSync(path.join(project, ".pi", "permissions"));
+  const projectFile = path.join(project, ".pi", "permissions", "config.json");
   const state = path.join(agentDir, "permissions", STATE_FILE);
   writeFileSync(global, JSON.stringify(config), { mode: 0o600 });
-  writeFileSync(projectFile, '{"version":2}', { mode: 0o600 });
+  writeFileSync(projectFile, '{"version":3,"defaultMode":"yolo"}', { mode: 0o600 });
   const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
   const tools = new Map<string, Parameters<ExtensionAPI["registerTool"]>[0]>();
   const hooks = new Map<string, Hook[]>(); const notifications: string[] = [];
@@ -113,21 +114,20 @@ test("macOS startup and state restoration share dependency inspection while relo
   } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
 });
 
-test("obsolete transcript entries carry no authority and unsupported configuration falls back to unrestricted tools", async () => {
+test("unrelated transcript entries carry no authority and unsupported configuration falls back to unrestricted tools", async () => {
   const f = fixture();
   try {
-    f.manager.appendCustomEntry("perm-mode", { mode: "yolo" });
-    f.manager.appendCustomEntry("permission-schema-v2", { acknowledged: true });
+    f.manager.appendCustomEntry("unrelated-mode", { mode: "yolo" });
+    f.manager.appendCustomEntry("unrelated-policy", { acknowledged: true });
     await f.start();
     assert.equal(await f.blocked(), false);
     assert.match(await f.awareness(), /Filesystem profile: project/);
-    writeFileSync(f.global, '{"version":1,"modes":{"code":{"bashAllow":["*"]}}}');
+    writeFileSync(f.global, '{"version":0}');
     await f.start("reload");
     assert.equal(await f.blocked(), false);
     assert.match(await f.awareness(), /Filesystem access is unrestricted and subprocess networking is open/);
     assert.equal(f.governed(), false);
     assert.match(f.notifications.join("\n"), /Unsupported permission configuration version/);
-    assert.doesNotMatch(f.notifications.join("\n"), /legacy policy|acknowledge/);
     await f.reset(); await f.start("reload");
     assert.equal(await f.blocked(), false);
     assert.match(await f.awareness(), /Filesystem profile: project/);
@@ -330,17 +330,18 @@ test("session block commands, clear-global separation, reload and close lifecycl
 });
 
 test("failed startup freezes reset and reload to the original project even across extension reload", async () => {
-  for (const malformed of ['{"modes":{"old":{}}}', '{"version":2,"unexpected":true}']) {
+  for (const malformed of ['{"modes":{"invalid":{}}}', '{"version":4,"unexpected":true}']) {
     const f = fixture();
     try {
       writeFileSync(f.global, malformed);
       await f.start(); assert.equal(await f.blocked(), false);
-      const otherPolicy = path.join(f.other, ".pi", "permission-mode.json");
+      mkdirSync(path.join(f.other, ".pi", "permissions"));
+      const otherPolicy = path.join(f.other, ".pi", "permissions", "config.json");
       writeFileSync(otherPolicy, "untouched"); f.ctx.cwd = f.other;
       await f.reloadExtension(); assert.equal(await f.blocked(), false);
       await f.reset(); await f.reloadExtension();
       assert.equal(readFileSync(otherPolicy, "utf8"), "untouched");
-      assert.equal(readFileSync(f.projectFile, "utf8"), '{"version":2}');
+      assert.equal(readFileSync(f.projectFile, "utf8"), '{"version":3,"defaultMode":"yolo"}');
       assert.ok(!readdirSync(path.dirname(f.projectFile)).some((name) => name.includes("backup")));
       const backup = readdirSync(path.dirname(f.global)).find((name) => name.startsWith("config.json.backup-"));
       assert.equal(readFileSync(path.join(path.dirname(f.global), backup!), "utf8"), malformed);
@@ -355,7 +356,7 @@ test("failed initialization delegates filesystem tools and shell networking to P
   const server = createServer((_request, response) => response.end("network-open"));
   try {
     const validPolicy = readFileSync(f.global, "utf8");
-    writeFileSync(f.global, '{"version":1}');
+    writeFileSync(f.global, '{"version":0}');
     await f.start();
     assert.equal(await f.blocked(), false);
     assert.deepEqual(await f.userBash(), [undefined]);
@@ -407,20 +408,19 @@ test("replacing a saved resource directory enables fallback and a restored bound
   } finally { await f.close(); }
 });
 
-test("old namespace is ignored and byte-untouched through new grants, self-protection, and reset", async () => {
+test("unrelated agent directories are untouched through grants, self-protection, and reset", async () => {
   const f = fixture();
   try {
-    const oldDirectory = path.join(f.agentDir, "permission-mode");
-    mkdirSync(oldDirectory, { mode: 0o700 });
-    const oldConfig = defaultConfig(); oldConfig.defaultMode = "yolo";
-    oldConfig.pathRules = [{ path: f.other, scope: "tree", read: "allow", write: "allow" }];
-    const oldFiles = new Map([
-      ["permission-mode.json", JSON.stringify(oldConfig)],
-      [STATE_FILE, "malformed old private authority"],
-      [LEGACY_STATE_FILE, "unsupported old private authority"],
-      [".authority.lock", "old namespace writer"],
+    const unrelatedDirectory = path.join(f.agentDir, "unrelated");
+    mkdirSync(unrelatedDirectory, { mode: 0o700 });
+    const unrelatedConfig = defaultConfig(); unrelatedConfig.defaultMode = "yolo";
+    unrelatedConfig.pathRules = [{ path: f.other, scope: "tree", read: "allow", write: "allow" }];
+    const unrelatedFiles = new Map([
+      ["config.json", JSON.stringify(unrelatedConfig)],
+      [STATE_FILE, "malformed private authority"],
+      [".authority.lock", "unrelated writer"],
     ]);
-    for (const [name, bytes] of oldFiles) writeFileSync(path.join(oldDirectory, name), bytes, { mode: 0o600 });
+    for (const [name, bytes] of unrelatedFiles) writeFileSync(path.join(unrelatedDirectory, name), bytes, { mode: 0o600 });
     rmSync(f.global);
     await f.start();
     assert.equal(f.governed(), true);
@@ -450,29 +450,30 @@ test("old namespace is ignored and byte-untouched through new grants, self-prote
       const name = readdirSync(path.dirname(target)).find((entry) => entry.startsWith(`${path.basename(target)}.backup-`));
       assert.equal(readFileSync(path.join(path.dirname(target), name!), "utf8"), before[index]);
     }
-    assert.deepEqual(readdirSync(oldDirectory).sort(), [...oldFiles.keys()].sort());
-    for (const [name, bytes] of oldFiles) assert.equal(readFileSync(path.join(oldDirectory, name), "utf8"), bytes);
-    assert.match(f.notifications.join("\n"), /old permission-mode namespace is untouched/);
+    assert.deepEqual(readdirSync(unrelatedDirectory).sort(), [...unrelatedFiles.keys()].sort());
+    for (const [name, bytes] of unrelatedFiles) assert.equal(readFileSync(path.join(unrelatedDirectory, name), "utf8"), bytes);
+    assert.match(f.notifications.join("\n"), /Permission policy initialized/);
     await f.reloadExtension();
     assert.equal(f.governed(), true);
     assert.match(await f.awareness(), /Filesystem profile: project/);
     assert.doesNotMatch(await f.awareness(), /other \(tree, project, id /);
-    for (const [name, bytes] of oldFiles) assert.equal(readFileSync(path.join(oldDirectory, name), "utf8"), bytes);
+    for (const [name, bytes] of unrelatedFiles) assert.equal(readFileSync(path.join(unrelatedDirectory, name), "utf8"), bytes);
   } finally { await f.close(); }
 });
 
-test("reset removes backed-up legacy state in the new namespace instead of migrating authority", async () => {
+test("reset leaves unrelated files beside policy and state untouched", async () => {
   const f = fixture();
   try {
+    const unrelated = path.join(path.dirname(f.state), "unrelated.json");
+    writeFileSync(unrelated, "unrelated data", { mode: 0o600 });
     await f.start();
-    const legacy = path.join(path.dirname(f.state), LEGACY_STATE_FILE);
-    writeFileSync(legacy, "legacy authority", { mode: 0o600 });
+    assert.equal(f.governed(), true);
     await f.reset();
-    assert.equal(existsSync(legacy), false);
-    const backup = readdirSync(path.dirname(legacy)).find((name) => name.startsWith(`${LEGACY_STATE_FILE}.backup-`));
-    assert.equal(readFileSync(path.join(path.dirname(legacy), backup!), "utf8"), "legacy authority");
+    assert.equal(readFileSync(unrelated, "utf8"), "unrelated data");
+    assert.ok(!readdirSync(path.dirname(unrelated)).some((name) => name.startsWith("unrelated.json.backup-")));
     await f.reloadExtension();
     assert.equal(f.governed(), true);
+    assert.equal(readFileSync(unrelated, "utf8"), "unrelated data");
   } finally { await f.close(); }
 });
 
@@ -485,8 +486,8 @@ test("init and reset previews explain losses and defaults while cancellation pre
     f.ctx.ui.confirm = async (title, message, options) => {
       prompts++;
       assert.equal(Reflect.get(options!, Symbol.for("pi-extensions:input-dialog")), false);
-      assert.equal(title, "Initialize permission policy v3?");
-      assert.equal(message, "Backed up\nPolicy and state files in the user permissions directory before reset\n\nDiscarded\nStored approvals across projects in this namespace. They are not migrated.\n\nUnchanged\nOld permission-mode namespace and repository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted");
+      assert.equal(title, "Initialize permission policy?");
+      assert.equal(message, "Backed up\nconfig.json and state-v4.json in the user permissions directory before reset\n\nDiscarded\nStored approvals across projects.\n\nUnchanged\nAll other files and directories.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted");
       return false;
     };
     for (const action of ["init", "reset"]) {
@@ -538,11 +539,12 @@ test("reset respects state locking and retains the original project root across 
     writeFileSync(lock, "other writer", { mode: 0o600 });
     const before = readFileSync(f.global, "utf8");
     await assert.rejects(f.reset(), /EEXIST/); assert.equal(readFileSync(f.global, "utf8"), before); rmSync(lock);
-    const otherPolicy = path.join(f.other, ".pi", "permission-mode.json"); writeFileSync(otherPolicy, "untouched");
+    mkdirSync(path.join(f.other, ".pi", "permissions"));
+    const otherPolicy = path.join(f.other, ".pi", "permissions", "config.json"); writeFileSync(otherPolicy, "untouched");
     f.ctx.cwd = f.other;
     await f.reset(); await f.start("reload");
     assert.equal(readFileSync(otherPolicy, "utf8"), "untouched");
-    assert.equal(readFileSync(f.projectFile, "utf8"), '{"version":2}');
+    assert.equal(readFileSync(f.projectFile, "utf8"), '{"version":3,"defaultMode":"yolo"}');
     assert.ok(!readdirSync(path.dirname(f.projectFile)).some((name) => name.includes("backup")));
     assert.equal(await f.blocked(), false);
     assert.match(await f.awareness(), new RegExp(f.project));

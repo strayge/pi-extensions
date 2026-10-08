@@ -121,7 +121,7 @@ test("Pi's actual extension loader keeps stock tools usable when root policy ini
   const dir = mkdtempSync(path.join(tmpdir(), "permission-fallback-sdk-"));
   const project = path.join(dir, "project"); const outside = path.join(dir, "outside"); const agentDir = path.join(dir, "agent");
   for (const value of [project, outside, agentDir, path.join(agentDir, "permissions")]) mkdirSync(value, { mode: 0o700 });
-  writeFileSync(path.join(agentDir, "permissions", "config.json"), '{"version":1}', { mode: 0o600 });
+  writeFileSync(path.join(agentDir, "permissions", "config.json"), '{"version":0}', { mode: 0o600 });
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
@@ -162,7 +162,8 @@ test("real loader refreshes runtime resources on reload and restores pathname gr
   config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: ["pi"] };
   config.modes.subproject = config.modes.project!;
   writeFileSync(path.join(agentDir, "permissions", "config.json"), JSON.stringify(config), { mode: 0o600 });
-  writeFileSync(path.join(project, ".pi", "permission-mode.json"), '{"version":2}');
+  mkdirSync(path.join(project, ".pi", "permissions"));
+  writeFileSync(path.join(project, ".pi", "permissions", "config.json"), '{"version":3,"defaultMode":"yolo"}');
   writeFileSync(path.join(outside, "sentinel"), "original");
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR; const previousHome = process.env.HOME; const previousEntry = process.argv[1];
   process.env.PI_CODING_AGENT_DIR = agentDir; process.env.HOME = dir; process.argv[1] = entry;
@@ -191,7 +192,8 @@ test("real loader refreshes runtime resources on reload and restores pathname gr
     assert.match(JSON.stringify((await tool("read").execute("runtime", { path: path.join(piPackage, "updated") })).content), /runtime refreshed/);
     await session!.extensionRunner!.emit({ type: "session_shutdown", reason: "quit" }); session!.dispose(); session = undefined;
     renameSync(project, `${project}-old`); mkdirSync(project); mkdirSync(path.join(project, ".pi"));
-    writeFileSync(path.join(project, ".pi", "permission-mode.json"), '{"version":2}'); writeFileSync(path.join(project, "credential"), "secret");
+    mkdirSync(path.join(project, ".pi", "permissions"));
+    writeFileSync(path.join(project, ".pi", "permissions", "config.json"), '{"version":3,"defaultMode":"yolo"}'); writeFileSync(path.join(project, "credential"), "secret");
     renameSync(outside, `${outside}-old`); mkdirSync(outside); writeFileSync(path.join(outside, "sentinel"), "restored pathname grant");
     await load();
     assert.match(JSON.stringify((await tool("read").execute("restore", { path: path.join(outside, "sentinel") })).content), /restored pathname grant/);

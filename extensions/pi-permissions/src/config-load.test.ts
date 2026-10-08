@@ -37,14 +37,14 @@ test("macOS defaults include writable var/folders without overriding explicit fi
   assert.deepEqual(explicit.modes.project!.filesystem, scoped);
 });
 
-test("process mode defaults to compatible, accepts strict, and preserves legacy configuration shapes", () => {
+test("process mode defaults to compatible, accepts strict, and remains optional", () => {
   const config = defaultConfig();
   assert.equal(config.processMode, "compatible");
   assert.equal(mergeConfig(config, { version: 3, processMode: "strict" }).processMode, "strict");
   for (const processMode of [null, "relaxed", false])
     assert.throws(() => mergeConfig(config, { version: 3, processMode }), /processMode/);
-  const legacy = { ...config }; delete legacy.processMode;
-  assert.deepEqual(parseConfig(legacy), legacy);
+  const withoutProcessMode = { ...config }; delete withoutProcessMode.processMode;
+  assert.deepEqual(parseConfig(withoutProcessMode), withoutProcessMode);
   const schema = JSON.parse(readFileSync(new URL("../schemas/permissions.schema.json", import.meta.url), "utf8"));
   assert.deepEqual(schema.properties.processMode.enum, ["compatible", "strict"]);
   assert.equal(schema.properties.processMode.default, "compatible");
@@ -60,13 +60,13 @@ test("v3 allow/ask/deny syntax agrees with the schema and repository policy is n
   const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-user-only-"))).canonical;
   try {
     const agentDir = path.join(dir, "agent");
-    mkdirSync(agentDir); mkdirSync(path.join(agentDir, "permissions")); mkdirSync(path.join(dir, ".pi"));
-    writeFileSync(path.join(dir, ".pi", "permission-mode.json"), "malformed and expansive repository input");
+    mkdirSync(agentDir); mkdirSync(path.join(agentDir, "permissions")); mkdirSync(path.join(dir, ".pi", "permissions"), { recursive: true });
+    writeFileSync(path.join(dir, ".pi", "permissions", "config.json"), "malformed and expansive repository input");
     const raw = { version: 3, pathRules: [{ path: "~/notes", scope: "file", read: "allow", write: "ask" }] };
     writeFileSync(path.join(agentDir, "permissions", "config.json"), JSON.stringify(raw));
     assert.deepEqual(loadConfig(agentDir, dir).global.pathRules, raw.pathRules);
     assert.equal(loadConfig(agentDir, dir).global.version, 3);
-    assert.throws(() => mergeConfig(defaultConfig(), { ...raw, version: 2 }), /only version 3/);
+    assert.throws(() => mergeConfig(defaultConfig(), { ...raw, version: 4 }), /expected 3/);
     for (const action of ["allow", "ask", "deny"]) {
       for (const operation of ["read", "write"])
         assert.throws(() => mergeConfig(defaultConfig(), { version: 3, pathRules: [{ path: "~/notes", scope: "file", [operation]: [action] }] }), /must be allow, ask, or deny/);

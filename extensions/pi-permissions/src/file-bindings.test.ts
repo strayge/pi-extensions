@@ -182,14 +182,14 @@ test("file-boundary tampering in saved state fails closed", () => {
   } finally { f.close(); }
 });
 
-test("old saved authority is left untouched and never restored into the new format", () => {
+test("unrelated state files are ignored without restoring authority", () => {
   const f = fixture();
   try {
     const store = new PermissionStore(f.dir);
-    const old = path.join(store.directory, "state-v2.json");
-    writeFileSync(old, '{"version":2,"sessions":{"old":{"mode":"yolo"}},"projects":{}}', { mode: 0o600 });
-    const before = readFileSync(old, "utf8");
-    const binding = { id: "old", file: path.join(f.dir, "session.jsonl"), cwd: f.project };
+    const unrelated = path.join(store.directory, "unrelated.json");
+    writeFileSync(unrelated, '{"version":4,"sessions":{"unrelated":{"mode":"yolo"}},"projects":{}}', { mode: 0o600 });
+    const before = readFileSync(unrelated, "utf8");
+    const binding = { id: "unrelated", file: path.join(f.dir, "session.jsonl"), cwd: f.project };
     writeFileSync(binding.file, "session");
     const restored = store.load(binding, f.project, f.context);
     assert.equal(restored.session, undefined);
@@ -197,7 +197,7 @@ test("old saved authority is left untouched and never restored into the new form
     const owner = new PermissionOwner(f.catalog, { store, ask: async () => undefined });
     assert.equal(owner.snapshot().mode, "project");
     assert.equal(owner.network.snapshot().restricted, false);
-    assert.equal(readFileSync(old, "utf8"), before);
+    assert.equal(readFileSync(unrelated, "utf8"), before);
     assert.equal(JSON.parse(readFileSync(path.join(store.directory, STATE_FILE), "utf8")).version, 4);
   } finally { f.close(); }
 });

@@ -90,7 +90,7 @@ test("macOS catalogs inspect dependencies once per build and do not cache them a
 });
 
 test("v3 rejects unsupported versions and replaces explicit user arrays", () => {
-  for (const version of [undefined, 1, 2])
+  for (const version of [undefined, null, 0, 4, "3"])
     assert.throws(() => mergeConfig(defaultConfig(), { version, modes: {} }), /Unsupported permission configuration version/);
   assert.throws(
     () => mergeConfig(defaultConfig(), { version: 3, modes: { project: { permission: {} } } }),

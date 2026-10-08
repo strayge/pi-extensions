@@ -46,7 +46,7 @@ function profile(value: unknown): FilesystemProfile {
 
 export function parseConfig(value: unknown): PermissionModeConfig {
   const c = object(value, "permission configuration");
-  if (c.version !== 3) throw new Error("Unsupported permission configuration version; only version 3 is supported. Back up customized policy and explicitly run /perm reset.");
+  if (c.version !== 3) throw new Error("Unsupported permission configuration version; expected 3.");
   keys(c, ["version", "$schema", "defaultMode", "processMode", "cycleOrder", "modes", "pathRules", "network"], "configuration");
   if (c.processMode !== undefined && c.processMode !== "compatible" && c.processMode !== "strict")
     throw new Error("processMode must be compatible or strict");
@@ -110,7 +110,7 @@ export function parseConfig(value: unknown): PermissionModeConfig {
 /** Explicit arrays replace defaults; a profile's filesystem field replaces the whole profile scope. */
 export function mergeConfig(base: PermissionModeConfig, raw: unknown): PermissionModeConfig {
   const overlay = object(raw, "configuration override");
-  if (overlay.version !== 3) throw new Error("Unsupported permission configuration version; only version 3 is supported. Back up customized policy and explicitly run /perm reset.");
+  if (overlay.version !== 3) throw new Error("Unsupported permission configuration version; expected 3.");
   keys(
     overlay,
     ["version", "$schema", "defaultMode", "processMode", "cycleOrder", "modes", "pathRules", "network"],

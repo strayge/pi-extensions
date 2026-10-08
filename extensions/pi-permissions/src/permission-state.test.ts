@@ -8,7 +8,7 @@ import test from "node:test";
 import { PermissionOwner } from "./approvals.ts";
 import { defaultConfig } from "./config-load.ts";
 import { bindPath, resolvePermissionBinding } from "./paths.ts";
-import { LEGACY_STATE_FILE, PermissionStore, STATE_FILE } from "./permission-state.ts";
+import { PermissionStore, STATE_FILE } from "./permission-state.ts";
 import { resolveCatalog } from "./policy.ts";
 
 async function fixture(runtime = false) {
@@ -61,7 +61,7 @@ test("fresh launches restore pathname authority with new identities while live o
   } finally { f.close(); }
 });
 
-test("saved catalogs preserve strict process mode and legacy omissions restore as compatible", async () => {
+test("saved catalogs preserve strict process mode and omitted process mode defaults to compatible", async () => {
   const f = await fixture();
   try {
     const document = JSON.parse(readFileSync(f.file, "utf8"));
@@ -105,25 +105,17 @@ test("saved authority omits inode snapshots and runtime resources without changi
   } finally { f.close(); }
 });
 
-test("legacy state is rejected untouched instead of migrating authority", async () => {
-  const f = await fixture(true);
+test("unsupported versions of the current state file are rejected without rewriting authority", async () => {
+  const f = await fixture();
   try {
-    const restored = new PermissionStore(f.dir).load(f.binding, f.project, f.context);
     const document = JSON.parse(readFileSync(f.file, "utf8"));
-    document.version = 3;
-    const projectKey = JSON.stringify(f.project); const sessionKey = JSON.stringify(f.binding.id);
-    document.projects[projectKey] = restored.project;
-    document.sessions[sessionKey] = restored.session;
-    const otherBinding = { ...f.binding, id: randomUUID() };
-    document.sessions[JSON.stringify(otherBinding.id)] = { ...restored.session, binding: otherBinding };
-    const legacy = path.join(path.dirname(f.file), LEGACY_STATE_FILE);
-    const original = JSON.stringify(document, (field, value) => field === "runtime" ? undefined : value);
-    writeFileSync(legacy, original, { mode: 0o600 }); rmSync(f.file);
-    renameSync(f.piPackage, `${f.piPackage}-old`); mkdirSync(f.piPackage);
-    renameSync(f.outside, `${f.outside}-old`); mkdirSync(f.outside);
-    assert.throws(() => new PermissionStore(f.dir).load(f.binding, f.project, f.context), /Unsupported legacy.*reset/);
-    assert.equal(readFileSync(legacy, "utf8"), original);
-    assert.equal(fs.existsSync(f.file), false);
+    for (const version of [undefined, null, 0, 5, "4"]) {
+      document.version = version;
+      const unsupported = JSON.stringify(document);
+      writeFileSync(f.file, unsupported);
+      assert.throws(() => new PermissionStore(f.dir).load(f.binding, f.project, f.context), /Invalid saved permission state shape|Unsupported or malformed permission state/);
+      assert.equal(readFileSync(f.file, "utf8"), unsupported);
+    }
   } finally { f.close(); }
 });
 
@@ -146,7 +138,7 @@ test("malformed saved authority cannot widen configuration or bypass remembered-
       (d: typeof original) => { d.projects[projectKey].catalog.profiles.docs.grants[0].access = "write"; },
       (d: typeof original) => { delete d.projects[projectKey].catalog; },
       (d: typeof original) => { d.projects[projectKey].grants[0].lifetime = "session"; },
-      (d: typeof original) => { d.projects[projectKey].grants[0].command = "legacy approval"; },
+      (d: typeof original) => { d.projects[projectKey].grants[0].unexpected = true; },
       (d: typeof original) => { d.projects[projectKey].exceptions[0].ruleId = "orphan"; },
       (d: typeof original) => { d.projects[projectKey].catalog.rules[0].read = "deny"; },
       (d: typeof original) => { d.projects[projectKey].catalog.root.binding.canonical = f.dir; },
@@ -194,9 +186,9 @@ test("current user policy supersedes obsolete cache targets and prunes only obso
     assert.equal(restored.session!.exceptions.length, 0);
     assert.equal(restored.project.grants.length, 1);
     assert.equal(readFileSync(f.file, "utf8"), before);
-    document.projects[JSON.stringify(f.project)].catalog.config.version = 2;
+    document.projects[JSON.stringify(f.project)].catalog.config.version = 4;
     const unsupported = JSON.stringify(document); writeFileSync(f.file, unsupported);
-    assert.throws(() => new PermissionStore(f.dir).load(f.binding, f.project, f.context, config), /only version 3/);
+    assert.throws(() => new PermissionStore(f.dir).load(f.binding, f.project, f.context, config), /expected 3/);
     assert.equal(readFileSync(f.file, "utf8"), unsupported);
   } finally { f.close(); }
 });

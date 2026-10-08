@@ -10,8 +10,6 @@ import { freeze, isRuntimeResource, resolveCatalog, survivingRules, type Resolut
 import type { AccessGrant, NetworkSnapshot, PathBinding, PermissionBinding, PermissionModeConfig, ResolvedCatalog, RuleException } from "./schema.ts";
 
 export const STATE_FILE = "state-v4.json";
-/** Only explicit reset may touch this unsupported authority document. */
-export const LEGACY_STATE_FILE = "state-v3.json";
 
 export interface SessionBinding { id: string; file: string; cwd: string }
 export interface SavedState {
@@ -189,10 +187,6 @@ export class PermissionStore {
           throw new Error("Unsupported or malformed permission state; explicitly run /perm reset");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        try { lstatSync(path.join(this.directory, LEGACY_STATE_FILE)); }
-        catch (legacyError) { if ((legacyError as NodeJS.ErrnoException).code !== "ENOENT") throw legacyError; }
-        if (bindPath(path.join(this.directory, LEGACY_STATE_FILE)).missing.length === 0)
-          throw new Error("Unsupported legacy permission state; explicitly run /perm reset. Approvals are not migrated.");
       }
       const outcome = operation(document);
       signal?.throwIfAborted();

@@ -36,7 +36,7 @@ import { createSearchTools } from "./filtered-search.ts";
 import { normalizeDomain } from "./network.ts";
 import { assertBinding, bindPath, configLocation, modelPath } from "./paths.ts";
 import { activePiPackage, resolveCatalog } from "./policy.ts";
-import { LEGACY_STATE_FILE, PermissionStore, STATE_FILE, type SessionBinding } from "./permission-state.ts";
+import { PermissionStore, STATE_FILE, type SessionBinding } from "./permission-state.ts";
 import { runtime } from "./sandbox.ts";
 import { GlobalPolicyWriter } from "./policy-write.ts";
 import { createStatus } from "./status.ts";
@@ -251,8 +251,8 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         if (!ctx.hasUI) throw new Error("Permission setup requires user acknowledgement in the UI");
         if (
           !(await ctx.ui.confirm(
-            "Initialize permission policy v3?",
-            "Backed up\nPolicy and state files in the user permissions directory before reset\n\nDiscarded\nStored approvals across projects in this namespace. They are not migrated.\n\nUnchanged\nOld permission-mode namespace and repository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted",
+            "Initialize permission policy?",
+            "Backed up\nconfig.json and state-v4.json in the user permissions directory before reset\n\nDiscarded\nStored approvals across projects.\n\nUnchanged\nAll other files and directories.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted",
             approvalDialogOptions(false),
           ))
         )
@@ -274,7 +274,6 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         const files = [
           path.join(directory, "config.json"),
           path.join(directory, STATE_FILE),
-          path.join(directory, LEGACY_STATE_FILE),
         ];
         for (const file of files) {
           const binding = bindPath(file);
@@ -318,7 +317,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
             try { closeSync(lockFd); } catch {}
           }
         }
-        ctx.ui.notify("Version 3 policy initialized. Restart Pi to discard old owner/runtime prototypes. Previous files in the user permissions directory are preserved as .backup-*; the old permission-mode namespace is untouched. Reapprove paths and restore reviewed custom rules manually.", "info");
+        ctx.ui.notify("Permission policy initialized. Restart Pi to apply the reset. Policy and state files are preserved as .backup-*. Reapprove paths and restore reviewed custom rules manually.", "info");
         return;
       }
       const active = getOwner();

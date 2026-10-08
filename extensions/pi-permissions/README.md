@@ -25,23 +25,15 @@ Both modes retain filesystem and network restrictions. Detached macOS descendant
 
 To opt into strict mode, add `"processMode": "strict"` to the user-owned version-3 policy. Repository permission policies are never read. Fully unrestricted, open-network direct execution has no sandbox preventing process-group escape, so it always uses compatible cleanup even when the policy selects strict mode.
 
-## Setup and state compatibility
+## Setup and configuration
 
 Requires pi >=1.0.2. Load the local package, or install `npm:@strayge/pi-permissions` when available. On Linux, install bubblewrap (with FD bind-mount support), socat, and ripgrep using your system package manager. On macOS, scoped access requires APFS and Apple's `/usr/bin/sandbox-exec`; search uses Homebrew ripgrep (`brew install ripgrep`). No bubblewrap or socat is needed on macOS. The runtime dependency is pinned and patched by `patch-package` during installation.
 
-The only policy source is `<agent-dir>/permissions/config.json`, normally `~/.pi/agent/permissions/config.json`. Missing configuration uses shipped defaults. Private state and the shared writer lock live beside it as `state-v4.json` and `.authority.lock`. Repository `.pi/permission-mode.json` files remain obsolete and are never read, imported, changed, backed up, or deleted.
+The only policy source is `<agent-dir>/permissions/config.json`, normally `~/.pi/agent/permissions/config.json`. Missing configuration uses shipped defaults. Private state and the shared writer lock live beside it as `state-v4.json` and `.authority.lock`. Repository permission policies and other state filenames are ignored.
 
-**The rename starts a fresh namespace, not a migration.** Existing custom restrictions and grants do not automatically apply. The old `permission-mode` directory is untouched, including by `/perm init` and `/perm reset`; no private state is imported. Configuration stays version 3 and private state stays version 4. Unsupported catalogs or `state-v3.json` inside the new directory remain rejected until explicit reset.
+Use `/perm init` or `/perm reset` to write shipped defaults after acknowledging the root-UI dialog. Both commands back up existing `config.json` and `state-v4.json`, discard stored approvals across projects, and leave all other files untouched. Fully restart Pi afterward, then reapprove required paths and restore reviewed custom rules manually.
 
-Manual rollout from `pi-permission-modes`:
-
-1. Stop Pi and independently back up customized policy. Remove the old installation/loading reference; **never load both identities**.
-2. Install `npm:@strayge/pi-permissions` **when available**, or repoint local loading to `extensions/pi-permissions`.
-3. Start Pi and set up fresh `permissions/config.json` with `/perm init` or `/perm reset`, acknowledging the root-UI dialog. Only policy/state files in the new namespace are backed up or reset. Reapprove required paths.
-4. If manually restoring a v3 policy, review its `pathRules`: explicit arrays replace defaults, so update self-protection to `$AGENT_DIR/permissions` and retain credential protection. Private approvals are not migrated.
-5. **Fully restart Pi**, not `/reload`, after rollout to discard retained owner/runtime prototypes.
-
-Headless tools cannot reset policy. Cancellation before replacement changes no authority; backups finish before source files change, and failed replacements restore changed sources. Reset stays anchored to the frozen starting project even after failed initialization, extension reload, or a different command cwd. Unsupported or malformed policy/state in the new namespace retain the warned **unrestricted initialization fallback** described below until repaired/reset; do not mistake that warning for confinement.
+Headless tools cannot reset policy. Cancellation before replacement changes no authority; backups finish before source files change, and failed replacements restore changed sources. Reset stays anchored to the frozen starting project even after failed initialization, extension reload, or a different command cwd. Unsupported or malformed policy/state retain the warned **unrestricted initialization fallback** described below until repaired/reset; do not mistake that warning for confinement.
 
 Example custom profile:
 
