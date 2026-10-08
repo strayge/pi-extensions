@@ -132,7 +132,7 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     for (const b of BUILTINS) expect(active).toContain(b);
   });
 
-  it("keeps real read and shell tools working when permission modes is not installed", async () => {
+  it("keeps real read and shell tools working when permissions is not installed", async () => {
     const file = join(cwd, "sentinel.txt");
     writeFileSync(file, "no-permission-package");
     let read: Promise<unknown> | undefined;
@@ -149,9 +149,9 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
   });
 
   it("does not activate an installed permission package when the parent has no policy", async () => {
-    const packageDir = join(process.env.PI_CODING_AGENT_DIR!, "extensions", "pi-permission-modes");
+    const packageDir = join(process.env.PI_CODING_AGENT_DIR!, "extensions", "pi-permissions");
     mkdirSync(join(packageDir, "src"), { recursive: true });
-    writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "@test/pi-permission-modes", type: "module", pi: { extensions: ["./src/index.js"] } }));
+    writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "@strayge/pi-permissions", type: "module", pi: { extensions: ["./src/index.js"] } }));
     const marker = join(cwd, "permission-started");
     writeFileSync(join(packageDir, "src", "index.js"), `
       import { writeFileSync } from "node:fs";

@@ -41,8 +41,8 @@ test("isolated SDK child keeps inherited direct and shell enforcement and sees p
   config.modes.subproject = config.modes.project!;
   const root = { family: randomUUID(), binding: bindPath(project) };
   const resolution = { agentDir, home: dir };
-  mkdirSync(path.join(agentDir, "permission-mode"), { mode: 0o700 });
-  writeFileSync(path.join(agentDir, "permission-mode", "permission-mode.json"), JSON.stringify(config), { mode: 0o600 });
+  mkdirSync(path.join(agentDir, "permissions"), { mode: 0o700 });
+  writeFileSync(path.join(agentDir, "permissions", "config.json"), JSON.stringify(config), { mode: 0o600 });
   const owner = new PermissionOwner(resolveCatalog(config, root, resolution), {
     ask: async () => undefined, policyWriter: new GlobalPolicyWriter(resolution), confirmGlobal: async () => true,
   });
@@ -120,8 +120,8 @@ test("isolated SDK child keeps inherited direct and shell enforcement and sees p
 test("Pi's actual extension loader keeps stock tools usable when root policy initialization fails", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "permission-fallback-sdk-"));
   const project = path.join(dir, "project"); const outside = path.join(dir, "outside"); const agentDir = path.join(dir, "agent");
-  for (const value of [project, outside, agentDir, path.join(agentDir, "permission-mode")]) mkdirSync(value, { mode: 0o700 });
-  writeFileSync(path.join(agentDir, "permission-mode", "permission-mode.json"), '{"version":1}', { mode: 0o600 });
+  for (const value of [project, outside, agentDir, path.join(agentDir, "permissions")]) mkdirSync(value, { mode: 0o700 });
+  writeFileSync(path.join(agentDir, "permissions", "config.json"), '{"version":1}', { mode: 0o600 });
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
@@ -154,14 +154,14 @@ test("real loader refreshes runtime resources on reload and restores pathname gr
   const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-restart-sdk-"))).canonical;
   const project = path.join(dir, "project"); const outside = path.join(dir, "outside");
   const agentDir = path.join(dir, "agent"); const piPackage = path.join(dir, "pi-runtime");
-  for (const value of [project, outside, agentDir, piPackage, path.join(project, ".pi"), path.join(agentDir, "permission-mode")]) mkdirSync(value, { mode: 0o700 });
+  for (const value of [project, outside, agentDir, piPackage, path.join(project, ".pi"), path.join(agentDir, "permissions")]) mkdirSync(value, { mode: 0o700 });
   const entry = path.join(piPackage, "cli.js");
   const manifest = JSON.stringify({ name: "@earendil-works/pi-coding-agent" });
   writeFileSync(entry, ""); writeFileSync(path.join(piPackage, "package.json"), manifest);
   const config = defaultConfig(); config.pathRules = [{ path: "credential", scope: "file", read: "deny" }];
   config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: ["pi"] };
   config.modes.subproject = config.modes.project!;
-  writeFileSync(path.join(agentDir, "permission-mode", "permission-mode.json"), JSON.stringify(config), { mode: 0o600 });
+  writeFileSync(path.join(agentDir, "permissions", "config.json"), JSON.stringify(config), { mode: 0o600 });
   writeFileSync(path.join(project, ".pi", "permission-mode.json"), '{"version":2}');
   writeFileSync(path.join(outside, "sentinel"), "original");
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR; const previousHome = process.env.HOME; const previousEntry = process.argv[1];
@@ -211,12 +211,12 @@ test("real root SDK session switches retire child leases and cannot inherit sess
   const dir = mkdtempSync(path.join(tmpdir(), "permission-root-sdk-"));
   const project = path.join(dir, "project"); const outside = path.join(dir, "outside"); const agentDir = path.join(dir, "agent");
   for (const value of [project, outside, agentDir]) mkdirSync(value, { mode: 0o700 });
-  mkdirSync(path.join(agentDir, "permission-mode"), { mode: 0o700 });
+  mkdirSync(path.join(agentDir, "permissions"), { mode: 0o700 });
   writeFileSync(path.join(outside, "sentinel"), "session-only");
   const config = defaultConfig(); config.pathRules = [];
   config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: [] };
   config.modes.subproject = config.modes.project!;
-  writeFileSync(path.join(agentDir, "permission-mode", "permission-mode.json"), JSON.stringify(config), { mode: 0o600 });
+  writeFileSync(path.join(agentDir, "permissions", "config.json"), JSON.stringify(config), { mode: 0o600 });
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = agentDir;
   const events = createEventBus();
   const factory: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {

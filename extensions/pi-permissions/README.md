@@ -1,4 +1,4 @@
-# pi-permission-modes
+# pi-permissions
 
 Scoped filesystem profiles, canonical file/tree rules, session/project/global grants, and independent subprocess networking for Pi.
 
@@ -27,20 +27,21 @@ To opt into strict mode, add `"processMode": "strict"` to the user-owned version
 
 ## Setup and state compatibility
 
-Install this package normally with pi >=1.0.2. On Linux, install bubblewrap (with FD bind-mount support), socat, and ripgrep using your system package manager. On macOS, scoped access requires APFS and Apple's `/usr/bin/sandbox-exec`; search uses Homebrew ripgrep (`brew install ripgrep`). No bubblewrap or socat is needed on macOS. The runtime dependency is pinned and patched by `patch-package` during installation.
+Requires pi >=1.0.2. Load the local package, or install `npm:@strayge/pi-permissions` when available. On Linux, install bubblewrap (with FD bind-mount support), socat, and ripgrep using your system package manager. On macOS, scoped access requires APFS and Apple's `/usr/bin/sandbox-exec`; search uses Homebrew ripgrep (`brew install ripgrep`). No bubblewrap or socat is needed on macOS. The runtime dependency is pinned and patched by `patch-package` during installation.
 
-The only policy source is `<agent-dir>/permission-mode/permission-mode.json`, normally `~/.pi/agent/permission-mode/permission-mode.json`. Repository `.pi/permission-mode.json` files are never read, imported, changed, backed up, or deleted.
+The only policy source is `<agent-dir>/permissions/config.json`, normally `~/.pi/agent/permissions/config.json`. Missing configuration uses shipped defaults. Private state and the shared writer lock live beside it as `state-v4.json` and `.authority.lock`. Repository `.pi/permission-mode.json` files remain obsolete and are never read, imported, changed, backed up, or deleted.
 
-**Version 3 is a breaking reset, not a migration.** Only v3 configuration and v3 private catalogs are supported. `state-v4.json` keeps the existing sessions/projects/grants/receipts shape; old catalogs and `state-v3.json` are rejected and left untouched until an explicit reset. No old approvals, repository restrictions, or transcript entries acquire v3 authority automatically.
+**The rename starts a fresh namespace, not a migration.** Existing custom restrictions and grants do not automatically apply. The old `permission-mode` directory is untouched, including by `/perm init` and `/perm reset`; no private state is imported. Configuration stays version 3 and private state stays version 4. Unsupported catalogs or `state-v3.json` inside the new directory remain rejected until explicit reset.
 
-Rollout:
+Manual rollout from `pi-permission-modes`:
 
-1. Inspect and independently back up customized user policy.
-2. Run `/perm init` or `/perm reset` and explicitly acknowledge the root-UI dialog. All affected user policy/state files are backed up before replacement; approvals across projects are discarded. Repository policies remain untouched.
-3. **Restart Pi**, rather than relying on `/reload`, to discard retained owner/runtime prototypes.
-4. Reapprove required paths and manually restore reviewed custom rules using v3 syntax.
+1. Stop Pi and independently back up customized policy. Remove the old installation/loading reference; **never load both identities**.
+2. Install `npm:@strayge/pi-permissions` **when available**, or repoint local loading to `extensions/pi-permissions`.
+3. Start Pi and set up fresh `permissions/config.json` with `/perm init` or `/perm reset`, acknowledging the root-UI dialog. Only policy/state files in the new namespace are backed up or reset. Reapprove required paths.
+4. If manually restoring a v3 policy, review its `pathRules`: explicit arrays replace defaults, so update self-protection to `$AGENT_DIR/permissions` and retain credential protection. Private approvals are not migrated.
+5. **Fully restart Pi**, not `/reload`, after rollout to discard retained owner/runtime prototypes.
 
-Headless tools cannot reset policy. Cancellation before replacement changes no authority; backups finish before source files change, and failed replacements restore changed sources. Reset stays anchored to the frozen starting project even after failed initialization, extension reload, or a different command cwd. Unsupported old policy/state and malformed v3 policy retain the warned **unrestricted initialization fallback** described below until repaired/reset; do not mistake that warning for confinement.
+Headless tools cannot reset policy. Cancellation before replacement changes no authority; backups finish before source files change, and failed replacements restore changed sources. Reset stays anchored to the frozen starting project even after failed initialization, extension reload, or a different command cwd. Unsupported or malformed policy/state in the new namespace retain the warned **unrestricted initialization fallback** described below until repaired/reset; do not mistake that warning for confinement.
 
 Example custom profile:
 
@@ -101,7 +102,7 @@ Confirmed global edits use a private same-directory temporary file, exclusive `.
   "version": 3,
   "pathRules": [
     { "path": "$AGENT_DIR/auth.json", "scope": "file", "read": "ask", "write": "ask" },
-    { "path": "$AGENT_DIR/permission-mode", "scope": "tree", "write": "ask" },
+    { "path": "$AGENT_DIR/permissions", "scope": "tree", "write": "ask" },
     { "path": "./private", "scope": "tree", "read": "deny" },
     { "path": "./private/notes.txt", "scope": "file", "read": "allow" }
   ]
@@ -167,7 +168,7 @@ A shell operation owns its original process group until foreground exit, cancell
 
 A running process keeps its filesystem snapshot. Proxied processes consult live network policy for each new connection; established connections are not terminated. Already-launched processes with open direct networking remain open until exit. Selecting a filesystem profile does not reset networking. Requested hosts, configured patterns, and grants use the same WHATWG host normalization as the proxy: alternate IPv4 forms such as `127.1`, `2130706433`, and `0x7f000001` cannot bypass a deny for `127.0.0.1`.
 
-Private approvals/cache are kept in user-owned `<agent-dir>/permission-mode/state-v4.json`, with atomic replacement and a whole-document exclusive writer lock shared with global policy transactions. Trusted current user policy establishes global authority before cache reconciliation. Obsolete cached declarations/receipts cannot restore removed allows or reject newer policy merely because obsolete positive targets changed. Independent ordinary grants, surviving receipts, saved shape, frozen-root/session identity, canonical destinations and object types remain validated. Runtime resources are rebuilt from current host metadata rather than restored from saved catalogs. Exact-file permissions resolve the current regular file under freshly bound parent anchors. Session restoration binds session ID, canonical session-file path, and canonical starting directory together. No-session roots keep only process-lifetime session authority. Project grants are separately keyed by canonical starting directory. Transcript navigation cannot resurrect a revoked record. Concurrent stale writers must reload. Lock-cleanup failure after a committed write does not falsely roll back in-memory authority; a remaining lock blocks subsequent writers. After a crash or cleanup failure, verify that all writers have stopped before manually recovering an orphan `.authority.lock`; no PID/age heuristic removes it automatically.
+Private approvals/cache are kept in user-owned `<agent-dir>/permissions/state-v4.json`, with atomic replacement and a whole-document exclusive writer lock shared with global policy transactions. Trusted current user policy establishes global authority before cache reconciliation. Obsolete cached declarations/receipts cannot restore removed allows or reject newer policy merely because obsolete positive targets changed. Independent ordinary grants, surviving receipts, saved shape, frozen-root/session identity, canonical destinations and object types remain validated. Runtime resources are rebuilt from current host metadata rather than restored from saved catalogs. Exact-file permissions resolve the current regular file under freshly bound parent anchors. Session restoration binds session ID, canonical session-file path, and canonical starting directory together. No-session roots keep only process-lifetime session authority. Project grants are separately keyed by canonical starting directory. Transcript navigation cannot resurrect a revoked record. Concurrent stale writers must reload. Lock-cleanup failure after a committed write does not falsely roll back in-memory authority; a remaining lock blocks subsequent writers. After a crash or cleanup failure, verify that all writers have stopped before manually recovering an orphan `.authority.lock`; no PID/age heuristic removes it automatically.
 
 ## Search and important limits
 

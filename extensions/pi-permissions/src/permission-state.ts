@@ -165,7 +165,7 @@ export class PermissionStore {
 
   constructor(agentDir: string) {
     const parent = bindPath(configLocation(agentDir));
-    this.directory = path.join(parent.canonical, "permission-mode");
+    this.directory = path.join(parent.canonical, "permissions");
     if (parent.missing.length || parent.lexical !== parent.canonical) throw new Error("Permission agent directory must exist without symlink redirection");
     try { mkdirSync(this.directory, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     secureFile(this.directory, true);

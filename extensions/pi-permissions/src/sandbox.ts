@@ -409,7 +409,7 @@ export class RuntimeCoordinator {
   }
 }
 
-const coordinatorKey = Symbol.for("pi.permission-modes.runtime.v3");
+const coordinatorKey = Symbol.for("pi.permissions.runtime.v3");
 const processState = globalThis as typeof globalThis & { [coordinatorKey]?: RuntimeCoordinator };
 export const runtime = (processState[coordinatorKey] ??= new RuntimeCoordinator());
 

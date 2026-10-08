@@ -7,7 +7,7 @@ Each extension lives in `extensions/pi-<name>/` as its own npm package
 ## Commit messages
 
 Use a Conventional Commit prefix and extension scope: `<type>(<scope>): <summary>`,
-for example `fix(permission-modes): hide project grants notice in subagents`.
+for example `fix(permissions): hide project grants notice in subagents`.
 
 ## vendor/ — local reference material
 

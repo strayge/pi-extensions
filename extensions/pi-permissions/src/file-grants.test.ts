@@ -134,7 +134,7 @@ test("saved file grants reject malformed anchors and non-file replacements", asy
   const store = new PermissionStore(f.dir); store.load(undefined, f.project, f.context);
   const owner = new PermissionOwner(f.catalog(), { store, ask: async () => ({ lifetime: "project" }) });
   await owner.requestGrant(f.file, "read", "remember config");
-  const stateFile = path.join(f.dir, "permission-mode", STATE_FILE);
+  const stateFile = path.join(f.dir, "permissions", STATE_FILE);
   const state = JSON.parse(readFileSync(stateFile, "utf8"));
   const original = readFileSync(stateFile, "utf8");
   state.projects[JSON.stringify(f.project)].grants[0].binding.parent = {

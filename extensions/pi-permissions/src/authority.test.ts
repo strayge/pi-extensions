@@ -86,7 +86,7 @@ test("protected session restore binds ID, canonical file, and root; stale projec
       () => new PermissionStore(f.dir).load({ ...binding, file: path.join(f.dir, "copied.jsonl") }, f.project),
       /binding mismatch/,
     );
-    chmodSync(path.join(f.dir, "permission-mode", STATE_FILE), 0o644);
+    chmodSync(path.join(f.dir, "permissions", STATE_FILE), 0o644);
     assert.throws(() => new PermissionStore(f.dir).load(binding, f.project), /private/);
   } finally {
     f.close();
@@ -99,10 +99,10 @@ test("failed persistence grants nothing and invalid reload blocks rather than re
     const store = new PermissionStore(f.dir);
     store.load(undefined, f.project);
     const owner = new PermissionOwner(f.catalog, { store, ask: async () => ({ lifetime: "project" }) });
-    writeFileSync(path.join(f.dir, "permission-mode", ".authority.lock"), "orphan", { mode: 0o600 });
+    writeFileSync(path.join(f.dir, "permissions", ".authority.lock"), "orphan", { mode: 0o600 });
     await assert.rejects(owner.requestDirectory(f.outside, "write", "failure"), /locked/);
     assert.equal(owner.snapshot().grants.length, 0);
-    rmSync(path.join(f.dir, "permission-mode", ".authority.lock"));
+    rmSync(path.join(f.dir, "permissions", ".authority.lock"));
     const release = owner.attachChild(() => release());
     const invalid = { ...f.config, modes: {} };
     await assert.rejects(owner.reload(invalid, undefined, f.context), /removed/);

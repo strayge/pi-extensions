@@ -255,11 +255,11 @@ describe("mandatory permission inheritance", () => {
     expect(resume).toHaveBeenCalledOnce(); expect(resumedRelease).toHaveBeenCalledOnce();
   });
 
-  it.each([{ extensions: true }, { extensions: ["*"] }, { extensions: ["pi-permission-modes", "pi-usage"] }])("does not enable discovered permission modes for an ungoverned parent with extensions=$extensions", async ({ extensions }) => {
+  it.each([{ extensions: true }, { extensions: ["*"] }, { extensions: ["pi-permissions", "pi-usage"] }])("does not enable discovered permissions for an ungoverned parent with extensions=$extensions", async ({ extensions }) => {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions }));
     withExtensions({
-      "/mock/pi-permission-modes/index.ts": ["request_directory_access"],
+      "/mock/pi-permissions/index.ts": ["request_directory_access"],
       "/mock/pi-usage/index.ts": ["usage_probe"],
     });
     const { session } = createSession("UNGOVERNED");
@@ -285,10 +285,10 @@ describe("mandatory permission inheritance", () => {
     expect(session.prompt).toHaveBeenCalledOnce();
   });
 
-  it("replaces discovered permission modes with the parent's mandatory live policy", async () => {
+  it("replaces discovered permissions with the parent's mandatory live policy", async () => {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true }));
-    withExtensions({ "/mock/pi-permission-modes/index.ts": ["request_directory_access"], "/mock/pi-usage/index.ts": ["usage_probe"] });
+    withExtensions({ "/mock/pi-permissions/index.ts": ["request_directory_access"], "/mock/pi-usage/index.ts": ["usage_probe"] });
     const { session } = createSession("INHERITED");
     createAgentSession.mockResolvedValue({ session });
     const factory = vi.fn(); const verify = vi.fn(); const release = vi.fn();

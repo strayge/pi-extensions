@@ -129,7 +129,7 @@ export function mergeConfig(base: PermissionModeConfig, raw: unknown): Permissio
   });
 }
 
-export const DEFAULTS_PATH = fileURLToPath(new URL("../permission-mode.defaults.json", import.meta.url));
+export const DEFAULTS_PATH = fileURLToPath(new URL("../permissions.defaults.json", import.meta.url));
 export function defaultConfig(agentDir?: string, home?: string): PermissionModeConfig {
   const config = parseConfig(JSON.parse(readFileSync(DEFAULTS_PATH, "utf8")));
   if (process.platform === "darwin") {
@@ -159,7 +159,7 @@ export function loadConfig(
   agentDir: string,
   home: string,
 ): { global: PermissionModeConfig } {
-  const raw = readConfig(path.join(agentDir, "permission-mode", "permission-mode.json"));
+  const raw = readConfig(path.join(agentDir, "permissions", "config.json"));
   return {
     global: raw === undefined ? defaultConfig(agentDir, home) : mergeConfig(defaultConfig(agentDir, home), raw),
   };

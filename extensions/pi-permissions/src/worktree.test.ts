@@ -174,7 +174,7 @@ test("automatic metadata is omitted from persisted authority and rediscovered on
     writeFileSync(binding.file, "session");
     const store = new PermissionStore(f.dir); store.load(binding, f.worktree, f.context, f.config);
     new PermissionOwner(f.catalog(), { store, ask: async () => undefined });
-    assert.doesNotMatch(readFileSync(path.join(f.dir, "permission-mode", STATE_FILE), "utf8"), /worktreeGrants|worktree:/);
+    assert.doesNotMatch(readFileSync(path.join(f.dir, "permissions", STATE_FILE), "utf8"), /worktreeGrants|worktree:/);
     const restored = new PermissionStore(f.dir).load(binding, f.worktree, f.context, f.config);
     assert.equal(restored.session?.catalog.profiles.project?.grants.find((g) => g.definition?.startsWith("worktree:"))?.binding.canonical, f.common);
     rmSync(path.join(f.worktree, ".git"));
@@ -189,8 +189,8 @@ test("Pi's actual loader initializes automatic worktree access without UI or per
   const agentDir = path.join(f.dir, "agent");
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
   try {
-    mkdirSync(agentDir, { mode: 0o700 }); mkdirSync(path.join(agentDir, "permission-mode"), { mode: 0o700 });
-    writeFileSync(path.join(agentDir, "permission-mode", "permission-mode.json"), JSON.stringify(f.config), { mode: 0o600 });
+    mkdirSync(agentDir, { mode: 0o700 }); mkdirSync(path.join(agentDir, "permissions"), { mode: 0o700 });
+    writeFileSync(path.join(agentDir, "permissions", "config.json"), JSON.stringify(f.config), { mode: 0o600 });
     process.env.PI_CODING_AGENT_DIR = agentDir;
     const loader = new DefaultResourceLoader({
       cwd: f.worktree, agentDir, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,

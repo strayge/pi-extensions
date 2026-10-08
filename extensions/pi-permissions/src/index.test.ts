@@ -16,15 +16,15 @@ type Hook = (event: never, context: ExtensionContext) => unknown;
 function fixture() {
   const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-reset-"))).canonical;
   const project = path.join(dir, "project"); const agentDir = path.join(dir, "agent"); const other = path.join(dir, "other");
-  for (const folder of [project, agentDir, other, path.join(project, ".pi"), path.join(other, ".pi"), path.join(agentDir, "permission-mode")]) mkdirSync(folder, { mode: 0o700 });
+  for (const folder of [project, agentDir, other, path.join(project, ".pi"), path.join(other, ".pi"), path.join(agentDir, "permissions")]) mkdirSync(folder, { mode: 0o700 });
   const oldHome = process.env.HOME; const oldAgent = process.env.PI_CODING_AGENT_DIR;
   process.env.HOME = dir; process.env.PI_CODING_AGENT_DIR = agentDir;
   const config = defaultConfig(); config.pathRules = [];
   config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: [] };
   config.modes.subproject = config.modes.project!;
-  const global = path.join(agentDir, "permission-mode", "permission-mode.json");
+  const global = path.join(agentDir, "permissions", "config.json");
   const projectFile = path.join(project, ".pi", "permission-mode.json");
-  const state = path.join(agentDir, "permission-mode", STATE_FILE);
+  const state = path.join(agentDir, "permissions", STATE_FILE);
   writeFileSync(global, JSON.stringify(config), { mode: 0o600 });
   writeFileSync(projectFile, '{"version":2}', { mode: 0o600 });
   const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
@@ -342,7 +342,7 @@ test("failed startup freezes reset and reload to the original project even acros
       assert.equal(readFileSync(otherPolicy, "utf8"), "untouched");
       assert.equal(readFileSync(f.projectFile, "utf8"), '{"version":2}');
       assert.ok(!readdirSync(path.dirname(f.projectFile)).some((name) => name.includes("backup")));
-      const backup = readdirSync(path.dirname(f.global)).find((name) => name.startsWith("permission-mode.json.backup-"));
+      const backup = readdirSync(path.dirname(f.global)).find((name) => name.startsWith("config.json.backup-"));
       assert.equal(readFileSync(path.join(path.dirname(f.global), backup!), "utf8"), malformed);
       assert.equal(await f.blocked(), false);
       assert.match(await f.awareness(), new RegExp(f.project));
@@ -407,7 +407,61 @@ test("replacing a saved resource directory enables fallback and a restored bound
   } finally { await f.close(); }
 });
 
-test("reset removes backed-up legacy state so migration cannot resurrect old authority", async () => {
+test("old namespace is ignored and byte-untouched through new grants, self-protection, and reset", async () => {
+  const f = fixture();
+  try {
+    const oldDirectory = path.join(f.agentDir, "permission-mode");
+    mkdirSync(oldDirectory, { mode: 0o700 });
+    const oldConfig = defaultConfig(); oldConfig.defaultMode = "yolo";
+    oldConfig.pathRules = [{ path: f.other, scope: "tree", read: "allow", write: "allow" }];
+    const oldFiles = new Map([
+      ["permission-mode.json", JSON.stringify(oldConfig)],
+      [STATE_FILE, "malformed old private authority"],
+      [LEGACY_STATE_FILE, "unsupported old private authority"],
+      [".authority.lock", "old namespace writer"],
+    ]);
+    for (const [name, bytes] of oldFiles) writeFileSync(path.join(oldDirectory, name), bytes, { mode: 0o600 });
+    rmSync(f.global);
+    await f.start();
+    assert.equal(f.governed(), true);
+    assert.match(await f.awareness(), /Filesystem profile: project/);
+    assert.doesNotMatch(await f.awareness(), /global id global:/);
+    f.ctx.ui.select = async () => "Remember for this project";
+    await f.perm(`grant read ${f.other}`);
+    assert.equal(JSON.parse(readFileSync(f.state, "utf8")).version, 4);
+    assert.equal(existsSync(f.global), false);
+    const file = path.join(f.dir, "notes"); writeFileSync(file, "NOTE");
+    f.ctx.ui.select = async () => "Save globally";
+    await f.perm(`grant read ${file}`);
+    const policy = JSON.parse(readFileSync(f.global, "utf8"));
+    assert.equal(policy.version, 3);
+    assert.ok(policy.pathRules.some((rule: { path: string; write?: string }) => rule.path === "$AGENT_DIR/permissions" && rule.write === "ask"));
+    assert.ok(policy.pathRules.some((rule: { path: string; read?: string }) => rule.path === file && rule.read === "allow"));
+    f.ctx.ui.select = async () => "Allow for this session";
+    await f.perm(`grant write ${f.agentDir}`);
+    f.ctx.ui.select = async () => undefined;
+    const before = [f.global, f.state].map((target) => readFileSync(target, "utf8"));
+    await assert.rejects(f.execute("write", { path: f.global, content: "overwrite protected policy" }), /denied/i);
+    assert.deepEqual([f.global, f.state].map((target) => readFileSync(target, "utf8")), before);
+    assert.equal(existsSync(path.join(path.dirname(f.global), ".authority.lock")), false);
+    await f.reset();
+    assert.equal(existsSync(f.state), false);
+    for (const [index, target] of [f.global, f.state].entries()) {
+      const name = readdirSync(path.dirname(target)).find((entry) => entry.startsWith(`${path.basename(target)}.backup-`));
+      assert.equal(readFileSync(path.join(path.dirname(target), name!), "utf8"), before[index]);
+    }
+    assert.deepEqual(readdirSync(oldDirectory).sort(), [...oldFiles.keys()].sort());
+    for (const [name, bytes] of oldFiles) assert.equal(readFileSync(path.join(oldDirectory, name), "utf8"), bytes);
+    assert.match(f.notifications.join("\n"), /old permission-mode namespace is untouched/);
+    await f.reloadExtension();
+    assert.equal(f.governed(), true);
+    assert.match(await f.awareness(), /Filesystem profile: project/);
+    assert.doesNotMatch(await f.awareness(), /other \(tree, project, id /);
+    for (const [name, bytes] of oldFiles) assert.equal(readFileSync(path.join(oldDirectory, name), "utf8"), bytes);
+  } finally { await f.close(); }
+});
+
+test("reset removes backed-up legacy state in the new namespace instead of migrating authority", async () => {
   const f = fixture();
   try {
     await f.start();
@@ -432,7 +486,7 @@ test("init and reset previews explain losses and defaults while cancellation pre
       prompts++;
       assert.equal(Reflect.get(options!, Symbol.for("pi-extensions:input-dialog")), false);
       assert.equal(title, "Initialize permission policy v3?");
-      assert.equal(message, "Backed up\nAll user permission policy and state files before reset\n\nDiscarded\nStored approvals across projects. They are not migrated.\n\nUnchanged\nRepository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted");
+      assert.equal(message, "Backed up\nPolicy and state files in the user permissions directory before reset\n\nDiscarded\nStored approvals across projects in this namespace. They are not migrated.\n\nUnchanged\nOld permission-mode namespace and repository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted");
       return false;
     };
     for (const action of ["init", "reset"]) {

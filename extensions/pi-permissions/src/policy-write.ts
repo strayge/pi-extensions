@@ -28,8 +28,8 @@ export class GlobalPolicyWriter {
 
   constructor(context: ResolutionContext) {
     this.context = context;
-    this.directory = bindPath(configLocation(path.join(context.agentDir, "permission-mode")));
-    this.file = path.join(this.directory.canonical, "permission-mode.json");
+    this.directory = bindPath(configLocation(path.join(context.agentDir, "permissions")));
+    this.file = path.join(this.directory.canonical, "config.json");
     this.checkDirectory();
   }
   private checkDirectory(): void {

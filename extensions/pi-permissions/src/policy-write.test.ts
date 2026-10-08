@@ -25,7 +25,7 @@ function fixture(change?: (config: PermissionModeConfig, outside: string) => voi
   change?.(config, outside);
   const context = { agentDir: directory, home: directory, piPackage: project };
   const store = new PermissionStore(directory); store.load(undefined, project, context, config);
-  const file = path.join(store.directory, "permission-mode.json");
+  const file = path.join(store.directory, "config.json");
   writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
   const root = { family: randomUUID(), binding: bindPath(project) };
   const writer = new GlobalPolicyWriter(context); const warnings: string[] = [];

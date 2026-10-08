@@ -156,7 +156,7 @@ test("file grants and ask/deny rules survive replacement, profile changes, reloa
     const projectOnly = new PermissionStore(f.dir).load(undefined, f.project, f.context);
     assert.equal(projectOnly.project.exceptions.length, 1);
     assert.doesNotThrow(() => compileFilesystem(restarted.snapshot()));
-    const state = JSON.parse(readFileSync(path.join(f.dir, "permission-mode", STATE_FILE), "utf8"));
+    const state = JSON.parse(readFileSync(path.join(f.dir, "permissions", STATE_FILE), "utf8"));
     assert.equal(state.version, 4);
   } finally { f.close(); }
 });
@@ -168,7 +168,7 @@ test("file-boundary tampering in saved state fails closed", () => {
     writeFileSync(binding.file, "session");
     const store = new PermissionStore(f.dir); store.load(binding, f.project, f.context);
     new PermissionOwner(f.catalog, { store, ask: async () => undefined });
-    const file = path.join(f.dir, "permission-mode", STATE_FILE);
+    const file = path.join(f.dir, "permissions", STATE_FILE);
     const original = JSON.parse(readFileSync(file, "utf8"));
     for (const target of ["session", "project"] as const) {
       const state = structuredClone(original);

@@ -791,7 +791,7 @@ export async function runAgent(
     extensionsOverride: (base) => {
       const filtered = extensionsOverride?.(base) ?? base;
       // Children inherit the parent's live policy or stay ungoverned; discovery cannot enable a separate policy.
-      const extensions = filtered.extensions.filter((extension) => extension.path !== PERMISSION_EXTENSION && !extensionCanonicalNames(extension.path).includes("pi-permission-modes"));
+      const extensions = filtered.extensions.filter((extension) => extension.path !== PERMISSION_EXTENSION && !extensionCanonicalNames(extension.path).includes("pi-permissions"));
       if (!permission) return { ...filtered, extensions };
       const mandatory = base.extensions.find((extension) => extension.path === PERMISSION_EXTENSION);
       if (!mandatory) throw new Error("Required child permission extension failed to load");

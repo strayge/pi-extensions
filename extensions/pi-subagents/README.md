@@ -383,7 +383,7 @@ isolated: true                    # hermetic: built-ins only, no extensions/skil
 A few rules the examples don't make obvious:
 
 - `extensions:` is the loading authority for ordinary extensions. `ext:foo` in `tools:` narrows what surfaces; it can't load `foo` on its own. Mismatches fire `extension-error:…` warnings.
-- `pi-permission-modes` is parent-controlled: children never activate an independently discovered policy. When the parent has an active policy, children inherit its live enforcement even with `extensions: false` or `isolated: true`; otherwise they stay ungoverned by this extension. `pi-subagents` does not require `pi-permission-modes` to be installed.
+- `pi-permissions` is parent-controlled: children never activate an independently discovered policy. When the parent has an active policy, children inherit its live enforcement even with `extensions: false` or `isolated: true`; otherwise they stay ungoverned by this extension. `pi-subagents` does not require `pi-permissions` to be installed.
 - Any `ext:` entry flips extension tools to an explicit allowlist — unnamed extensions still load (handlers fire) but expose no tools. So `tools: "*, ext:mcp/search"` exposes only `search` from `mcp`, nothing from any other extension.
 - Extension names match case-insensitively (`[Mcp]` = `[mcp]`); tool names in `ext:foo/bar` stay case-sensitive.
 - Extensions that register tools **lazily** work too. MCP-backed extensions typically can't enumerate their tools until their servers connect, so they register from `session_start` or `before_agent_start` rather than at load. Subagent scoping is re-derived as tools appear, so these surface normally — including under `ext:` selectors, which keep narrowing correctly no matter when a tool shows up.

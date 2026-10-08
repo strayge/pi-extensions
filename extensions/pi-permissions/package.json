@@ -1,19 +1,19 @@
 {
-  "name": "@strayge/pi-permission-modes",
+  "name": "@strayge/pi-permissions",
   "version": "0.0.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/strayge/pi-extensions.git",
-    "directory": "extensions/pi-permission-modes"
+    "directory": "extensions/pi-permissions"
   },
-  "homepage": "https://github.com/strayge/pi-extensions/tree/main/extensions/pi-permission-modes#readme",
+  "homepage": "https://github.com/strayge/pi-extensions/tree/main/extensions/pi-permissions#readme",
   "bugs": {
     "url": "https://github.com/strayge/pi-extensions/issues"
   },
   "publishConfig": {
     "access": "public"
   },
-  "description": "Pi extension providing declarative permission modes: OS-level sandboxing, an allow/ask/deny policy engine, and bash AST gating via tree-sitter.",
+  "description": "Pi extension providing declarative permissions: OS-level sandboxing, an allow/ask/deny policy engine, and bash AST gating via tree-sitter.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -28,7 +28,7 @@
     "src",
     "schemas",
     "patches",
-    "permission-mode.defaults.json",
+    "permissions.defaults.json",
     "README.md"
   ],
   "engines": {

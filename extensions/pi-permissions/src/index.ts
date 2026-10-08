@@ -58,8 +58,8 @@ export interface PermissionBridgeRequest {
   }): void;
   reject(reason: string): void;
 }
-const retainedSymbol = Symbol.for("pi.permission-modes.reload.v3");
-const rootsSymbol = Symbol.for("pi.permission-modes.starting-roots.v2");
+const retainedSymbol = Symbol.for("pi.permissions.reload.v3");
+const rootsSymbol = Symbol.for("pi.permissions.starting-roots.v2");
 const globals = globalThis as typeof globalThis & {
   [retainedSymbol]?: Map<string, PermissionOwner>;
   [rootsSymbol]?: Map<string, PathBinding>;
@@ -252,7 +252,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         if (
           !(await ctx.ui.confirm(
             "Initialize permission policy v3?",
-            "Backed up\nAll user permission policy and state files before reset\n\nDiscarded\nStored approvals across projects. They are not migrated.\n\nUnchanged\nRepository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted",
+            "Backed up\nPolicy and state files in the user permissions directory before reset\n\nDiscarded\nStored approvals across projects in this namespace. They are not migrated.\n\nUnchanged\nOld permission-mode namespace and repository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted",
             approvalDialogOptions(false),
           ))
         )
@@ -267,12 +267,12 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         if (owner !== resetting || startingRoot !== root) throw new Error("Parent policy changed during reset; retry explicitly");
         assertBinding(root);
         if (resetting) assertBinding(resetting.rootIdentity.binding);
-        const directory = configLocation(path.join(agentDir, "permission-mode"));
+        const directory = configLocation(path.join(agentDir, "permissions"));
         mkdirSync(directory, { recursive: true, mode: 0o700 });
         if (bindPath(directory).canonical !== directory) throw new Error("Permission setup does not follow directory symlinks");
         chmodSync(directory, 0o700);
         const files = [
-          path.join(directory, "permission-mode.json"),
+          path.join(directory, "config.json"),
           path.join(directory, STATE_FILE),
           path.join(directory, LEGACY_STATE_FILE),
         ];
@@ -318,7 +318,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
             try { closeSync(lockFd); } catch {}
           }
         }
-        ctx.ui.notify("Version 3 policy initialized. Restart Pi to discard old owner/runtime prototypes. Old user files are preserved as .backup-*; reapprove paths and restore reviewed custom rules manually.", "info");
+        ctx.ui.notify("Version 3 policy initialized. Restart Pi to discard old owner/runtime prototypes. Previous files in the user permissions directory are preserved as .backup-*; the old permission-mode namespace is untouched. Reapprove paths and restore reviewed custom rules manually.", "info");
         return;
       }
       const active = getOwner();

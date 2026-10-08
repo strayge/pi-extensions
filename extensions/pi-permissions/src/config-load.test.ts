@@ -16,7 +16,7 @@ test("strict v3 overrides reject duplicate rules and invalid shapes and normaliz
   assert.deepEqual(normalized.network.allowedDomains, ["example.com"]);
   assert.deepEqual(normalized.network.deniedDomains, ["blocked.example"]);
   assert.deepEqual(parseConfig(normalized), normalized);
-  const schema = JSON.parse(readFileSync(new URL("../schemas/permission-mode.schema.json", import.meta.url), "utf8"));
+  const schema = JSON.parse(readFileSync(new URL("../schemas/permissions.schema.json", import.meta.url), "utf8"));
   assert.equal(schema.properties.pathRules.uniqueItems, true);
   assert.equal(schema.properties.$schema.type, "string");
   assert.ok(!new RegExp(schema.$defs.paths.items.pattern).test("a\0b"));
@@ -45,7 +45,7 @@ test("process mode defaults to compatible, accepts strict, and preserves legacy 
     assert.throws(() => mergeConfig(config, { version: 3, processMode }), /processMode/);
   const legacy = { ...config }; delete legacy.processMode;
   assert.deepEqual(parseConfig(legacy), legacy);
-  const schema = JSON.parse(readFileSync(new URL("../schemas/permission-mode.schema.json", import.meta.url), "utf8"));
+  const schema = JSON.parse(readFileSync(new URL("../schemas/permissions.schema.json", import.meta.url), "utf8"));
   assert.deepEqual(schema.properties.processMode.enum, ["compatible", "strict"]);
   assert.equal(schema.properties.processMode.default, "compatible");
 });
@@ -60,10 +60,10 @@ test("v3 allow/ask/deny syntax agrees with the schema and repository policy is n
   const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-user-only-"))).canonical;
   try {
     const agentDir = path.join(dir, "agent");
-    mkdirSync(agentDir); mkdirSync(path.join(agentDir, "permission-mode")); mkdirSync(path.join(dir, ".pi"));
+    mkdirSync(agentDir); mkdirSync(path.join(agentDir, "permissions")); mkdirSync(path.join(dir, ".pi"));
     writeFileSync(path.join(dir, ".pi", "permission-mode.json"), "malformed and expansive repository input");
     const raw = { version: 3, pathRules: [{ path: "~/notes", scope: "file", read: "allow", write: "ask" }] };
-    writeFileSync(path.join(agentDir, "permission-mode", "permission-mode.json"), JSON.stringify(raw));
+    writeFileSync(path.join(agentDir, "permissions", "config.json"), JSON.stringify(raw));
     assert.deepEqual(loadConfig(agentDir, dir).global.pathRules, raw.pathRules);
     assert.equal(loadConfig(agentDir, dir).global.version, 3);
     assert.throws(() => mergeConfig(defaultConfig(), { ...raw, version: 2 }), /only version 3/);
@@ -71,7 +71,7 @@ test("v3 allow/ask/deny syntax agrees with the schema and repository policy is n
       for (const operation of ["read", "write"])
         assert.throws(() => mergeConfig(defaultConfig(), { version: 3, pathRules: [{ path: "~/notes", scope: "file", [operation]: [action] }] }), /must be allow, ask, or deny/);
     }
-    const schema = JSON.parse(readFileSync(new URL("../schemas/permission-mode.schema.json", import.meta.url), "utf8"));
+    const schema = JSON.parse(readFileSync(new URL("../schemas/permissions.schema.json", import.meta.url), "utf8"));
     assert.equal(schema.properties.version.const, 3);
     assert.deepEqual(schema.properties.pathRules.items.properties.read.enum, ["allow", "ask", "deny"]);
   } finally { rmSync(dir, { recursive: true, force: true }); }

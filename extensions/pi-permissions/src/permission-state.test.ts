@@ -32,7 +32,7 @@ async function fixture(runtime = false) {
   await owner.requestDirectory(outside, runtime ? "write" : "read", "remember directory");
   await owner.authorize([path.join(project, "credential")], "read", "remember exception");
   owner.select("docs");
-  const file = path.join(dir, "permission-mode", STATE_FILE);
+  const file = path.join(dir, "permissions", STATE_FILE);
   return { dir, project, outside, piPackage, context, binding, owner, file, close: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
@@ -215,7 +215,7 @@ test("post-commit lock cleanup failure does not roll back memory or report a com
     assert.equal(JSON.parse(readFileSync(f.file, "utf8")).projects[JSON.stringify(f.project)].grants.length, 0);
     assert.throws(() => new PermissionStore(f.dir).load(f.binding, f.project, f.context), /locked/);
     t.mock.restoreAll(); syncBuiltinESMExports();
-    unlink(path.join(f.dir, "permission-mode", ".authority.lock"));
+    unlink(path.join(f.dir, "permissions", ".authority.lock"));
     assert.equal(new PermissionStore(f.dir).load(f.binding, f.project, f.context).project.grants.length, 0);
   } finally { t.mock.restoreAll(); syncBuiltinESMExports(); f.close(); }
 });

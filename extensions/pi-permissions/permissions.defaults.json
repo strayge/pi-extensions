@@ -1,5 +1,5 @@
 {
-  "$schema": "./schemas/permission-mode.schema.json",
+  "$schema": "./schemas/permissions.schema.json",
   "version": 3,
   "defaultMode": "project",
   "processMode": "compatible",
@@ -19,7 +19,7 @@
   },
   "pathRules": [
     { "path": "$AGENT_DIR/auth.json", "scope": "file", "read": "ask", "write": "ask" },
-    { "path": "$AGENT_DIR/permission-mode", "scope": "tree", "write": "ask" }
+    { "path": "$AGENT_DIR/permissions", "scope": "tree", "write": "ask" }
   ],
   "network": {
     "default": "open",
