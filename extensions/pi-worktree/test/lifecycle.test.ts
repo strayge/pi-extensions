@@ -452,8 +452,8 @@ for (const merged of [true, false]) {
         const h = harness(f, f.feature);
         h.hooks.select = (title, choices) => {
           if (!merged) {
-            assert.ok(title.includes(git(f.feature, "rev-parse", "HEAD")));
-            assert.match(title, /DATA-LOSS WARNING/);
+            assert.ok(!title.includes(git(f.feature, "rev-parse", "HEAD")));
+            assert.match(title, /Warning: \d+ commits? (?:is|are) not reachable/);
           } else {
             assert.doesNotMatch(title, /VERIFICATION|Branch tip/);
           }
@@ -820,13 +820,15 @@ test("finish renderer exposes uncertain-deletion warning in the same screen and 
     () => 24,
   );
   assert.equal(
-    component.render(80).some((line) => line.includes("DATA-LOSS")),
+    component.render(80).some((line) => line.includes("Warning:")),
     false,
   );
   component.handleInput(" ");
-  assert.ok(component.render(80).some((line) => line.includes("DATA-LOSS")));
+  assert.ok(
+    component.render(80).includes("Warning: 1 commit is not reachable from other branches/tags."),
+  );
   for (let index = 0; index < 100; index++) component.handleInput("\u001b[B");
-  assert.ok(component.render(80).join("\n").includes(tip));
+  assert.ok(!component.render(80).join("\n").includes(tip));
   for (const width of [0, 1, 2, 5, 10, 40, 80, 160]) {
     assert.ok(component.render(width).every((line) => visibleWidth(line) <= width));
   }
@@ -1050,8 +1052,8 @@ for (const removeBranch of [false, true]) {
       );
       const originalLog = readFileSync(log, "utf8");
       h.hooks.select = (title, choices) => {
-        assert.ok(title.includes(recovery));
-        assert.match(title, /reflog/i);
+        assert.ok(!title.includes(recovery));
+        assert.ok(title.includes("Warning: 1 commit is not reachable from other branches/tags."));
         assert.match(choices[0] ?? "", /DELETE/);
         return choices.find((choice) => choice.includes(removeBranch ? "DELETE" : "KEEP"));
       };

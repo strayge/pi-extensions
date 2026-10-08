@@ -55,6 +55,35 @@ test("finish matches the compact layout without routine verification text", () =
   assert.ok(lines.every((line) => visibleWidth(line) <= 100));
 });
 
+test("branch deletion shows exactly one warning with the actual commit count", () => {
+  const roles: string[] = [];
+  const dialog = createFinishDialog(
+    { ...proposal, risk: Array.from({ length: 6 }, () => "b".repeat(40)) },
+    () => {},
+    () => {},
+    (role, text) => {
+      if (text.startsWith("Warning:")) roles.push(role);
+      return text;
+    },
+    () => 24,
+  );
+  const lines = dialog.render(100);
+  assert.deepEqual(
+    lines.filter((line) => line.startsWith("Warning:")),
+    ["Warning: 6 commits are not reachable from other branches/tags."],
+  );
+  assert.deepEqual(roles, ["warning"]);
+  assert.doesNotMatch(lines.join("\n"), /Branch tip:|DATA LOSS|DATA-LOSS|[ab]{40}/);
+});
+
+test("an unverified merge with no at-risk commits has no branch warning", () => {
+  const dialog = dialogFor({ ...proposal, merged: false });
+  assert.match(dialog.render(100).join("\n"), /\[ \] Delete branch.*merge unverified/);
+  dialog.handleInput(" ");
+  assert.match(dialog.render(100).join("\n"), /\[x\] Delete branch/);
+  assert.doesNotMatch(dialog.render(100).join("\n"), /Warning:|Branch tip:|DATA LOSS|DATA-LOSS/);
+});
+
 test("home-relative paths stay explicit without shortening unrelated prefixes", () => {
   const home = homedir();
   const text = dialogFor({
@@ -104,10 +133,15 @@ test("keeping an uncertain branch hides deletion warnings until it is selected",
     () => 24,
   );
   assert.match(dialog.render(100).join("\n"), /\[ \] Delete branch/);
-  assert.doesNotMatch(dialog.render(100).join("\n"), /DATA LOSS|DATA-LOSS/);
+  assert.doesNotMatch(dialog.render(100).join("\n"), /Warning:|DATA LOSS|DATA-LOSS/);
   dialog.handleInput(" ");
-  assert.match(dialog.render(100).join("\n"), /\[x\] Delete branch/);
-  assert.match(dialog.render(100).join("\n"), /DATA LOSS/);
+  const selected = dialog.render(100).join("\n");
+  assert.match(selected, /\[x\] Delete branch/);
+  assert.ok(selected.includes("Warning: 1 commit is not reachable from other branches/tags."));
+  assert.doesNotMatch(selected, /Branch tip:|DATA LOSS|DATA-LOSS|b{40}/);
+  dialog.handleInput(" ");
+  assert.doesNotMatch(dialog.render(100).join("\n"), /Warning:/);
+  dialog.handleInput(" ");
   dialog.handleInput("\r");
   assert.equal(choice, true);
 });
@@ -161,7 +195,8 @@ test("short terminals keep all cleanup evidence reachable while pinning loss war
     assert.ok(text.includes("Ignored to delete:"));
     assert.ok(text.includes("extensions/pi-cmux/node_modules/"));
     assert.ok(text.includes(recoveryTip));
-    assert.ok(text.includes("b".repeat(40)));
+    assert.ok(text.includes("Warning: 1 commit is not reachable from other branches/tags."));
+    assert.ok(!text.includes("b".repeat(40)));
   }
 });
 
@@ -175,7 +210,7 @@ test("detached worktrees have no branch toggle or branch deletion warning", () =
   assert.equal(dialog.render(100).join("\n"), before);
 });
 
-test("RPC approval keeps structured line breaks and full deletion evidence", async () => {
+test("RPC approval keeps structured line breaks and a single branch warning", async () => {
   let title = "";
   const ctx = {
     mode: "rpc",
@@ -188,12 +223,16 @@ test("RPC approval keeps structured line breaks and full deletion evidence", asy
       },
     },
   } as unknown as ExtensionCommandContext;
-  assert.equal(await confirmFinish(ctx, { ...proposal, merged: false }, false), false);
+  assert.equal(
+    await confirmFinish(ctx, { ...proposal, merged: false, risk: ["b".repeat(40)] }, false),
+    false,
+  );
   assert.ok(title.includes("Remove   /feature\nReturn   /main"));
   assert.ok(title.includes("Ignored to delete:\n  extensions/pi-cmux/node_modules/"));
   assert.doesNotMatch(title, /VERIFICATION|Main checkout HEAD|conversation/);
-  assert.ok(title.includes(`Branch tip: ${proposal.tip}`));
-  assert.match(title, /DATA-LOSS WARNING/);
+  assert.ok(title.includes("Warning: 1 commit is not reachable from other branches/tags."));
+  assert.equal(title.match(/Warning:/g)?.length, 1);
+  assert.doesNotMatch(title, /Branch tip:|DATA LOSS|DATA-LOSS|[ab]{40}/);
 });
 
 test("finish marks only agent factories and preserves branch choices and cancellation", async () => {
@@ -233,7 +272,7 @@ test("agent native finish remains tracked with unchanged deletion and cancellati
 });
 
 for (const merged of [false, true]) {
-  test(`large recovery warnings remain scrollable with merged=${merged}`, () => {
+  test(`large branch histories show only a count with merged=${merged}`, () => {
     const dialog = createFinishDialog(
       {
         ...proposal,
@@ -250,14 +289,19 @@ for (const merged of [false, true]) {
     if (!merged) dialog.handleInput(" ");
     const first = dialog.render(80);
     assert.ok(first.length <= 24);
-    assert.match(first.join("\n"), /DATA LOSS/);
+    assert.ok(
+      first.join("\n").includes("Warning: 100 commits are not reachable from other branches/tags."),
+    );
+    assert.equal(first.filter((line) => line.startsWith("Warning:")).length, 1);
+    assert.doesNotMatch(first.join("\n"), /Branch tip:|DATA LOSS|DATA-LOSS|[a-f0-9]{40}/);
     assert.ok(first.every((line) => visibleWidth(line) <= 80));
     for (let index = 0; index < 200; index++) dialog.handleInput("\u001b[B");
     const last = dialog.render(80);
     assert.ok(last.length <= 24);
     assert.ok(last.join("\n").includes("Remove   /feature\nReturn   /main"));
-    assert.match(last.join("\n"), /0000000000000000000000000000000000000063/);
-    assert.match(last.join("\n"), /DATA LOSS/);
+    assert.ok(
+      last.join("\n").includes("Warning: 100 commits are not reachable from other branches/tags."),
+    );
     for (const width of [1, 8, 20, 42, 80]) {
       const lines = dialog.render(width);
       assert.ok(lines.length <= 24);

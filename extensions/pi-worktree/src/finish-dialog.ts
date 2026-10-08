@@ -16,21 +16,9 @@ export interface FinishDialogProposal {
 }
 
 export function deletionWarning(proposal: FinishDialogProposal): string {
-  if (!proposal.branch) return "No branch will be deleted.";
-  return [
-    `Branch tip: ${stripTerminalControls(proposal.tip ?? "(none)")}`,
-    ...(!proposal.merged
-      ? [
-          "DATA-LOSS WARNING: this tip is not proven merged into the main checkout HEAD. Deleting its branch can lose feature commits (including squash/rebase originals).",
-        ]
-      : []),
-    ...(proposal.risk.length > 0
-      ? [
-          "DATA-LOSS WARNING: deleting the branch also removes its reflog. These commits, including recovery-only history, are not reachable from the target or other local durable refs:",
-          ...proposal.risk.map((oid) => `  ${stripTerminalControls(oid)}`),
-        ]
-      : []),
-  ].join("\n");
+  if (!proposal.branch || proposal.risk.length === 0) return "";
+  const count = proposal.risk.length;
+  return `Warning: ${count} ${count === 1 ? "commit is" : "commits are"} not reachable from other branches/tags.`;
 }
 
 function displayPath(path: string): string {
@@ -60,8 +48,8 @@ function finishDetails(proposal: FinishDialogProposal, deleteBranch: boolean): s
     ...(proposal.recoveryWarning
       ? ["", stripTerminalControls(proposal.recoveryWarning).trim()]
       : []),
-    ...(deleteBranch && (!proposal.merged || proposal.risk.length > 0)
-      ? ["", ...deletionWarning(proposal).split("\n")]
+    ...(deleteBranch && proposal.branch && proposal.risk.length > 0
+      ? ["", deletionWarning(proposal)]
       : []),
   ];
 }
@@ -99,24 +87,13 @@ export function createFinishDialog(
       const toggle = proposal.branch
         ? `[${deleteBranch ? "x" : " "}] Delete branch ${branch} (${proposal.merged ? "merged" : "merge unverified"})`
         : "No branch will be deleted";
-      const dangerousDeletion = deleteBranch && (!proposal.merged || proposal.risk.length > 0);
-      const loss =
-        dangerousDeletion && proposal.recoveryWarning
-          ? [color("warning", "DATA LOSS: branch and worktree recovery history; review details.")]
-          : dangerousDeletion
-            ? [
-                color(
-                  "warning",
-                  "DATA LOSS: unmerged or recovery-only branch history; review details.",
-                ),
-              ]
-            : proposal.recoveryWarning
-              ? [color("warning", "DATA LOSS: worktree removal discards recovery history.")]
-              : [];
+      const loss = proposal.recoveryWarning
+        ? [color("warning", "DATA LOSS: worktree removal discards recovery history.")]
+        : [];
       const workspace = workspaceSummary(proposal);
       const styled = (line: string) =>
         line === "Ignored to delete:" ||
-        line.startsWith("DATA-LOSS WARNING") ||
+        line.startsWith("Warning:") ||
         line.startsWith("Administrative recovery warning:")
           ? color("warning", line)
           : line;
