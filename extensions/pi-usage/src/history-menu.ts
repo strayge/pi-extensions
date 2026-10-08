@@ -548,9 +548,11 @@ function quotaBucketLines(
         estimate.estimated100PercentCost === undefined
           ? "—"
           : money(estimate.estimated100PercentCost);
+      const evidence =
+        capacityCost !== "—" && estimate.observedConsumedPercent < 3 ? " · weak evidence" : "";
       rows.push(
         {
-          text: `${sanitizeArtifactLabel(estimate.model)}: recorded ${money(estimate.recordedCost)} · weekly 100% ${capacityCost === "—" ? "insufficient data" : `≈ ${capacityCost}`}`,
+          text: `${sanitizeArtifactLabel(estimate.model)}: recorded ${money(estimate.recordedCost)} · weekly 100% ${capacityCost === "—" ? "insufficient data" : `≈ ${capacityCost}`}${evidence}`,
         },
         {
           text: `sample ${money(estimate.sampleCost)} / ${decimal(estimate.observedConsumedPercent)} pp · ${number(estimate.intervals)} ${estimate.intervals === 1 ? "interval" : "intervals"} (≤15m)`,

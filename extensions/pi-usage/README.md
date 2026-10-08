@@ -348,19 +348,25 @@ supporting sample cost, quota percentage points, and qualifying interval count:
 model weekly 100% cost = sample recorded cost × 100 / sample quota consumption (pp)
 ```
 
-Samples use only active measurement windows of up to 15 minutes where that exact
-provider/model accounts for at least 95% of recorded dollar cost. Active windows
+Samples use active measurement windows of up to 15 minutes where that exact
+provider/model accounts for at least 80% of recorded dollar cost. Active windows
 with zero quota movement still contribute sample cost; quota movement in windows
-without Pi activity is ignored. This assumes Pi's prices are approximately right
-and small helper-model activity can be ignored. Unsupported estimates show
-`insufficient data`, not a permanent model value or a subscription billing price.
-Reset-crossing gaps, missing prices, imprecise timing, and ambiguous account
-correlation are excluded. Adjacent samples dominated by the same model are
-combined for calibration, with dollar costs counted once and the 95% threshold
-checked again for the combined period. Dominant-model requests must fit entirely
-within that period, so whole-request costs are never paired with partial quota
-movement. Supporting cost and quota cover qualifying samples, not necessarily
-all activity in the selected range.
+without Pi activity is ignored. Adjacent samples dominated by the same model are
+combined, with costs counted once and dominance checked again for the final
+period. Nearby snapshots may extend its boundaries by up to 15 minutes to bracket
+whole requests; otherwise a safely bracketed inner portion is retained. Sampling
+gaps over 15 minutes remain excluded, and periods never overlap. Request costs
+are not prorated.
+
+Real resets, missing prices, imprecise timing, and ambiguous account correlation
+remain excluded; reset-time rounding of up to two seconds is tolerated. Supporting
+cost and quota cover qualifying samples, not necessarily all selected activity.
+The calculation assumes Pi's prices are approximately right and attributes a
+mixed period's quota movement to its dominant model, which can underestimate
+that model's capacity when other models also consume quota. Estimates supported
+by less than 3 quota percentage points show `weak evidence`; unsupported estimates
+show `insufficient data`. Neither is a permanent model value or subscription
+billing price.
 
 Historical coverage is deliberately not claimed to be complete. Snapshot
 sampling is irregular and active-session-driven, so peaks, resets, and

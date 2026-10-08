@@ -2138,16 +2138,16 @@ function codexModelRows(history: LoadedHistory, durationMs = 60 * 60_000) {
   );
 }
 
-test("model quota averages tolerate 5% helper cost and retain zero-movement interval costs", () => {
+test("model quota averages tolerate 20% helper cost and retain zero-movement interval costs", () => {
   const history = loaded(
     [
-      codexModelCall("sol-a", 44, 9.5),
+      codexModelCall("sol-a", 44, 8),
       {
-        ...codexModelCall("luna-a", 42, 0.5, "luna"),
-        usage: { ...usage(1_000_000), cost: { ...usage().cost, total: 0.5 } },
+        ...codexModelCall("luna-a", 42, 2, "luna"),
+        usage: { ...usage(1_000_000), cost: { ...usage().cost, total: 2 } },
       },
-      codexModelCall("sol-b", 29, 19.5),
-      codexModelCall("luna-b", 28, 0.5, "luna"),
+      codexModelCall("sol-b", 29, 16),
+      codexModelCall("luna-b", 28, 4, "luna"),
       codexModelCall("sol-flat", 14, 1),
       normalizedCall({ key: "other-provider", at: NOW - 25 * 60_000, cost: 100 }),
     ],
@@ -2168,15 +2168,102 @@ test("model quota averages tolerate 5% helper cost and retain zero-movement inte
     rows.find((row) => row.model === "sol"),
     {
       model: "sol",
-      recordedCost: 30,
-      sampleCost: 30,
+      recordedCost: 25,
+      sampleCost: 25,
       observedConsumedPercent: 5,
       intervals: 3,
-      estimated100PercentCost: 600,
+      estimated100PercentCost: 500,
     },
   );
-  assert.equal(rows.find((row) => row.model === "luna")?.recordedCost, 1);
+  assert.equal(rows.find((row) => row.model === "luna")?.recordedCost, 6);
   assert.equal(rows.find((row) => row.model === "luna")?.estimated100PercentCost, undefined);
+});
+
+test("model quota dominance includes 80% but excludes a share just below it", () => {
+  for (const helperCost of [2, 2.001]) {
+    const row = codexModelRows(
+      loaded(
+        [codexModelCall("sol", 14, 8), codexModelCall("helper", 13, helperCost, "luna")],
+        [codexWeeklySnapshot("start", 15, 10), codexWeeklySnapshot("end", 0, 12)],
+      ),
+    ).find((item) => item.model === "sol");
+    assert.ok(row);
+    assert.equal(row.recordedCost, 8);
+    assert.equal(row.sampleCost, helperCost === 2 ? 8 : 0);
+    assert.equal(row.observedConsumedPercent, helperCost === 2 ? 2 : 0);
+    assert.equal(row.estimated100PercentCost, helperCost === 2 ? 400 : undefined);
+  }
+});
+
+test("model quota epochs tolerate reset jitter relative to the first observation", () => {
+  const reset = NOW / 1000 + 604_800;
+  const row = codexModelRows(
+    loaded(
+      [codexModelCall("first", 44, 2), codexModelCall("second", 29, 3)],
+      [
+        codexWeeklySnapshot("start", 45, 10),
+        codexWeeklySnapshot("positive-jitter", 30, 12, { resetsAt: reset + 2 }),
+        codexWeeklySnapshot("negative-jitter", 15, 15, { resetsAt: reset - 2 }),
+      ],
+    ),
+  )[0];
+  assert.equal(row?.sampleCost, 5);
+  assert.equal(row?.observedConsumedPercent, 5);
+  assert.equal(row?.intervals, 2);
+  assert.equal(row?.estimated100PercentCost, 100);
+});
+
+test("model quota reset jitter cannot accumulate across an epoch", () => {
+  const reset = NOW / 1000 + 604_800;
+  const row = codexModelRows(
+    loaded(
+      [
+        codexModelCall("first", 59, 2),
+        codexModelCall("drift-crossing", 44, 99),
+        codexModelCall("second", 29, 3),
+      ],
+      [
+        codexWeeklySnapshot("start", 60, 10),
+        codexWeeklySnapshot("first-jitter", 45, 12, { resetsAt: reset + 1.5 }),
+        codexWeeklySnapshot("new-epoch", 30, 14, { resetsAt: reset + 3 }),
+        codexWeeklySnapshot("new-jitter", 15, 17, { resetsAt: reset + 4.5 }),
+      ],
+    ),
+  )[0];
+  assert.equal(row?.recordedCost, 104);
+  assert.equal(row?.sampleCost, 5);
+  assert.equal(row?.observedConsumedPercent, 5);
+  assert.equal(row?.estimated100PercentCost, 100);
+});
+
+test("model quota epochs distinguish missing resets and restart after a drop below half peak", () => {
+  const reset = NOW / 1000 + 604_800;
+  for (const [oldReset, newReset, percentages] of [
+    [reset, undefined, [10, 12, 14, 17]],
+    [undefined, reset, [10, 12, 14, 17]],
+    [reset, reset, [20, 24, 11, 14]],
+  ] as const) {
+    const row = codexModelRows(
+      loaded(
+        [
+          codexModelCall("first", 59, 2),
+          codexModelCall("epoch-crossing", 44, 99),
+          codexModelCall("second", 29, 3),
+        ],
+        [
+          codexWeeklySnapshot("old-start", 60, percentages[0], { resetsAt: oldReset }),
+          codexWeeklySnapshot("old-end", 45, percentages[1], { resetsAt: oldReset }),
+          codexWeeklySnapshot("new-start", 30, percentages[2], { resetsAt: newReset }),
+          codexWeeklySnapshot("new-end", 15, percentages[3], { resetsAt: newReset }),
+        ],
+      ),
+    )[0];
+    assert.equal(row?.recordedCost, 104);
+    assert.equal(row?.sampleCost, 5);
+    assert.equal(row?.observedConsumedPercent, oldReset === newReset ? 7 : 5);
+    assert.equal(row?.intervals, 2);
+    assert.equal(row?.estimated100PercentCost, 500 / (oldReset === newReset ? 7 : 5));
+  }
 });
 
 test("model quota averages use only the selected history range", () => {
@@ -2229,7 +2316,7 @@ test("model quota averages never pair whole request costs with partial eligible 
       ],
     },
     {
-      calls: [long, codexModelCall("helper", 43, 1, "luna"), codexModelCall("short", 14, 3)],
+      calls: [long, codexModelCall("helper", 43, 3, "luna"), codexModelCall("short", 14, 2)],
       snapshots: [
         codexWeeklySnapshot("start", 45, 0),
         codexWeeklySnapshot("mixed", 30, 1),
@@ -2279,7 +2366,7 @@ test("model quota averages leave unsupported samples insufficient rather than in
   const firstSnapshot = baseline.snapshots[0];
   assert.ok(firstSnapshot);
   const cases = [
-    { ...baseline, calls: [...baseline.calls, codexModelCall("helper", 13, 1, "luna")] },
+    { ...baseline, calls: [...baseline.calls, codexModelCall("helper", 13, 3, "luna")] },
     { ...baseline, calls: [...baseline.calls, codexModelCall("unpriced", 13, 0, "luna")] },
     { ...baseline, calls: baseline.calls.map((call) => ({ ...call, preciseTimestamp: false })) },
     {
@@ -2390,15 +2477,136 @@ test("adjacent dominant samples align whole long-request costs with their full q
   assert.equal(row?.estimated100PercentCost, 300);
 });
 
+test("model calibration recovers safe inner observations without charging partial requests or rebounds", () => {
+  const row = codexModelRows(
+    loaded(
+      [
+        { ...codexModelCall("left-edge", 64, 3), completedAt: NOW - 50 * 60_000 },
+        { ...codexModelCall("contained", 44, 5), completedAt: NOW - 31 * 60_000 },
+        { ...codexModelCall("right-edge", 29, 7), completedAt: NOW - 10 * 60_000 },
+      ],
+      [
+        codexWeeklySnapshot("start", 60, 10),
+        codexWeeklySnapshot("peak", 55, 13),
+        codexWeeklySnapshot("safe-start", 45, 12),
+        codexWeeklySnapshot("dip", 40, 11),
+        codexWeeklySnapshot("safe-end", 30, 14),
+        codexWeeklySnapshot("later", 25, 15),
+        codexWeeklySnapshot("end", 15, 16),
+      ],
+    ),
+    90 * 60_000,
+  )[0];
+  assert.equal(row?.recordedCost, 15);
+  assert.equal(row?.sampleCost, 5);
+  assert.equal(row?.observedConsumedPercent, 1);
+  assert.equal(row?.intervals, 1);
+  assert.equal(row?.estimated100PercentCost, 500);
+});
+
+test("model calibration extends to safe outer observations and revalidates all overlapping activity", () => {
+  const calls = [
+    { ...codexModelCall("long", 49, 8), completedAt: NOW - 11 * 60_000 },
+    codexModelCall("contained-a", 44, 10),
+    codexModelCall("contained-b", 29, 10),
+    codexModelCall("left-helper", 59, 3, "luna"),
+    codexModelCall("right-helper", 14, 3, "luna"),
+  ];
+  const snapshots = [
+    codexWeeklySnapshot("outer-start", 60, 10),
+    codexWeeklySnapshot("start", 45, 11),
+    codexWeeklySnapshot("middle", 30, 12),
+    codexWeeklySnapshot("end", 15, 13),
+    codexWeeklySnapshot("outer-end", 0, 16),
+  ];
+  const scenarios = [
+    { calls, snapshots, accepted: true },
+    {
+      calls: [...calls, codexModelCall("unpriced-outer", 58, 0, "luna")],
+      snapshots,
+      accepted: false,
+    },
+    {
+      calls: [
+        ...calls,
+        { ...codexModelCall("imprecise-outer", 58, 1, "luna"), preciseTimestamp: false },
+      ],
+      snapshots,
+      accepted: false,
+    },
+    {
+      calls: [...calls, codexModelCall("extra-helper", 58, 2, "luna")],
+      snapshots,
+      accepted: false,
+    },
+    {
+      calls,
+      snapshots: [
+        ...snapshots.slice(0, -1),
+        codexWeeklySnapshot("reset-outer", 0, 16, { resetsAt: NOW / 1000 + 2 * 604_800 }),
+      ],
+      accepted: false,
+    },
+  ];
+  for (const [index, scenario] of scenarios.entries()) {
+    const row = codexModelRows(loaded(scenario.calls, scenario.snapshots)).find(
+      (item) => item.model === "sol",
+    );
+    assert.ok(row);
+    assert.equal(row.recordedCost, 28, `scenario ${index}`);
+    assert.equal(row.sampleCost, scenario.accepted ? 28 : 0, `scenario ${index}`);
+    assert.equal(row.observedConsumedPercent, scenario.accepted ? 6 : 0, `scenario ${index}`);
+    assert.equal(row.intervals, scenario.accepted ? 4 : 0, `scenario ${index}`);
+    assert.equal(
+      row.estimated100PercentCost,
+      scenario.accepted ? (28 * 100) / 6 : undefined,
+      `scenario ${index}`,
+    );
+  }
+});
+
+test("overlapping extended calibration candidates never count the same quota movement twice", () => {
+  const rows = codexModelRows(
+    loaded(
+      [
+        codexModelCall("sol-contained", 59, 200),
+        { ...codexModelCall("sol-crossing", 59, 16), completedAt: NOW - 41 * 60_000 },
+        { ...codexModelCall("luna-crossing", 44, 30, "luna"), completedAt: NOW - 26 * 60_000 },
+        { ...codexModelCall("luna-long", 29, 16, "luna"), completedAt: NOW - 11 * 60_000 },
+        codexModelCall("luna-contained", 29, 200, "luna"),
+      ],
+      [
+        codexWeeklySnapshot("start", 60, 10),
+        codexWeeklySnapshot("first", 45, 11),
+        codexWeeklySnapshot("second", 30, 12),
+        codexWeeklySnapshot("third", 15, 13),
+        codexWeeklySnapshot("end", 0, 14),
+      ],
+    ),
+  );
+  const sol = rows.find((row) => row.model === "sol");
+  const luna = rows.find((row) => row.model === "luna");
+  assert.equal(sol?.recordedCost, 216);
+  assert.equal(sol?.sampleCost, 216);
+  assert.equal(sol?.observedConsumedPercent, 2);
+  assert.equal(sol?.intervals, 2);
+  assert.equal(sol?.estimated100PercentCost, 10_800);
+  assert.equal(luna?.recordedCost, 246);
+  assert.equal(luna?.sampleCost, 0);
+  assert.equal(luna?.observedConsumedPercent, 0);
+  assert.equal(luna?.intervals, 0);
+  assert.equal(luna?.estimated100PercentCost, undefined);
+});
+
 test("merged calibration rechecks model dominance without counting overlapping costs repeatedly", () => {
   const call = { ...codexModelCall("long", 44, 9), completedAt: NOW - 60_000 };
   const row = codexModelRows(
     loaded(
       [
         call,
-        codexModelCall("helper-a", 43, 0.4, "luna"),
-        codexModelCall("helper-b", 28, 0.4, "luna"),
-        codexModelCall("helper-c", 13, 0.4, "luna"),
+        codexModelCall("helper-a", 43, 2, "luna"),
+        codexModelCall("helper-b", 28, 2, "luna"),
+        codexModelCall("helper-c", 13, 2, "luna"),
       ],
       [
         codexWeeklySnapshot("start", 45, 0),

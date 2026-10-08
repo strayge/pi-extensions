@@ -1919,9 +1919,10 @@ function identityKey(identity: UsageSnapshotIdentity): string {
 }
 
 const MODEL_QUOTA_INTERVAL_MS = 15 * 60_000;
-const MODEL_QUOTA_MIN_SHARE = 0.95;
+const MODEL_QUOTA_MIN_SHARE = 0.8;
+const MODEL_QUOTA_RESET_TOLERANCE_SECONDS = 2;
 
-/** Join adjacent samples so whole-request prices and quota movement cover the same work. */
+/** Keep whole-request prices paired with quota observations that bracket the same work. */
 function estimateModelQuotas(
   observations: Array<QuotaObservation & { percentage: number }>,
   calls: NormalizedCall[],
@@ -1983,12 +1984,14 @@ function estimateModelQuotas(
       continue;
     }
     const epoch = epochs.at(-1);
-    const previous = epoch?.at(-1);
-    if (
-      !epoch ||
-      previous?.raw.resetsAt !== observation.raw.resetsAt ||
-      observation.percentage < peak * 0.5
-    ) {
+    const epochReset = epoch?.[0]?.raw.resetsAt;
+    const reset = observation.raw.resetsAt;
+    const sameReset =
+      epochReset === reset ||
+      (epochReset !== undefined &&
+        reset !== undefined &&
+        Math.abs(epochReset - reset) <= MODEL_QUOTA_RESET_TOLERANCE_SECONDS);
+    if (!epoch || !sameReset || observation.percentage < peak * 0.5) {
       epochs.push([observation]);
       peak = observation.percentage;
     } else {
@@ -1997,36 +2000,112 @@ function estimateModelQuotas(
     }
   }
 
-  let run:
-    | { model: string; begin: number; end: number; consumption: number; intervals: number }
-    | undefined;
-  const finishRun = () => {
+  const accepted: Array<{ begin: number; end: number }> = [];
+  let run: { model: string; begin: number; end: number } | undefined;
+  const finishRun = (epoch: typeof observations) => {
     const period = run;
     run = undefined;
     if (!period) return;
     const row = rows.get(period.model);
     if (!row) return;
-    const periodCalls = callsBetween(period.begin, period.end);
-    const targetCalls = periodCalls.filter((call) => call.model === period.model);
-    if (
-      targetCalls.some(
-        (call) =>
-          call.timestamp < period.begin || (call.completedAt ?? call.timestamp) > period.end,
-      )
-    ) {
+    const targetActivity = activity.filter((call) => call.model === period.model);
+    const safe = epoch.filter(
+      (observation) =>
+        observation.capturedAt >= period.begin - MODEL_QUOTA_INTERVAL_MS &&
+        observation.capturedAt <= period.end + MODEL_QUOTA_INTERVAL_MS &&
+        !targetActivity.some(
+          (call) =>
+            call.timestamp < observation.capturedAt &&
+            (call.completedAt ?? call.timestamp) > observation.capturedAt,
+        ),
+    );
+    const outerBegin = safe.filter((item) => item.capturedAt <= period.begin).at(-1);
+    const outerEnd = safe.find((item) => item.capturedAt >= period.end);
+    const inner = safe.filter(
+      (item) => item.capturedAt >= period.begin && item.capturedAt <= period.end,
+    );
+    const innerBegin = inner[0];
+    const innerEnd = inner.at(-1);
+    const candidates: Array<{ begin: number; end: number }> = [];
+    if (outerBegin && outerEnd) {
+      candidates.push({ begin: outerBegin.capturedAt, end: outerEnd.capturedAt });
+    }
+    if (innerBegin && innerEnd) {
+      candidates.push({ begin: innerBegin.capturedAt, end: innerEnd.capturedAt });
+    }
+    for (const candidate of candidates) {
+      if (
+        candidate.begin >= candidate.end ||
+        accepted.some((sample) => sample.begin < candidate.end && candidate.begin < sample.end)
+      ) {
+        continue;
+      }
+      const samples = epoch.filter(
+        (item) => item.capturedAt >= candidate.begin && item.capturedAt <= candidate.end,
+      );
+      if (
+        samples.some(
+          (item, index) =>
+            index > 0 &&
+            item.capturedAt - (samples[index - 1]?.capturedAt ?? 0) > MODEL_QUOTA_INTERVAL_MS,
+        )
+      ) {
+        continue;
+      }
+      const periodCalls = callsBetween(candidate.begin, candidate.end);
+      if (
+        periodCalls.some(
+          (call) =>
+            !call.preciseTimestamp || (call.usage.totalTokens > 0 && call.usage.cost.total <= 0),
+        )
+      ) {
+        continue;
+      }
+      const sampleCost = periodCalls
+        .filter((call) => call.model === period.model)
+        .reduce((sum, call) => sum + call.usage.cost.total, 0);
+      const totalCost = periodCalls.reduce((sum, call) => sum + call.usage.cost.total, 0);
+      if (totalCost <= 0 || sampleCost / totalCost < MODEL_QUOTA_MIN_SHARE) continue;
+
+      // Keep prior peaks so a shallow correction cannot create consumption after trimming.
+      let runningPeak = epoch
+        .filter((item) => item.capturedAt <= candidate.begin)
+        .reduce((maximum, item) => Math.max(maximum, item.percentage), 0);
+      let consumption = 0;
+      let intervals = 0;
+      for (let start = 0; start < samples.length - 1; ) {
+        const begin = samples[start];
+        if (!begin) break;
+        let end = start + 1;
+        while (
+          end + 1 < samples.length &&
+          (samples[end + 1]?.capturedAt ?? Infinity) <= begin.capturedAt + MODEL_QUOTA_INTERVAL_MS
+        ) {
+          end += 1;
+        }
+        const finish = samples[end];
+        if (!finish) break;
+        let movement = 0;
+        for (let index = start + 1; index <= end; index += 1) {
+          const current = samples[index];
+          if (!current) continue;
+          movement += Math.max(0, current.percentage - runningPeak);
+          runningPeak = Math.max(runningPeak, current.percentage);
+        }
+        if (callsBetween(begin.capturedAt, finish.capturedAt).length > 0) {
+          consumption += movement;
+          intervals += 1;
+        }
+        start = end;
+      }
+      row.sampleCost += sampleCost;
+      row.observedConsumedPercent += consumption;
+      row.intervals += intervals;
+      accepted.push(candidate);
       return;
     }
-    const sampleCost = targetCalls.reduce((sum, call) => sum + call.usage.cost.total, 0);
-    const totalCost = periodCalls.reduce((sum, call) => sum + call.usage.cost.total, 0);
-    if (totalCost <= 0 || sampleCost / totalCost < MODEL_QUOTA_MIN_SHARE) return;
-    row.sampleCost += sampleCost;
-    row.observedConsumedPercent += period.consumption;
-    row.intervals += period.intervals;
   };
   for (const epoch of epochs) {
-    const first = epoch[0];
-    if (!first) continue;
-    peak = first.percentage;
     for (let start = 0; start < epoch.length - 1; ) {
       const begin = epoch[start];
       if (!begin) break;
@@ -2040,13 +2119,6 @@ function estimateModelQuotas(
       const finish = epoch[end];
       if (!finish) break;
       const intervalCalls = callsBetween(begin.capturedAt, finish.capturedAt);
-      let consumption = 0;
-      for (let index = start + 1; index <= end; index += 1) {
-        const current = epoch[index];
-        if (!current) continue;
-        consumption += Math.max(0, current.percentage - peak);
-        peak = Math.max(peak, current.percentage);
-      }
       start = end;
       if (
         finish.capturedAt - begin.capturedAt > MODEL_QUOTA_INTERVAL_MS ||
@@ -2056,7 +2128,7 @@ function estimateModelQuotas(
             !call.preciseTimestamp || (call.usage.totalTokens > 0 && call.usage.cost.total <= 0),
         )
       ) {
-        finishRun();
+        finishRun(epoch);
         continue;
       }
       const costs = new Map<string, number>();
@@ -2066,25 +2138,17 @@ function estimateModelQuotas(
       const totalCost = [...costs.values()].reduce((sum, cost) => sum + cost, 0);
       const dominant = [...costs].sort((a, b) => b[1] - a[1])[0];
       if (!dominant || totalCost <= 0 || dominant[1] / totalCost < MODEL_QUOTA_MIN_SHARE) {
-        finishRun();
+        finishRun(epoch);
         continue;
       }
-      if (run && (run.model !== dominant[0] || run.end !== begin.capturedAt)) finishRun();
+      if (run && (run.model !== dominant[0] || run.end !== begin.capturedAt)) finishRun(epoch);
       if (!run) {
-        run = {
-          model: dominant[0],
-          begin: begin.capturedAt,
-          end: finish.capturedAt,
-          consumption,
-          intervals: 1,
-        };
+        run = { model: dominant[0], begin: begin.capturedAt, end: finish.capturedAt };
       } else {
         run.end = finish.capturedAt;
-        run.consumption += consumption;
-        run.intervals += 1;
       }
     }
-    finishRun();
+    finishRun(epoch);
   }
   for (const row of result) {
     if (row.observedConsumedPercent > 0 && row.sampleCost > 0) {

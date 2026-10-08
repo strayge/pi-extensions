@@ -606,13 +606,23 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
     assert.match(output, /gpt-insufficient: recorded \$3\.00 · weekly 100% insufficient data/);
     assert.match(output, /sample \$1\.00 \/ 0 pp · 1 interval \(≤15m\)\n/);
     assert.equal(output.match(/Historical .* model averages/g)?.length, 1);
-    assert.doesNotMatch(output, /identity-[abc]|lifetime|permanent/i);
+    assert.doesNotMatch(output, /weak evidence|identity-[abc]|lifetime|permanent/i);
   }
   for (const tab of ["Models", "Cache"] as const) {
     const output = renderUsageHistory(history, { ...state, tab }, 120, 100, { view }).lines.join(
       "\n",
     );
     assert.doesNotMatch(output, /model averages|API-equivalent|gpt-supported|insufficient data/);
+  }
+
+  for (const consumed of [1, 2, 3]) {
+    bucket.modelEstimates[0].observedConsumedPercent = consumed;
+    const output = renderUsageHistory(history, state, 120, 100, {
+      view,
+      padToHeight: false,
+    }).lines.join("\n");
+    assert.equal(output.includes("weekly 100% ≈ $120.00 · weak evidence"), consumed < 3);
+    assert.doesNotMatch(output, /insufficient data · weak evidence/);
   }
 
   bucket.capacity = undefined;
