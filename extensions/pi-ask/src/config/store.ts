@@ -31,13 +31,9 @@ export class AskConfigStore {
 	private notice?: AskConfigNotice;
 	private readonly listeners = new Set<(config: AskConfig) => void>();
 	private readonly configPath: string;
-	private readonly legacyConfigPaths: string[];
 
-	constructor(configPath?: string, legacyConfigPaths?: string[]) {
-		this.configPath = configPath ?? getAskConfigPath();
-		this.legacyConfigPaths = (
-			legacyConfigPaths ?? (configPath ? [] : getLegacyAskConfigPaths())
-		).filter((path) => path !== this.configPath);
+	constructor(configPath = getAskConfigPath()) {
+		this.configPath = configPath;
 	}
 
 	subscribe(onChange: (config: AskConfig) => void): () => void {
@@ -91,7 +87,7 @@ export class AskConfigStore {
 	}
 
 	private async loadFromDisk(): Promise<AskConfigLoadResult> {
-		const content = await this.readDiskConfig();
+		const content = await readConfigFileIfPresent(this.configPath);
 		if (content === undefined) {
 			return this.loadMissingConfig();
 		}
@@ -102,15 +98,6 @@ export class AskConfigStore {
 		}
 
 		return this.loadParsedConfig(parsed.value);
-	}
-
-	private async readDiskConfig(): Promise<string | undefined> {
-		for (const path of [this.configPath, ...this.legacyConfigPaths]) {
-			const content = await readConfigFileIfPresent(path);
-			if (content !== undefined) {
-				return content;
-			}
-		}
 	}
 
 	private async loadMissingConfig(): Promise<AskConfigLoadResult> {
@@ -176,11 +163,7 @@ export function resetAskConfigStore(): void {
 }
 
 export function getAskConfigPath(): string {
-	return join(getAgentDir(), "eko24ive-pi-ask.json");
-}
-
-export function getLegacyAskConfigPaths(): string[] {
-	return [join(getAgentDir(), "extensions", "eko24ive-pi-ask.json")];
+	return join(getAgentDir(), "pi-ask.json");
 }
 
 function createConfigSaveError(path: string, error: unknown): Error {
