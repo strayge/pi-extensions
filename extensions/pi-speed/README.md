@@ -37,23 +37,25 @@ speed values.
 
 ## Historical model speed
 
-Run `/speed` to open the `1d` report, or use `/speed 1d`, `/speed 2d`, `/speed
-3d`, `/speed 5d`, `/speed 7d`, or `/speed 14d`. The range selector remains above
-the results. Left/Right changes the range immediately from one captured history
-load, so every range shares the same fixed end time.
+Run `/speed` with no arguments to open a table with **Model**, **24h**, and
+**2d–7d** columns. Each cell shows median streaming output tokens/second;
+`—` means no usable measurements. Speed columns are at least five characters
+wide, expanding for larger values.
 
-Each exact provider/model has one row, with reasoning levels pooled. Models
-without usable measurements in the selected period are hidden. The table shows:
+Columns are separate rolling 24-hour periods, not cumulative averages or
+calendar days: 24h covers the last 24 hours, 2d covers 24–48 hours ago, and so
+on. All seven columns share one captured end time. Exact boundaries belong to
+the newer column.
 
-- median streaming output tokens/second;
-- measured text and tool-call output tokens, excluding reasoning;
-- measured total output-stream time; and
-- descriptive Trend values for sufficiently populated comparable cohorts.
+Each exact provider/model has one row, with reasoning levels pooled. The first
+column shows the model name, adding the provider in parentheses only when the
+same model appears on multiple routes. Models without usable measurements in
+any of the seven days are hidden.
 
-Up/Down and PageUp/PageDown scroll rows. Shift+Left/Right pans columns on narrow
-terminals, Left/Right changes range, and Escape closes the report. UI-capable
-non-TUI clients receive the report and range choices in one selection loop.
-Nothing is posted into model context.
+Up/Down and PageUp/PageDown scroll rows. Left/Right (or Shift+Left/Right) pans
+columns on narrow terminals, and Escape closes the report. UI-capable non-TUI
+clients receive the table with a Close option. Nothing is posted into model
+context.
 
 ### Persisted history sources
 
@@ -70,11 +72,10 @@ speed measurement. Quota snapshots, provider adapters, credentials, and usage
 configuration are not read.
 
 The reader keeps a 30-day history horizon with a 30-minute file-age boundary
-tolerance. `14d` is the largest offered range because its comparison needs 28
-days. Missing, unreadable, malformed, or undiscoverable sessions can make the
-report incomplete.
+tolerance; the table uses only the latest seven days. Missing, unreadable,
+malformed, or undiscoverable sessions can make the report incomplete.
 
-### Measurements and comparisons
+### Measurements
 
 For each eligible assistant response:
 
@@ -107,41 +108,10 @@ even though token totals include that chunk. Provider/network buffering and
 parsed-event delivery can distort arrival times. Reasoning-only payloads and
 subsequent tool execution do not count.
 
-A row's speed is the median of individual request rates, not a ratio of summed
-tokens and time. Its non-reasoning token and stream-time totals use those same
-eligible requests. Concurrent stream durations can overlap, so the total is not
-wall-clock active time.
-
-Every selected range is compared with the immediately preceding equal-length
-period. The shared boundary belongs to the selected period. Within an exact
-provider/model row, comparison cohorts also match:
-
-- requested thinking level and explicit versus inferred effort provenance;
-- context size (`input + cacheRead + cacheWrite`): `<16k`, `16–64k`, `64–128k`,
-  or `>=128k`;
-- non-reasoning output size: `<500`, `500–2k`, `2–8k`, or `>=8k`; and
-- stop reason: `stop` or `toolUse`.
-
-Effort comes from explicit message metadata or the nearest ancestor
-`thinking_level_change` on that request's branch. Unknown, inferred, and
-explicit effort remain distinct for comparisons even though the overview row
-pools them.
-
-Here `k` means 1,000 tokens. A cohort needs at least 10 measured requests in each
-period. Its change is:
-
-```text
-(current median rate / previous median rate - 1) x 100
-```
-
-Trend shows one percentage for one eligible cohort, or the minimum-to-maximum
-percentages and cohort count for several. It never averages cohort changes.
-Without an eligible cohort it says `insufficient`; row medians and totals still
-include all eligible measurements.
-
-These are descriptive observations, not benchmark verdicts, confidence claims,
-or model recommendations. Coarse cohorts cannot control provider load, routing,
-network latency, cache behavior, or workload differences.
+Each daily speed is the median of individual request rates, not a ratio of
+summed tokens and time. These are descriptive observations, not benchmark
+verdicts or model recommendations; workloads, provider load, routing, and
+network buffering can differ between days.
 
 ## Current-session speed status
 

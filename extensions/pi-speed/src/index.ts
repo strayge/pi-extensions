@@ -5,7 +5,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { isAbortError, isStaleExtensionContextError } from "./core.ts";
 import { loadHistory } from "./history.ts";
-import { SPEED_RANGES, showSpeedReport, speedRange } from "./speed.ts";
+import { showSpeedReport } from "./speed.ts";
 import { registerSpeedStatus } from "./speed-status.ts";
 import { registerStreamCollector } from "./stream.ts";
 
@@ -47,15 +47,10 @@ export default function speedExtension(pi: ExtensionAPI, load: HistoryLoader = l
   let speedController: AbortController | undefined;
 
   pi.registerCommand("speed", {
-    description: "Show historical output streaming speed and descriptive cohort changes",
+    description: "Show median model streaming speed for the last seven days",
     handler: async (args, ctx) => {
-      const argument = args.trim();
-      const preset = speedRange(argument);
-      if (argument && !preset) {
-        ctx.ui.notify(
-          `/speed accepts: ${SPEED_RANGES.join(", ")}, or no argument to open the 1d report.`,
-          "warning",
-        );
+      if (args.trim()) {
+        ctx.ui.notify("/speed takes no arguments; it shows the last seven days.", "warning");
         return;
       }
       if (!ctx.hasUI) {
@@ -66,7 +61,6 @@ export default function speedExtension(pi: ExtensionAPI, load: HistoryLoader = l
       const controller = new AbortController();
       speedController = controller;
       try {
-        const range = preset ?? "1d";
         const loaded = await runWithLoader(
           ctx,
           "Loading model speed history…",
@@ -74,7 +68,7 @@ export default function speedExtension(pi: ExtensionAPI, load: HistoryLoader = l
           (signal) => load(ctx, { signal }),
         );
         if (!loaded || controller.signal.aborted) return;
-        await showSpeedReport(ctx, loaded, range, controller.signal);
+        await showSpeedReport(ctx, loaded, controller.signal);
       } catch (error) {
         if (controller.signal.aborted || isAbortError(error) || isStaleExtensionContextError(error))
           return;

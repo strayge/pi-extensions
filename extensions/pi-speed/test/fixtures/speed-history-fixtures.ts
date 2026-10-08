@@ -242,18 +242,15 @@ export const discoveryFixture = {
     }),
   ],
   expectedReport: {
-    range: "1d",
-    since: FIXED_NOW - DAY_MS,
-    previousSince: FIXED_NOW - 2 * DAY_MS,
+    since: FIXED_NOW - 7 * DAY_MS,
     now: FIXED_NOW,
     rows: [],
     coverage: { assistants: 4, observed: 0, unsuccessful: 0, untimed: 4, noOutput: 0 },
     warnings: [],
   },
   expectedVisibleLines: [
-    "Streaming speed · 1d vs previous 1d",
-    "Provider/model Median tok/s Total output tokens Total stream time  Trend       ",
-    "No measured requests in selected period",
+    "Model 24h   2d    3d    4d    5d    6d    7d   ",
+    "No measured requests in the last seven days",
   ],
 } as const;
 
@@ -450,18 +447,15 @@ export const normalizationFixture = {
     ["beta-cycle", undefined, false],
   ],
   expectedReport: {
-    range: "1d",
-    since: FIXED_NOW - DAY_MS,
-    previousSince: FIXED_NOW - 2 * DAY_MS,
+    since: FIXED_NOW - 7 * DAY_MS,
     now: FIXED_NOW,
     rows: [],
-    coverage: { assistants: 22, observed: 0, unsuccessful: 1, untimed: 21, noOutput: 0 },
+    coverage: { assistants: 35, observed: 0, unsuccessful: 1, untimed: 34, noOutput: 0 },
     warnings: ["invalid-usage (2)", "untimestamped-call (1)"],
   },
   expectedVisibleLines: [
-    "Streaming speed · 1d vs previous 1d",
-    "Provider/model Median tok/s Total output tokens Total stream time  Trend       ",
-    "No measured requests in selected period",
+    "Model 24h   2d    3d    4d    5d    6d    7d   ",
+    "No measured requests in the last seven days",
   ],
 } as const;
 
@@ -760,9 +754,7 @@ export function buildLineageFixture(paths: LineageFixturePaths) {
       ],
     ]),
     expectedReport: {
-      range: "1d",
-      since: FIXED_NOW - DAY_MS,
-      previousSince: FIXED_NOW - 2 * DAY_MS,
+      since: FIXED_NOW - 7 * DAY_MS,
       now: FIXED_NOW,
       rows: [],
       coverage: { assistants: 12, observed: 0, unsuccessful: 1, untimed: 11, noOutput: 0 },
@@ -792,8 +784,7 @@ export const outputFixture = {
     output: 999,
   }).message as FixtureRow,
   expectedVisibleLines: [
-    "Streaming speed · 1d vs previous 1d",
-    "Provider/model Median tok/s Total output tokens Total stream time  Trend       ",
-    "No measured requests in selected period",
+    "Model 24h   2d    3d    4d    5d    6d    7d   ",
+    "No measured requests in the last seven days",
   ],
 } as const;

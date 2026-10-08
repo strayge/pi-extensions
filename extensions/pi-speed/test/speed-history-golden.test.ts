@@ -67,18 +67,12 @@ async function writeJsonl(path: string, rows: readonly unknown[], tail = "") {
 
 function reportSnapshot(report: SpeedReport) {
   return {
-    range: report.range,
     since: report.since,
-    previousSince: report.previousSince,
     now: report.now,
     rows: report.rows,
     coverage: report.coverage,
     warnings: report.warnings,
   };
-}
-
-function oneDay(history: LoadedHistory) {
-  return deriveSpeedReport(history, "1d");
 }
 
 test("golden discovery uses default listing, custom fallback, canonical aliases, and captured active entries", async (t) => {
@@ -155,7 +149,7 @@ test("golden discovery uses default listing, custom fallback, canonical aliases,
     history.calls.find((call) => call.entryId === "persisted-subagent-call")?.source.kind,
     "session",
   );
-  const report = oneDay(history);
+  const report = deriveSpeedReport(history);
   assert.deepEqual(reportSnapshot(report), discoveryFixture.expectedReport);
   assert.deepEqual(speedReportLines(report, 140), discoveryFixture.expectedVisibleLines);
 
@@ -168,7 +162,7 @@ test("golden discovery uses default listing, custom fallback, canonical aliases,
   assert.equal(memoryHistory.calls[0]?.usage.output, 90);
   assert.equal(memoryHistory.calls[0]?.durationMs, 3_000);
   assert.equal(memoryHistory.calls[0]?.stream, undefined);
-  assert.deepEqual(oneDay(memoryHistory).rows, []);
+  assert.deepEqual(deriveSpeedReport(memoryHistory).rows, []);
 });
 
 test("on-disk age pruning retains only the 30-day boundary tolerance", async (t) => {
@@ -216,7 +210,7 @@ test("on-disk age pruning retains only the 30-day boundary tolerance", async (t)
   assert.equal(history.calls[0]?.timestamp, FIXED_NOW - 60_000);
   assert.equal(history.calls[0]?.usage.output, 100);
   assert.equal(history.calls[0]?.durationMs, 1_000);
-  assert.deepEqual(oneDay(history).rows, []);
+  assert.deepEqual(deriveSpeedReport(history).rows, []);
 });
 
 test("golden lineage keeps conservative roots and baseline canonical-copy claimants", async (t) => {
@@ -301,7 +295,7 @@ test("golden lineage keeps conservative roots and baseline canonical-copy claima
   assert.ok(history.warnings.some((warning) => warning.code === "broken-lineage"));
   assert.ok(history.warnings.some((warning) => warning.code === "cyclic-lineage"));
   assert.equal(history.warnings.filter((warning) => warning.code === "invalid-usage").length, 1);
-  assert.deepEqual(reportSnapshot(oneDay(history)), fixture.expectedReport);
+  assert.deepEqual(reportSnapshot(deriveSpeedReport(history)), fixture.expectedReport);
 
   const validRoot = join(root, "valid-accounting-root.jsonl");
   const validFork = join(root, "valid-accounting-fork.jsonl");
@@ -377,7 +371,7 @@ test("golden normalization preserves effort ancestry, usage validation, endpoint
   assert.equal(calls.has("bad-token"), false);
   assert.equal(calls.has("bad-cost"), false);
   assert.equal(history.warnings.filter((warning) => warning.code === "invalid-usage").length, 2);
-  const report = oneDay(history);
+  const report = deriveSpeedReport(history);
   assert.deepEqual(reportSnapshot(report), normalizationFixture.expectedReport);
   assert.deepEqual(speedReportLines(report, 140), normalizationFixture.expectedVisibleLines);
 
@@ -437,7 +431,7 @@ test("temporary outputs are never read and cannot change visible speed rows", as
     sourceReadStarted: (path) => reads.push(path),
   });
 
-  const report = oneDay(history);
+  const report = deriveSpeedReport(history);
   assert.deepEqual(reads, [persisted]);
   assert.deepEqual(speedReportLines(report, 140), outputFixture.expectedVisibleLines);
   assert.equal(report.coverage.untimed, 1);
@@ -478,17 +472,15 @@ test("malformed, incomplete, missing-header, and unreadable persisted files keep
       if (path === changing) await appendFile(changing, '{"actively-writing"');
     },
   });
-  const report = oneDay(history);
+  const report = deriveSpeedReport(history);
   assert.deepEqual(report.rows, [
     {
       provider: "provider-m",
       model: "survivor",
-      samples: 1,
-      previousSamples: 0,
-      medianRate: 150,
-      totalOutputTokens: 300,
-      totalSeconds: 2,
-      changes: [],
+      days: [
+        { samples: 1, medianRate: 150 },
+        ...Array.from({ length: 6 }, () => ({ samples: 0, medianRate: undefined })),
+      ],
     },
   ]);
   assert.equal(history.warnings.filter((warning) => warning.code === "malformed-jsonl").length, 3);
@@ -503,9 +495,8 @@ test("malformed, incomplete, missing-header, and unreadable persisted files keep
     1,
   );
   assert.deepEqual(speedReportLines(report, 140), [
-    "Streaming speed · 1d vs previous 1d",
-    "Provider/model      Median tok/s Total output tokens Total stream time  Trend       ",
-    "provider-m/survivor 150.0        300                 2.0s               insufficient",
+    "Model    24h   2d    3d    4d    5d    6d    7d   ",
+    "survivor 150.0 —     —     —     —     —     —    ",
   ]);
 });
 
@@ -537,23 +528,21 @@ test("active and disk annotations attach across all entries, survive reload, and
   assert.equal(loaded.calls.find((call) => call.entryId === "disk-stream")?.durationMs, 90_000);
   assert.ok(loaded.calls.every((call) => call.stream?.totalOutputTokens === 900));
   assert.doesNotMatch(JSON.stringify(loaded), /privatePayload|secret|unrelated/);
-  assert.deepEqual(oneDay(loaded).rows, [
+  assert.deepEqual(deriveSpeedReport(loaded).rows, [
     {
       provider: "fixture-provider",
       model: "fixture-model",
-      samples: 2,
-      previousSamples: 0,
-      medianRate: 225,
-      totalOutputTokens: 600,
-      totalSeconds: 3,
-      changes: [],
+      days: [
+        { samples: 2, medianRate: 225 },
+        ...Array.from({ length: 6 }, () => ({ samples: 0, medianRate: undefined })),
+      ],
     },
   ]);
   const reloaded = await loadHistory(context(manager({ dir: root })), {
     now: FIXED_NOW,
     listAll: async () => [listed(disk), listed(activeFile)],
   });
-  assert.deepEqual(oneDay(reloaded).rows, oneDay(loaded).rows);
+  assert.deepEqual(deriveSpeedReport(reloaded).rows, deriveSpeedReport(loaded).rows);
   assert.deepEqual(
     reloaded.calls.map((call) => [call.entryId, call.stream]).sort(),
     loaded.calls.map((call) => [call.entryId, call.stream]).sort(),
@@ -614,8 +603,8 @@ test("identity mismatches, malformed annotations, and conflicting valid duplicat
       ["identical-duplicates", "invalid-does-not-conflict"],
     );
     assert.ok(loaded.calls.every((call) => call.durationMs === 1_000));
-    assert.equal(oneDay(loaded).coverage.untimed, rejected.length + 1);
-    assert.equal(oneDay(loaded).rows[0]?.samples, 2);
+    assert.equal(deriveSpeedReport(loaded).coverage.untimed, rejected.length + 1);
+    assert.equal(deriveSpeedReport(loaded).rows[0]?.days[0]?.samples, 2);
   }
 });
 
@@ -665,9 +654,8 @@ test("canonical lineage claimants retain their own telemetry without importing m
     loaded.calls.some((call) => call.entryId === accounting.id),
     false,
   );
-  assert.equal(oneDay(loaded).coverage.untimed, 1);
-  assert.equal(oneDay(loaded).rows[0]?.samples, 2);
-  assert.equal(oneDay(loaded).rows[0]?.totalSeconds, 4);
+  assert.equal(deriveSpeedReport(loaded).coverage.untimed, 1);
+  assert.deepEqual(deriveSpeedReport(loaded).rows[0]?.days[0], { samples: 2, medianRate: 150 });
 });
 
 test("history cancellation remains prompt at entry, discovery, and source-read boundaries", async (t) => {
@@ -745,9 +733,9 @@ test("one load captures now once before asynchronous discovery", async (t) => {
   }
 
   assert.equal(history.now, FIXED_NOW);
-  const report = oneDay(history);
+  const report = deriveSpeedReport(history);
   assert.equal(report.now, FIXED_NOW);
-  assert.equal(report.since, FIXED_NOW - DAY_MS);
+  assert.equal(report.since, FIXED_NOW - 7 * DAY_MS);
   assert.equal(history.calls[0]?.timestamp, FIXED_NOW - DAY_MS);
   assert.equal(history.calls[0]?.durationMs, 1_000);
   assert.equal(report.coverage.untimed, 1);

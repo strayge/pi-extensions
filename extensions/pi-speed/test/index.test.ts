@@ -39,69 +39,68 @@ test("pi-speed owns only the speed command and speed lifecycle hooks", () => {
   ]);
 });
 
-test("/speed opens results directly and changes range without reloading or live side effects", async (t) => {
+test("/speed opens one fixed seven-day table without live side effects", async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => {
     globalThis.fetch = originalFetch;
   });
   globalThis.fetch = async () => assert.fail("speed must not fetch live data");
-  for (const args of ["", "7d"]) {
-    const mock = createMockPi();
-    let loads = 0;
-    let loadSignal: AbortSignal | undefined;
-    speedExtension(mock.pi, async (_ctx, options) => {
-      loads += 1;
-      loadSignal = options.signal;
-      return emptyHistory;
-    });
-    const selections: string[] = [];
-    const { ctx, statuses, notifications } = createMockContext({
-      hasUI: true,
-      mode: "rpc",
-      model,
-      modelRegistry: new Proxy({}, { get: () => assert.fail("speed must not resolve auth") }),
-      select: async (title: string, options: string[]) => {
-        selections.push(title);
-        assert.deepEqual(options, ["1d", "2d", "3d", "5d", "7d", "14d", "Close"]);
-        assert.match(
-          title,
-          selections.length === 1
-            ? args
-              ? /7d vs previous 7d/
-              : /1d vs previous 1d/
-            : /14d vs previous 14d/,
-        );
-        assert.match(title, /Provider\/model/);
-        return selections.length === 1 ? "14d" : "Close";
-      },
-    });
-    await mock.commands.get("speed")?.handler(args, ctx);
-    assert.equal(loads, 1);
-    assert.equal(selections.length, 2);
-    assert.equal(loadSignal?.aborted, true);
-    assert.equal(statuses.size, 0);
-    assert.deepEqual(notifications, []);
-    assert.deepEqual(mock.entries, []);
-    assert.deepEqual(mock.sentMessages, []);
-    assert.deepEqual(mock.sentUserMessages, []);
-  }
+  const mock = createMockPi();
+  let loads = 0;
+  let loadSignal: AbortSignal | undefined;
+  speedExtension(mock.pi, async (_ctx, options) => {
+    loads += 1;
+    loadSignal = options.signal;
+    return emptyHistory;
+  });
+  const selections: string[] = [];
+  const { ctx, statuses, notifications } = createMockContext({
+    hasUI: true,
+    mode: "rpc",
+    model,
+    modelRegistry: new Proxy({}, { get: () => assert.fail("speed must not resolve auth") }),
+    select: async (title: string, options: string[]) => {
+      selections.push(title);
+      assert.deepEqual(options, ["Close"]);
+      assert.equal(
+        title.split("\n")[0]?.trim().replace(/\s+/g, " "),
+        "Model 24h 2d 3d 4d 5d 6d 7d",
+      );
+      assert.doesNotMatch(title, /Streaming speed|Provider\/model|previous/);
+      assert.match(title, /No measured requests in the last seven days/);
+      return "Close";
+    },
+  });
+  await mock.commands.get("speed")?.handler("", ctx);
+  assert.equal(loads, 1);
+  assert.equal(selections.length, 1);
+  assert.equal(loadSignal?.aborted, true);
+  assert.equal(statuses.size, 0);
+  assert.deepEqual(notifications, []);
+  assert.deepEqual(mock.entries, []);
+  assert.deepEqual(mock.sentMessages, []);
+  assert.deepEqual(mock.sentUserMessages, []);
 });
 
 test("/speed rejects invalid arguments and no-UI contexts before loading", async () => {
   const mock = createMockPi();
   speedExtension(mock.pi, async () => assert.fail("must not load"));
-  for (const args of ["30d", "1d 2d", "invalid"]) {
+  for (const args of ["1d", "7d", "30d", "1d 2d", "invalid"]) {
     const { ctx, notifications } = createMockContext({
       hasUI: true,
       mode: "rpc",
       select: async () => assert.fail("invalid args must not select"),
     });
     await mock.commands.get("speed")?.handler(args, ctx);
-    assert.equal(notifications.length, 1);
-    assert.match(notifications[0]?.message ?? "", /\/speed accepts/);
+    assert.deepEqual(notifications, [
+      {
+        message: "/speed takes no arguments; it shows the last seven days.",
+        level: "warning",
+      },
+    ]);
   }
   const noUI = createMockContext();
-  await mock.commands.get("speed")?.handler("1d", noUI.ctx);
+  await mock.commands.get("speed")?.handler("", noUI.ctx);
   assert.match(noUI.notifications[0]?.message ?? "", /requires an interactive/);
 });
 
@@ -131,9 +130,9 @@ test("/speed aborts a superseded load and a shutdown load without showing stale 
         return "Close";
       },
     });
-    const pending = mock.commands.get("speed")?.handler("1d", ctx);
+    const pending = mock.commands.get("speed")?.handler("", ctx);
     assert.equal(firstSignal?.aborted, false);
-    if (action === "supersede") await mock.commands.get("speed")?.handler("2d", ctx);
+    if (action === "supersede") await mock.commands.get("speed")?.handler("", ctx);
     else mock.events.get("session_shutdown")?.[0]?.({}, ctx);
     await pending;
     assert.equal(firstSignal?.aborted, true);
@@ -180,7 +179,7 @@ test("/speed TUI Escape aborts the history loader without opening a report", asy
         setImmediate(() => component.handleInput("\u001b"));
       }),
   });
-  await mock.commands.get("speed")?.handler("1d", ctx);
+  await mock.commands.get("speed")?.handler("", ctx);
   assert.equal(aborted, true);
   assert.equal(customCalls, 1);
   assert.deepEqual(notifications, []);
@@ -192,7 +191,7 @@ test("/speed sanitizes read failures and suppresses stale contexts", async () =>
     throw new Error("/private/source: bearer-secret");
   });
   const failed = createMockContext({ hasUI: true, mode: "rpc" });
-  await generic.commands.get("speed")?.handler("1d", failed.ctx);
+  await generic.commands.get("speed")?.handler("", failed.ctx);
   assert.deepEqual(failed.notifications, [
     { message: "Could not load model speed history.", level: "warning" },
   ]);
@@ -202,6 +201,6 @@ test("/speed sanitizes read failures and suppresses stale contexts", async () =>
     throw new Error("This extension ctx is stale after session replacement or reload");
   });
   const replaced = createMockContext({ hasUI: true, mode: "rpc" });
-  await stale.commands.get("speed")?.handler("1d", replaced.ctx);
+  await stale.commands.get("speed")?.handler("", replaced.ctx);
   assert.deepEqual(replaced.notifications, []);
 });
