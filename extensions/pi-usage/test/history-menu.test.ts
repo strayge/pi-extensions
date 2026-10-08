@@ -603,7 +603,8 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
     assert.ok(output.includes(`Historical ${range} model averages · API-equivalent dollars`));
     assert.match(output, /gpt-supported: recorded \$48\.00 · weekly 100% ≈ \$120\.00/);
     assert.match(output, /sample \$12\.60 \/ 10\.5 pp · 4 intervals \(≤15m\)/);
-    assert.match(output, /gpt-insufficient: recorded \$3\.00 · weekly 100% insufficient data/);
+    assert.match(output, /gpt-insufficient: recorded \$3\.00\n/);
+    assert.doesNotMatch(output, /insufficient data/);
     assert.match(output, /sample \$1\.00 \/ 0 pp · 1 interval \(≤15m\)\n/);
     assert.equal(output.match(/Historical .* model averages/g)?.length, 1);
     assert.doesNotMatch(output, /weak evidence|identity-[abc]|lifetime|permanent/i);
@@ -634,7 +635,7 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
   bucket.observedConsumption = 0;
   bucket.observations = [];
   const zeroQuota = renderUsageHistory(history, state, 120, 100, { view }).lines.join("\n");
-  assert.match(zeroQuota, /gpt-insufficient: recorded \$3\.00 · weekly 100% insufficient data/);
+  assert.match(zeroQuota, /gpt-insufficient: recorded \$3\.00\n/);
 });
 
 test("per-model quota rows sanitize model IDs and stay width-safe with real theme", () => {
@@ -684,7 +685,8 @@ test("per-model quota rows sanitize model IDs and stay width-safe with real them
     if (width === 120) {
       assert.match(output, /weekly 100% ≈\s+\$400\.00/);
       assert.match(output, /sample \$2\.00 \/ 0\.5 pp · 2 intervals \(≤15m\)/);
-      assert.match(output, /gpt-no-samples: recorded \$0\.00 · weekly 100% insufficient data/);
+      assert.match(output, /gpt-no-samples: recorded \$0\.00\n/);
+      assert.doesNotMatch(output, /insufficient data/);
       assert.match(output, /sample \$0\.00 \/ 0 pp · 0 intervals \(≤15m\)/);
     }
   }
