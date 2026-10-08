@@ -20,7 +20,7 @@ function fixture(t: { after: (cleanup: () => void) => void }) {
 type Factory = Parameters<ExtensionContext["ui"]["custom"]>[0];
 type Dialog = Awaited<ReturnType<Factory>>;
 
-function tuiContext(cwd: string, visit: (component: Dialog, index: number) => void): ExtensionContext {
+function tuiContext(cwd: string, visit: (component: Dialog, index: number, factory: Factory) => void): ExtensionContext {
   initTheme("dark", false);
   let dialogs = 0;
   return { cwd, hasUI: true, mode: "tui", ui: {
@@ -34,7 +34,7 @@ function tuiContext(cwd: string, visit: (component: Dialog, index: number) => vo
         (value) => { result = value; finished = true; },
       );
       try {
-        visit(component, dialogs++);
+        visit(component, dialogs++, factory);
         assert.ok(finished, "the dialog must finish through its callback");
         return result;
       } finally { component.dispose?.(); }
@@ -122,6 +122,46 @@ test("abort signals dismiss both custom scope dialogs without returning a stale 
       } else controller.abort();
     });
     await assert.rejects(editDirectoryScope(ctx, f.requested, f.requested, "write", controller.signal), { name: "AbortError" });
+  }
+});
+
+test("scope picker and prefilled editor factories inherit only the opening approval's input intent", async (t) => {
+  const f = fixture(t);
+  const marker = Symbol.for("pi-extensions:input-dialog");
+  for (const agentWait of [undefined, false]) {
+    const controller = new AbortController();
+    let dialogs = 0;
+    const ctx = tuiContext(f.root, (component, index, factory) => {
+      dialogs++;
+      assert.equal(Reflect.get(factory, marker), agentWait === false ? undefined : true);
+      assert.equal(Reflect.get(component, marker), undefined);
+      if (index === 0) component.handleInput?.("\u001b[A");
+      else assert.ok(component.render(1024).join("\n").includes(f.requested));
+      component.handleInput?.("\r");
+    });
+    assert.deepEqual(await editDirectoryScope(ctx, f.requested, f.requested, "read", controller.signal, agentWait), bindPath(f.requested));
+    assert.equal(dialogs, 2);
+  }
+});
+
+test("native scope picker and manual input preserve signals while opting out only manual approvals", async (t) => {
+  const f = fixture(t);
+  const marker = Symbol.for("pi-extensions:input-dialog");
+  for (const agentWait of [undefined, false]) {
+    const controller = new AbortController();
+    let dialogs = 0;
+    const options = (opts: Parameters<ExtensionContext["ui"]["select"]>[2]) => {
+      dialogs++;
+      assert.equal(opts?.signal, controller.signal);
+      assert.equal(Reflect.get(opts!, marker), agentWait === false ? false : undefined);
+      assert.equal(Reflect.get({ ...opts }, marker), agentWait === false ? false : undefined);
+    };
+    const ctx = { cwd: f.root, hasUI: true, mode: "rpc", ui: {
+      select: async (_title, _items, opts) => { options(opts); return "Enter a path manually…"; },
+      input: async (_title, current, opts) => { options(opts); assert.equal(current, f.requested); return f.root; },
+    } } as ExtensionContext;
+    assert.deepEqual(await editDirectoryScope(ctx, f.requested, f.requested, "write", controller.signal, agentWait), bindPath(f.root));
+    assert.equal(dialogs, 2);
   }
 });
 

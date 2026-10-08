@@ -13,7 +13,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "description": "Repository-managed cmux bridge with background-agent activity and pi-ask notifications.",
+  "description": "Repository-managed cmux bridge with background-agent activity and input-dialog tracking.",
   "type": "module",
   "license": "GPL-3.0-or-later",
   "keywords": [

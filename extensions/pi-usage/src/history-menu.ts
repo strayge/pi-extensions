@@ -1049,7 +1049,10 @@ async function showUsageHistorySelect(
       "Back",
     ];
     const report = wrappedContentLines(view, state, 100).join("\n");
-    const choice = await ctx.ui.select(report, actions, { signal: options.signal });
+    const choice = await ctx.ui.select(report, actions, {
+      signal: options.signal,
+      [Symbol.for("pi-extensions:input-dialog")]: false,
+    });
     if (!choice || choice === "Back") return;
     if (choice.startsWith("Tab: ")) state.tab = choice.slice(5) as HistoryTab;
     else if (choice.startsWith("Range: ")) state.range = choice.slice(7) as HistoryRangeLabel;

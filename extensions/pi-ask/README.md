@@ -1,8 +1,9 @@
 # pi-ask
 
 > Vendored fork of [`@eko24ive/pi-ask`](https://github.com/eko24ive/pi-ask) at v1.2.0.
-> Upstream history (`.git`, release tooling, `CHANGELOG.md`) was stripped on import;
-> `src/`, `tests/`, `skills/`, and `docs/` are unmodified upstream content.
+> Upstream history (`.git`, release tooling, `CHANGELOG.md`) was stripped on import.
+> Local changes mark question-form factories for input-dialog tracking and defer
+> automatic recovery until post-start resource discovery, with regression tests.
 > Report fork-specific issues in this repo, upstream issues upstream.
 
 `pi-ask` is an ask tool that cares about your answers.

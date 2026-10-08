@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import type { ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
 import { createWorktreeSettingsRuntime } from "../src/settings.ts";
 import worktreeExtension from "../src/worktree.ts";
 import { type ExecFunction, oid, porcelain, result } from "./command-test-support.ts";
@@ -40,7 +41,10 @@ test("interactive root configuration saves, applies to the next Add, and resets 
       hasUI: true,
       mode: "tui",
       select: async () => "Configure worktree root",
-      input: async () => "/srv/worktrees",
+      input: async (_title: string, _placeholder: string, options?: ExtensionUIDialogOptions) => {
+        assert.equal(Reflect.get(options ?? {}, Symbol.for("pi-extensions:input-dialog")), false);
+        return "/srv/worktrees";
+      },
     });
     await mock.commands.get("worktree")?.handler("", configure.ctx);
     assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")), {

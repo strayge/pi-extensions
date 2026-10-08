@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { PermissionOwner, type ApprovalAnswer } from "./approvals.ts";
+import { PermissionOwner, type ApprovalAnswer, type ApprovalRequest } from "./approvals.ts";
 import { defaultConfig } from "./config-load.ts";
 import { createDirectTools } from "./direct-tools.ts";
 import { bindPath } from "./paths.ts";
@@ -31,6 +31,7 @@ test("edited approval can create the first missing ancestor without granting unr
     let asked = 0;
     f.owner.ask = async (request) => {
       asked++; assert.equal(request.path, path.dirname(target)); assert.equal(request.create, true);
+      assert.equal(request.agentWait, true);
       return { lifetime: "session", directory: ancestor, binding: bindPath(ancestor) };
     };
     const [, , write] = createDirectTools(() => f.owner, f.project);
@@ -68,9 +69,10 @@ test("creating an ungranted protected directory requires a separate exception be
       const target = path.join(f.outside, "new"); const requests: string[] = [];
       f.owner.ask = async (request) => {
         requests.push(request.kind); assert.equal(existsSync(target), false);
+        assert.equal(request.agentWait, false);
         return request.kind === "directory" || allowException ? { lifetime: "session" } : undefined;
       };
-      const pending = f.owner.requestDirectory(target, "write", "create protected directory");
+      const pending = f.owner.requestDirectory(target, "write", "create protected directory", undefined, false);
       if (allowException) {
         await pending;
         assert.equal(decide(f.owner.snapshot(), bindPath(target), "write").action, "allow");
@@ -100,6 +102,48 @@ test("blocking a future ask during directory creation does not create it or publ
     assert.equal(f.owner.snapshot().grants.length, 0);
     assert.equal(f.owner.snapshot().exceptions.length, 0);
   } finally { f.close(); }
+});
+
+test("manual authorize and run propagate input intent to exception and directory requests without saving it", async () => {
+  const f = fixture(true);
+  try {
+    const target = path.join(f.outside, "new"); mkdirSync(target);
+    const requests: ApprovalRequest[] = [];
+    f.owner.ask = async (request) => { requests.push(request); return { lifetime: "project" }; };
+    await f.owner.authorize([target], "write", "manual exception", undefined, false);
+    assert.equal(await f.owner.run([f.outside], "read", "manual cwd", undefined, async () => "executed", false), "executed");
+    assert.deepEqual(requests.map((request) => [request.kind, request.agentWait]), [["exception", false], ["directory", false]]);
+    assert.ok(requests.every(Object.isFrozen));
+    const snapshot = f.owner.snapshot();
+    assert.equal(snapshot.exceptions.length, 1);
+    assert.equal(snapshot.grants.length, 1);
+    assert.doesNotMatch(JSON.stringify(snapshot), /agentWait|input-dialog/);
+  } finally { f.close(); }
+});
+
+test("mixed-origin filesystem joins reuse immutable first-opening metadata without promoting manual waits", async () => {
+  for (const firstManual of [true, false]) {
+    const f = fixture();
+    try {
+      let answer!: (value: ApprovalAnswer) => void;
+      const requests: ApprovalRequest[] = [];
+      f.owner.ask = (request) => {
+        requests.push(request);
+        return new Promise((resolve) => { answer = resolve; });
+      };
+      const first = f.owner.requestDirectory(f.outside, "read", "first opening", undefined, !firstManual);
+      const joining = f.owner.requestGrant(f.outside, "read", "late join", undefined, firstManual);
+      assert.equal(requests.length, 1);
+      assert.ok(Object.isFrozen(requests[0]));
+      assert.equal(requests[0]!.agentWait, !firstManual);
+      assert.equal(requests[0]!.reason, "first opening");
+      answer({ lifetime: "session" });
+      await Promise.all([first, joining]);
+      assert.equal(requests.length, 1);
+      assert.equal(f.owner.snapshot().grants.length, 1);
+      assert.doesNotMatch(JSON.stringify(f.owner.snapshot()), /agentWait|input-dialog/);
+    } finally { f.close(); }
+  }
 });
 
 test("owner retirement aborts active execution and drains its lease without cancelling ordinary mode switches", async () => {

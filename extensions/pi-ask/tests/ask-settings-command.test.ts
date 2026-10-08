@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { registerAskSettingsCommand } from "../src/ask-settings-command.ts";
+import { DEFAULT_ASK_CONFIG } from "../src/config/defaults.ts";
+import { getAskConfigStore } from "../src/config/store.ts";
+import { runAskFlow } from "../src/ui/controller.ts";
 
 function plainTheme() {
 	return {
@@ -40,6 +43,10 @@ test("registers /ask-settings and opens the shared settings overlay", async () =
 		mode: "tui",
 		ui: {
 			custom(callback: any, options: unknown) {
+				assert.equal(
+					Reflect.get(callback, Symbol.for("pi-extensions:input-dialog")),
+					undefined
+				);
 				const done = () => {
 					// test callback intentionally unused
 				};
@@ -75,6 +82,71 @@ test("registers /ask-settings and opens the shared settings overlay", async () =
 
 	delete process.env.PI_CODING_AGENT_DIR;
 	await rm(agentDir, { force: true, recursive: true });
+});
+
+test("local question stays open while its unmarked settings overlay closes", {
+	timeout: 2000,
+}, async (t) => {
+	getAskConfigStore().setConfig({
+		...DEFAULT_ASK_CONFIG,
+		notifications: { ...DEFAULT_ASK_CONFIG.notifications, enabled: false },
+	});
+	t.after(() => getAskConfigStore().setConfig(DEFAULT_ASK_CONFIG));
+	const markers: unknown[] = [];
+	let question: { handleInput(data: string): void } | undefined;
+	let settled = false;
+	const resultPromise = runAskFlow(
+		{
+			cwd: process.cwd(),
+			mode: "tui",
+			ui: {
+				custom(callback: (...args: any[]) => any) {
+					const marker = Reflect.get(
+						callback,
+						Symbol.for("pi-extensions:input-dialog")
+					);
+					markers.push(marker);
+					let component:
+						| { handleInput(data: string): void; dispose?(): void }
+						| undefined;
+					return new Promise((resolve) => {
+						component = callback(
+							{ requestRender: () => undefined },
+							plainTheme(),
+							{},
+							resolve
+						);
+						if (marker === true) {
+							question = component;
+						} else {
+							resolve(undefined);
+						}
+					}).finally(() => component?.dispose?.());
+				},
+			},
+		} as never,
+		{
+			questions: [
+				{
+					id: "decision",
+					prompt: "Proceed?",
+					options: [{ value: "yes", label: "Yes" }],
+				},
+			],
+		}
+	).then((result) => {
+		settled = true;
+		return result;
+	});
+
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert(question);
+	question.handleInput("?");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(markers, [true, undefined]);
+	assert.equal(settled, false);
+	question.handleInput("\u001b");
+	assert.equal((await resultPromise).cancelled, true);
 });
 
 test("/ask-settings notifies outside TUI instead of opening custom UI", async () => {

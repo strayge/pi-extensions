@@ -57,6 +57,7 @@ import {
   type UICtx,
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
+import { manualDialogOptions } from "./ui/manual-dialog.ts";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
@@ -3151,7 +3152,7 @@ Terse command-style prompts produce shallow, generic work.
       ctx.ui.notify(noAgentsMsg, "info");
     }
 
-    const choice = await ctx.ui.select("Agents", options);
+    const choice = await ctx.ui.select("Agents", options, manualDialogOptions());
     if (!choice) return;
 
     if (choice.startsWith("Running agents (")) {
@@ -3256,7 +3257,7 @@ Terse command-style prompts produce shallow, generic work.
       const dn = getDisplayName(a.type);
       const dur = formatDuration(a.startedAt, a.completedAt);
       return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
-    });
+    }, manualDialogOptions());
     if (!record) return;
 
     await viewAgentConversation(ctx, record);
@@ -3317,7 +3318,7 @@ Terse command-style prompts produce shallow, generic work.
       menuOptions = ["Edit", "Disable", "Delete", "Back"];
     }
 
-    const choice = await ctx.ui.select(name, menuOptions);
+    const choice = await ctx.ui.select(name, menuOptions, manualDialogOptions());
     if (!choice || choice === "Back") return;
 
     if (choice === "Edit" && file) {
@@ -3331,7 +3332,7 @@ Terse command-style prompts produce shallow, generic work.
       }
     } else if (choice === "Delete") {
       if (file) {
-        const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${name} from ${file.location} (${file.path})?`);
+        const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${name} from ${file.location} (${file.path})?`, manualDialogOptions());
         if (confirmed) {
           unlinkSync(file.path);
           reloadCustomAgents();
@@ -3339,7 +3340,7 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
     } else if (choice === "Reset to default" && file) {
-      const confirmed = await ctx.ui.confirm("Reset to default", `Delete override ${file.path} and restore embedded default?`);
+      const confirmed = await ctx.ui.confirm("Reset to default", `Delete override ${file.path} and restore embedded default?`, manualDialogOptions());
       if (confirmed) {
         unlinkSync(file.path);
         reloadCustomAgents();
@@ -3359,7 +3360,7 @@ Terse command-style prompts produce shallow, generic work.
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
       `Personal (${personalAgentsDir()})`,
-    ]);
+    ], manualDialogOptions());
     if (!location) return;
 
     const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
@@ -3367,7 +3368,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const targetPath = join(targetDir, `${name}.md`);
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`, manualDialogOptions());
       if (!overwrite) return;
     }
 
@@ -3407,7 +3408,7 @@ Terse command-style prompts produce shallow, generic work.
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
       `Personal (${personalAgentsDir()})`,
-    ]);
+    ], manualDialogOptions());
     if (!location) return;
 
     const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
@@ -3451,7 +3452,7 @@ Terse command-style prompts produce shallow, generic work.
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
       `Personal (${personalAgentsDir()})`,
-    ]);
+    ], manualDialogOptions());
     if (!location) return;
 
     const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
@@ -3459,7 +3460,7 @@ Terse command-style prompts produce shallow, generic work.
     const method = await ctx.ui.select("Creation method", [
       "Generate with Claude (recommended)",
       "Manual configuration",
-    ]);
+    ], manualDialogOptions());
     if (!method) return;
 
     if (method.startsWith("Generate")) {
@@ -3470,17 +3471,17 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   async function showGenerateWizard(ctx: ExtensionCommandContext, targetDir: string) {
-    const description = await ctx.ui.input("Describe what this agent should do");
+    const description = await ctx.ui.input("Describe what this agent should do", undefined, manualDialogOptions());
     if (!description) return;
 
-    const name = await ctx.ui.input("Agent name (filename, no spaces)");
+    const name = await ctx.ui.input("Agent name (filename, no spaces)", undefined, manualDialogOptions());
     if (!name) return;
 
     mkdirSync(targetDir, { recursive: true });
 
     const targetPath = join(targetDir, `${name}.md`);
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`, manualDialogOptions());
       if (!overwrite) return;
     }
 
@@ -3561,15 +3562,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
 
   async function showManualWizard(ctx: ExtensionCommandContext, targetDir: string) {
     // 1. Name
-    const name = await ctx.ui.input("Agent name (filename, no spaces)");
+    const name = await ctx.ui.input("Agent name (filename, no spaces)", undefined, manualDialogOptions());
     if (!name) return;
 
     // 2. Description
-    const description = await ctx.ui.input("Description (one line)");
+    const description = await ctx.ui.input("Description (one line)", undefined, manualDialogOptions());
     if (!description) return;
 
     // 3. Tools
-    const toolChoice = await ctx.ui.select("Tools", ["all", "none", "read-only (read, bash, grep, find, ls)", "custom..."]);
+    const toolChoice = await ctx.ui.select("Tools", ["all", "none", "read-only (read, bash, grep, find, ls)", "custom..."], manualDialogOptions());
     if (!toolChoice) return;
 
     let tools: string;
@@ -3580,7 +3581,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
     } else if (toolChoice.startsWith("read-only")) {
       tools = "read, bash, grep, find, ls";
     } else {
-      const customTools = await ctx.ui.input("Tools (comma-separated)", BUILTIN_TOOL_NAMES.join(", "));
+      const customTools = await ctx.ui.input("Tools (comma-separated)", BUILTIN_TOOL_NAMES.join(", "), manualDialogOptions());
       if (!customTools) return;
       tools = customTools;
     }
@@ -3592,7 +3593,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       "sonnet",
       "opus",
       "custom...",
-    ]);
+    ], manualDialogOptions());
     if (!modelChoice) return;
 
     let model: string | undefined;
@@ -3600,12 +3601,12 @@ Write the file using the write tool. Only write the file, nothing else.`;
     else if (modelChoice === "sonnet") model = "anthropic/claude-sonnet-4-6";
     else if (modelChoice === "opus") model = "anthropic/claude-opus-4-6";
     else if (modelChoice === "custom...") {
-      model = (await ctx.ui.input("Model (provider/modelId)")) || undefined;
+      model = (await ctx.ui.input("Model (provider/modelId)", undefined, manualDialogOptions())) || undefined;
     }
 
     // 5. Thinking
     // "inherit" is a UI-only pseudo-choice (omit the field); the rest mirror pi.
-    const thinkingChoice = await ctx.ui.select("Thinking level", ["inherit", ...THINKING_LEVELS]);
+    const thinkingChoice = await ctx.ui.select("Thinking level", ["inherit", ...THINKING_LEVELS], manualDialogOptions());
     if (!thinkingChoice) return;
 
     // 6. System prompt
@@ -3624,7 +3625,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
     const targetPath = join(targetDir, `${name}.md`);
 
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`, manualDialogOptions());
       if (!overwrite) return;
     }
 
@@ -4148,7 +4149,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.
-      let input: string | undefined = await ctx.ui.input(label, current);
+      let input: string | undefined = await ctx.ui.input(label, current, manualDialogOptions());
       while (input != null) {
         const trimmed = input.trim();
         const n = Number(trimmed);
@@ -4160,7 +4161,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
           return;
         }
         // Invalid — re-prompt with the user's last entry so they can edit it
-        input = await ctx.ui.input(label, trimmed);
+        input = await ctx.ui.input(label, trimmed, manualDialogOptions());
       }
     }
   }

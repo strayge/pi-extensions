@@ -374,7 +374,7 @@ export async function showSpeedReport(
       const selected = await ctx.ui.select(
         speedReportLines(report, 140).join("\n"),
         [...SPEED_RANGES, "Close"],
-        { signal },
+        { signal, [Symbol.for("pi-extensions:input-dialog")]: false },
       );
       const nextRange = selected === undefined ? undefined : speedRange(selected);
       if (!nextRange) return;

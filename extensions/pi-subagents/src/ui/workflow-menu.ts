@@ -17,6 +17,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRecord } from "../types.js";
 import { pauseWorkflowTask, resumeWorkflowTask, type WorkflowTask } from "../workflow/task.js";
+import { manualDialogOptions } from "./manual-dialog.ts";
 import { WorkflowDialog } from "./workflow-dialog.js";
 
 /** Everything the menu and the inspector need from the extension around them. */
@@ -186,7 +187,7 @@ export async function showWorkflowsMenu(
         task.agentCount === 1 ? "" : "s"
       } · ${task.id}`,
   );
-  const picked = await ctx.ui.select("Workflows", labels);
+  const picked = await ctx.ui.select("Workflows", labels, manualDialogOptions());
   const index = picked !== undefined ? labels.indexOf(picked) : -1;
   if (index >= 0) await showWorkflowDialog(ctx, tasks[index], deps);
 }

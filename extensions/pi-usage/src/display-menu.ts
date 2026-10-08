@@ -152,7 +152,7 @@ async function showDisplaySelect(
     const choice = await ctx.ui.select(
       plainPreview(config, options).join("\n"),
       [...entries, BACK],
-      { signal: options.signal },
+      { signal: options.signal, [Symbol.for("pi-extensions:input-dialog")]: false },
     );
     if (!choice || choice === BACK) return;
 

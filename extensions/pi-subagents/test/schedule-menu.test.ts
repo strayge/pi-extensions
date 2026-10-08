@@ -24,8 +24,14 @@ import { showSchedulesMenu } from "../src/ui/schedule-menu.js";
 /** ctx.ui stub: `select` returns whichever label index we tell it to. */
 function makeCtx(opts: { pick?: (labels: string[]) => string | undefined; confirm?: boolean } = {}) {
   const notify = vi.fn();
-  const select = vi.fn(async (_title: string, labels: string[]) => opts.pick?.(labels));
-  const confirm = vi.fn(async () => opts.confirm ?? true);
+  const select = vi.fn(async (_title: string, labels: string[], options: object) => {
+    expect(Reflect.get({ ...options }, Symbol.for("pi-extensions:input-dialog"))).toBe(false);
+    return opts.pick?.(labels);
+  });
+  const confirm = vi.fn(async (_title: string, _message: string, options: object) => {
+    expect(Reflect.get({ ...options }, Symbol.for("pi-extensions:input-dialog"))).toBe(false);
+    return opts.confirm ?? true;
+  });
   return { ctx: { ui: { select, confirm, notify } } as any, select, confirm, notify };
 }
 

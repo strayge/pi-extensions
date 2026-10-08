@@ -39,20 +39,25 @@ describe("/agents → Settings model progress timeout", () => {
     let menuTaken = false;
     let settingsOpenCount = 0;
     const rendered: string[] = [];
-    const inputs = vi.fn(async () => answers.shift());
+    const inputs = vi.fn(async (_label: string, _current: string, options: object) => {
+      expect(Reflect.get({ ...options }, Symbol.for("pi-extensions:input-dialog"))).toBe(false);
+      return answers.shift();
+    });
     const notifications = vi.fn();
     const context = ctx({
       cwd: hermetic.dir,
       hasUI: true,
       ui: {
         notify: notifications,
-        select: vi.fn(async (title: string, options: string[]) => {
+        select: vi.fn(async (title: string, options: string[], nativeOptions: object) => {
+          expect(Reflect.get({ ...nativeOptions }, Symbol.for("pi-extensions:input-dialog"))).toBe(false);
           if (title !== "Agents" || menuTaken) return undefined;
           menuTaken = true;
           return options.find(option => option === "Settings");
         }),
         input: inputs,
         custom: vi.fn(async (factory: any) => new Promise(resolve => {
+          expect(Reflect.get(factory, Symbol.for("pi-extensions:input-dialog"))).toBeUndefined();
           const component = factory(
             { requestRender: () => {} },
             { fg: (_color: string, text: string) => text, bold: (text: string) => text },

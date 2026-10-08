@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { type AddBaseProvenance, quoteTerminalValue } from "./command.ts";
+import { manualDialogOptions } from "./input-dialog.ts";
 
 export interface CreateDialogProposal {
   branch: string;
@@ -73,20 +74,26 @@ export function createWorktreeDialog(
 export async function confirmCreate(
   ctx: ExtensionCommandContext,
   proposal: CreateDialogProposal,
+  agent: boolean,
 ): Promise<boolean> {
   if (ctx.mode === "tui") {
-    return ctx.ui.custom<boolean>((tui, theme, _keys, done) =>
+    const factory: Parameters<typeof ctx.ui.custom<boolean>>[0] = (tui, theme, _keys, done) =>
       createWorktreeDialog(
         proposal,
         done,
         () => tui.requestRender(),
         (role, text) => theme.fg(role, text),
         () => tui.terminal.rows,
-      ),
+      );
+    return ctx.ui.custom<boolean>(
+      agent
+        ? Object.assign(factory, { [Symbol.for("pi-extensions:input-dialog")]: true })
+        : factory,
     );
   }
   return ctx.ui.confirm(
     `Create worktree · ${displayValue(proposal.branch)}`,
     createSummary(proposal, true),
+    agent ? undefined : manualDialogOptions(),
   );
 }

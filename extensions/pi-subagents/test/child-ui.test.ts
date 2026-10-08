@@ -1,4 +1,4 @@
-import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionUIContext, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { CHILD_EXTENSION_UI_MARKER, createChildExtensionUI } from "../src/child-ui.js";
 
@@ -63,6 +63,93 @@ describe("child extension UI", () => {
       ["Allow once", "Deny"],
       undefined,
     );
+  });
+
+  it("preserves native option metadata through UI spreads and combined cancellation", async () => {
+    const marker = Symbol.for("pi-extensions:input-dialog");
+    const extra = Symbol("native option");
+    const agentAbort = new AbortController();
+    const dialogAbort = new AbortController();
+    const options = Object.assign({ signal: dialogAbort.signal, timeout: 1234 }, {
+      [marker]: false,
+      [extra]: "keep",
+    });
+    const seen: Array<{ method: string; options?: ExtensionUIDialogOptions }> = [];
+    const parent = parentUI(async (_title, labels, opts) => {
+      expect(labels).toBe(labelsIn);
+      seen.push({ method: "select", options: opts });
+      return "Allow";
+    });
+    parent.confirm = vi.fn(async (_title, message, opts) => {
+      expect(message).toBe("message");
+      seen.push({ method: "confirm", options: opts });
+      return true;
+    });
+    parent.input = vi.fn(async (_title, placeholder, opts) => {
+      expect(placeholder).toBe("placeholder");
+      seen.push({ method: "input", options: opts });
+      return "answer";
+    });
+    const labelsIn = ["Allow", "Deny"];
+    const child = { ...createChildExtensionUI(parent, "Explore", agentAbort.signal) };
+    expect(Reflect.get(child, CHILD_EXTENSION_UI_MARKER)).toBe(true);
+    const results = await Promise.all([
+      child.select("Select", labelsIn, { ...options }),
+      child.confirm("Confirm", "message", { ...options }),
+      child.input("Input", "placeholder", { ...options }),
+    ]);
+    expect(results).toEqual(["Allow", true, "answer"]);
+    expect(seen.map(call => call.method)).toEqual(["select", "confirm", "input"]);
+    for (const call of seen) {
+      expect(Reflect.get({ ...call.options }, marker)).toBe(false);
+      expect(Reflect.get(call.options!, extra)).toBe("keep");
+      expect(call.options?.timeout).toBe(1234);
+      expect(call.options?.signal).not.toBe(dialogAbort.signal);
+      expect(call.options?.signal).not.toBe(agentAbort.signal);
+      expect(call.options?.signal?.aborted).toBe(false);
+    }
+    dialogAbort.abort();
+    expect(seen.every(call => call.options?.signal?.aborted)).toBe(true);
+    expect(options.signal).toBe(dialogAbort.signal);
+    expect(Reflect.get(options, marker)).toBe(false);
+  });
+
+  it("forwards unchanged options when no signal merge is needed and keeps child approvals tracked once", async () => {
+    const marker = Symbol.for("pi-extensions:input-dialog");
+    const options = { timeout: 200, signal: new AbortController().signal };
+    const parent = parentUI(vi.fn(async () => "Allow"));
+    parent.confirm = vi.fn(async () => true);
+    parent.input = vi.fn(async () => "answer");
+    const child = createChildExtensionUI(parent, "Plan");
+    await child.select("Permission", ["Allow"], options);
+    await child.confirm("Permission", "message", options);
+    await child.input("Permission", "placeholder", options);
+    for (const method of [parent.select, parent.confirm, parent.input]) {
+      expect(method).toHaveBeenCalledTimes(1);
+      const forwarded = vi.mocked(method).mock.calls[0][2];
+      expect(forwarded).toBe(options);
+      expect(Reflect.get(forwarded!, marker)).toBeUndefined();
+    }
+    await expect(child.custom(vi.fn())).resolves.toBeUndefined();
+    expect(parent.custom).not.toHaveBeenCalled();
+  });
+
+  it("agent cancellation reaches forwarded native approvals without opting them out", async () => {
+    const marker = Symbol.for("pi-extensions:input-dialog");
+    const agentAbort = new AbortController();
+    const dialogAbort = new AbortController();
+    let forwarded: ExtensionUIDialogOptions | undefined;
+    const parent = parentUI(async (_title, _labels, options) => {
+      forwarded = options;
+      return "Allow";
+    });
+    await createChildExtensionUI(parent, "Plan", agentAbort.signal).select(
+      "Approval", ["Allow"], { signal: dialogAbort.signal },
+    );
+    expect(Reflect.get(forwarded!, marker)).toBeUndefined();
+    agentAbort.abort();
+    expect(forwarded?.signal?.aborted).toBe(true);
+    expect(dialogAbort.signal.aborted).toBe(false);
   });
 
   it("serializes dialogs from concurrent subagents and drops an aborted waiter", async () => {

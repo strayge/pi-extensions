@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { stripTerminalControls } from "./git.ts";
+import { manualDialogOptions } from "./input-dialog.ts";
 
 export interface FinishDialogProposal {
   mainPath: string;
@@ -158,16 +159,26 @@ export function createFinishDialog(
 export async function confirmFinish(
   ctx: ExtensionCommandContext,
   proposal: FinishDialogProposal,
+  agent: boolean,
 ): Promise<boolean | undefined> {
   if (ctx.mode === "tui") {
-    return ctx.ui.custom<boolean | undefined>((tui, theme, _keys, done) =>
+    const factory: Parameters<typeof ctx.ui.custom<boolean | undefined>>[0] = (
+      tui,
+      theme,
+      _keys,
+      done,
+    ) =>
       createFinishDialog(
         proposal,
         done,
         () => tui.requestRender(),
         (role, text) => theme.fg(role, text),
         () => tui.terminal.rows,
-      ),
+      );
+    return ctx.ui.custom<boolean | undefined>(
+      agent
+        ? Object.assign(factory, { [Symbol.for("pi-extensions:input-dialog")]: true })
+        : factory,
     );
   }
   const keep = "Return and remove worktree; KEEP branch";
@@ -188,6 +199,7 @@ export async function confirmFinish(
       "First option is the default.",
     ].join("\n"),
     choices,
+    agent ? undefined : manualDialogOptions(),
   );
   return selected === undefined ? undefined : selected === remove;
 }

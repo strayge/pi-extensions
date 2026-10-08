@@ -27,6 +27,8 @@ export interface ApprovalRequest {
   create: boolean;
   ruleId?: string;
   scope?: "file" | "tree";
+  /** UI intent only; deduplicated joins retain the first opening's intent. */
+  agentWait?: boolean;
 }
 export type ApprovalAnswer = {
   action?: "grant";
@@ -60,7 +62,7 @@ export class PermissionOwner {
   private readonly store?: PermissionStore;
   private readonly policyWriter?: GlobalPolicyWriter;
   private cacheStale = false;
-  confirmGlobal?: (preview: GlobalPreview, signal?: AbortSignal) => Promise<boolean>;
+  confirmGlobal?: (preview: GlobalPreview, signal?: AbortSignal, agentWait?: boolean) => Promise<boolean>;
   warn?: (message: string) => void;
   readonly network: NetworkSession;
   ask: AskApproval;
@@ -71,7 +73,7 @@ export class PermissionOwner {
     options: {
       store?: PermissionStore;
       policyWriter?: GlobalPolicyWriter;
-      confirmGlobal?: (preview: GlobalPreview, signal?: AbortSignal) => Promise<boolean>;
+      confirmGlobal?: (preview: GlobalPreview, signal?: AbortSignal, agentWait?: boolean) => Promise<boolean>;
       warn?: (message: string) => void;
       restored?: SavedState;
       grants?: AccessGrant[];
@@ -198,12 +200,12 @@ export class PermissionOwner {
     try { this.warn?.(message); } catch { /* Reporting cannot undo a committed policy change. */ }
   }
 
-  async changeGlobal(mutation: GlobalMutation, signal?: AbortSignal): Promise<void> {
+  async changeGlobal(mutation: GlobalMutation, signal?: AbortSignal, agentWait = true): Promise<void> {
     this.snapshot();
     if (this.cacheStale) throw new Error("Permission cache is stale; restart before changing global authority");
     if (!this.policyWriter || !this.confirmGlobal) throw new Error("Global permission changes require the parent UI and trusted policy writer");
     const prepared = this.policyWriter.prepare(this.catalog, this.revision, mutation);
-    if (!(await this.confirmGlobal(prepared.preview, signal))) throw new Error("Global permission change cancelled");
+    if (!(await this.confirmGlobal(prepared.preview, signal, agentWait))) throw new Error("Global permission change cancelled");
     signal?.throwIfAborted();
     const catalog = this.policyWriter.commit(prepared, (revision) => this.check(revision), signal);
     const previous = this.catalog;
@@ -269,14 +271,14 @@ export class PermissionOwner {
     this.approvalCancellation.abort();
   }
 
-  async requestDirectory(directory: string, access: Access, reason: string, signal?: AbortSignal): Promise<void> {
+  async requestDirectory(directory: string, access: Access, reason: string, signal?: AbortSignal, agentWait = true): Promise<void> {
     const binding = bindPath(directory);
     if (!binding.missing.length && binding.identity.type !== "directory")
       throw new Error("Directory access requires a directory");
-    await this.requestGrant(directory, access, reason, signal);
+    await this.requestGrant(directory, access, reason, signal, agentWait);
   }
 
-  async requestGrant(nativePath: string, access: Access, reason: string, signal?: AbortSignal): Promise<void> {
+  async requestGrant(nativePath: string, access: Access, reason: string, signal?: AbortSignal, agentWait = true): Promise<void> {
     if (access !== "read" && access !== "write") throw new Error("Path access must be read or write");
     const binding = bindPath(nativePath);
     if (!binding.missing.length && binding.identity.type !== "directory" && binding.identity.type !== "file")
@@ -287,7 +289,7 @@ export class PermissionOwner {
     const decision = decide(snapshot, binding, access, proposed);
     if (decision.action === "deny") throw new Error(`Hard-denied path: ${nativePath}`);
     await this.approve(
-      { kind, path: kind === "file" ? binding.lexical : binding.canonical, access, reason, create: binding.missing.length > 0 },
+      { kind, path: kind === "file" ? binding.lexical : binding.canonical, access, reason, create: binding.missing.length > 0, agentWait },
       snapshot.revision,
       signal,
     );
@@ -372,7 +374,7 @@ export class PermissionOwner {
             for (const exception of decision.exceptions) {
               await this.approve({
                 kind: "exception", path: exception.rule.binding!.lexical, access: exception.access,
-                ruleId: exception.rule.id, scope: exception.rule.scope, reason: request.reason, create: false,
+                ruleId: exception.rule.id, scope: exception.rule.scope, reason: request.reason, create: false, agentWait: request.agentWait,
               }, revision, signal);
               // Only the requested exception may advance authority while this directory answer is pending.
               this.check(++revision);
@@ -383,7 +385,7 @@ export class PermissionOwner {
             binding = bindPath(binding.lexical);
             created = binding;
           }
-          if (answer.lifetime === "global") await this.changeGlobal({ kind: "save", binding, access: request.access, scope: "tree" }, signal);
+          if (answer.lifetime === "global") await this.changeGlobal({ kind: "save", binding, access: request.access, scope: "tree" }, signal, request.agentWait);
           else {
             const grants = [...this.grants, { id: randomUUID(), binding, access: request.access, lifetime: answer.lifetime }];
             this.persist(this.mode, grants, this.exceptions, this.network.snapshot(), signal);
@@ -392,7 +394,7 @@ export class PermissionOwner {
         } else if (request.kind === "file") {
           if (answer.directory || answer.binding) throw new Error("Exact-file grants cannot edit directory scope");
           const binding = bindFile(frozen);
-          if (answer.lifetime === "global") await this.changeGlobal({ kind: "save", binding, access: request.access, scope: "file" }, signal);
+          if (answer.lifetime === "global") await this.changeGlobal({ kind: "save", binding, access: request.access, scope: "file" }, signal, request.agentWait);
           else {
             const grants = [...this.grants, { id: randomUUID(), binding, access: request.access, lifetime: answer.lifetime }];
             this.persist(this.mode, grants, this.exceptions, this.network.snapshot(), signal);
@@ -429,6 +431,7 @@ export class PermissionOwner {
     access: Access,
     reason: string,
     signal?: AbortSignal,
+    agentWait = true,
   ): Promise<{ snapshot: FilesystemSnapshot; targets: PathBinding[] }> {
     const original = nativePaths.map(bindPath);
     const creations = new Map<string, PathBinding>();
@@ -461,6 +464,7 @@ export class PermissionOwner {
                 scope: exception.rule.scope,
                 reason,
                 create: false,
+                agentWait,
               },
               snapshot.revision,
               signal,
@@ -471,7 +475,7 @@ export class PermissionOwner {
           if (decision.directory) {
             const directory = target.identity.type === "directory" && !target.missing.length ? target.canonical : path.dirname(target.canonical);
             const created = await this.approve(
-              { kind: "directory", path: directory, access, reason, create: bindPath(directory).missing.length > 0 },
+              { kind: "directory", path: directory, access, reason, create: bindPath(directory).missing.length > 0, agentWait },
               snapshot.revision,
               signal,
             );
@@ -497,10 +501,11 @@ export class PermissionOwner {
     reason: string,
     signal: AbortSignal | undefined,
     execute: (snapshot: FilesystemSnapshot, targets: PathBinding[], signal: AbortSignal) => Promise<T>,
+    agentWait = true,
   ): Promise<T> {
     const cancellation = signal ? AbortSignal.any([signal, this.approvalSignal]) : this.approvalSignal;
     for (;;) {
-      const authorization = await this.authorize(paths, access, reason, cancellation);
+      const authorization = await this.authorize(paths, access, reason, cancellation, agentWait);
       const release = this.lease();
       try {
         this.check(authorization.snapshot.revision);

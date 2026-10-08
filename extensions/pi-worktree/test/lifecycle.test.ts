@@ -17,6 +17,7 @@ import {
   type ExecResult,
   type ExtensionAPI,
   type ExtensionCommandContext,
+  type ExtensionUIDialogOptions,
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -113,7 +114,12 @@ function harness(f: ReturnType<typeof fixture>, initialCwd: string) {
   });
   const messages: Array<{ cwd: string; text: string; triggerTurn?: boolean }> = [];
   const operations: Array<{ cwd: string; args: string[] }> = [];
-  const dialogs: Array<{ title: string; message?: string; choices?: string[] }> = [];
+  const dialogs: Array<{
+    title: string;
+    message?: string;
+    choices?: string[];
+    options?: ExtensionUIDialogOptions;
+  }> = [];
   const preparedPaths: string[] = [];
   const pending: Array<{ runtime: Runtime; text: string }> = [];
   const hooks: {
@@ -214,6 +220,7 @@ function harness(f: ReturnType<typeof fixture>, initialCwd: string) {
       cwd,
       mode: "rpc",
       hasUI: hooks.hasUI,
+      isIdle: () => true,
       sessionManager: manager,
       hasPendingMessages() {
         return hooks.queuedInput;
@@ -223,15 +230,15 @@ function harness(f: ReturnType<typeof fixture>, initialCwd: string) {
           assertCurrent();
           messages.push({ cwd, text });
         },
-        async confirm(title: string, message?: string) {
+        async confirm(title: string, message?: string, options?: ExtensionUIDialogOptions) {
           assertCurrent();
-          dialogs.push({ title, message });
+          dialogs.push({ title, message, options });
           hooks.onConfirm?.();
           return hooks.confirm;
         },
-        async select(title: string, choices: string[]) {
+        async select(title: string, choices: string[], options?: ExtensionUIDialogOptions) {
           assertCurrent();
-          dialogs.push({ title, choices });
+          dialogs.push({ title, choices, options });
           return hooks.select ? hooks.select(title, choices) : choices[0];
         },
       },
@@ -268,7 +275,9 @@ function harness(f: ReturnType<typeof fixture>, initialCwd: string) {
         return { cancelled: false };
       },
     } as unknown as ExtensionCommandContext;
-    registerWorktreeLifecycle(pi, settings, () => ({ isCurrent: () => current }));
+    const manualFinish = registerWorktreeLifecycle(pi, settings, () => ({
+      isCurrent: () => current,
+    }));
     for (const start of handlers.get("session_start") ?? []) start({}, ctx);
     const state = {
       ctx,
@@ -276,6 +285,7 @@ function harness(f: ReturnType<typeof fixture>, initialCwd: string) {
       pi,
       raw,
       commands,
+      manualFinish: () => manualFinish(ctx),
       emit(name: string, event: unknown) {
         return (handlers.get(name) ?? []).map((handler) => handler(event, ctx));
       },
@@ -336,8 +346,18 @@ test("prefilled create has one confirmation and carries the active conversation 
     assert.equal(result.terminate, true);
     assert.match(JSON.stringify(result.content), /pending/i);
     assert.equal(existsSync(f.feature), false);
+    assert.equal(h.dialogs.length, 0, "the proposal itself opens no dialog");
+    let waited = false;
+    h.hooks.onWaitForIdle = () => {
+      waited = true;
+    };
+    h.hooks.onConfirm = () => {
+      assert.equal(waited, true);
+      assert.equal(h.active.ctx.isIdle(), true);
+    };
     await h.drain();
     assert.equal(h.dialogs.length, 1);
+    assert.equal(h.dialogs[0]?.options, undefined, "idle agent approvals remain tracked");
     assert.equal(h.dialogs[0]?.title, "Create worktree · feat/new");
     assert.ok(h.dialogs[0]?.message?.includes("Branch   feat/new (new)"));
     assert.ok(h.dialogs[0]?.message?.includes("Base     main"));
@@ -443,6 +463,7 @@ for (const merged of [true, false]) {
         await h.propose({ action: "finish" });
         await h.drain();
         assert.equal(h.dialogs.length, 1);
+        assert.equal(h.dialogs[0]?.options, undefined, "agent finish remains tracked");
         assert.equal(h.active.ctx.cwd, f.main);
         assert.equal(existsSync(f.feature), false);
         const deleted = merged !== reverse;
@@ -678,8 +699,36 @@ test("switch only accepts exact registered path and continues in the replacement
     await h.propose({ action: "switch", path: f.feature });
     await h.drain();
     assert.equal(h.dialogs.length, 1);
+    assert.equal(h.dialogs[0]?.options, undefined, "agent switch remains tracked");
     assert.equal(h.active.ctx.cwd, f.feature);
     assert.match(h.messages.at(-1)?.text ?? "", /Active workspace/);
+  } finally {
+    f.close();
+  }
+});
+
+test("manual lifecycle finish opts out without changing cancellation or safety", async () => {
+  const f = fixture();
+  try {
+    f.addFeature();
+    const h = harness(f, f.feature);
+    h.hooks.select = () => undefined;
+    let waited = false;
+    h.hooks.onWaitForIdle = () => {
+      waited = true;
+    };
+    await h.active.manualFinish();
+    assert.equal(waited, true);
+    assert.equal(h.dialogs.length, 1);
+    assert.equal(
+      Reflect.get(h.dialogs[0]?.options ?? {}, Symbol.for("pi-extensions:input-dialog")),
+      false,
+    );
+    assert.equal(h.active.ctx.cwd, f.feature);
+    assert.ok(existsSync(f.feature));
+    assert.notEqual(git(f.main, "branch", "--list", "feat/change"), "");
+    assert.match(h.messages.at(-1)?.text ?? "", /Finish cancelled/);
+    assert.equal(h.messages.at(-1)?.triggerTurn, undefined);
   } finally {
     f.close();
   }

@@ -324,6 +324,10 @@ test("usage history loading is cancellable and returns silently to the action me
     custom: async (factory: unknown) =>
       new Promise<unknown>((resolve) => {
         customCalls += 1;
+        assert.equal(
+          Reflect.get(factory as object, Symbol.for("pi-extensions:input-dialog")),
+          undefined,
+        );
         let component: { dispose?(): void; handleInput(data: string): void };
         const done = (value: unknown) => {
           component.dispose?.();
@@ -717,6 +721,8 @@ test("/usage reuses an idempotency key when a reset outcome is unknown", async (
 
   const choices = ["Use one reset…", "Refresh usage", "Retry using reset…", "Close"];
   const selections: string[][] = [];
+  const dialogSignals: AbortSignal[] = [];
+  let confirmations = 0;
   const mock = createMockPi();
   usageExtension(mock.pi);
   const command = mock.commands.get("usage");
@@ -725,11 +731,18 @@ test("/usage reuses an idempotency key when a reset outcome is unknown", async (
     hasUI: true,
     mode: "rpc",
     model: codexModel,
-    select: async (_title: string, options: string[]) => {
+    select: async (_title: string, options: string[], opts: { signal: AbortSignal }) => {
+      assert.equal(Reflect.get({ ...opts }, Symbol.for("pi-extensions:input-dialog")), false);
+      dialogSignals.push(opts.signal);
       selections.push(options);
       return choices.shift();
     },
-    confirm: async () => true,
+    confirm: async (_title: string, _message: string, opts: { signal: AbortSignal }) => {
+      assert.equal(Reflect.get({ ...opts }, Symbol.for("pi-extensions:input-dialog")), false);
+      assert.equal(opts.signal, dialogSignals[0]);
+      confirmations += 1;
+      return true;
+    },
     modelRegistry: {
       getProviderAuth: async () => ({ auth: { apiKey: activeToken } }),
       getAvailable: () => [codexModel],
@@ -741,6 +754,9 @@ test("/usage reuses an idempotency key when a reset outcome is unknown", async (
 
   await command.handler("", ctx);
 
+  assert.equal(confirmations, 2);
+  assert.equal(dialogSignals.length, 4);
+  assert.ok(dialogSignals.every((signal) => signal === dialogSignals[0] && signal.aborted));
   assert.ok(selections[1]?.includes("Retry using reset…"));
   assert.ok(selections[2]?.includes("Retry using reset…"));
   assert.equal(redemptionBodies.length, 2);
@@ -956,6 +972,7 @@ test("session shutdown aborts an open usage action", async (t) => {
       opts?: { signal?: AbortSignal },
     ): Promise<string | undefined> => {
       assert.ok(opts?.signal);
+      assert.equal(Reflect.get({ ...opts }, Symbol.for("pi-extensions:input-dialog")), false);
       dialogSignals.push(opts.signal);
       menuOpened();
       return new Promise((resolve) => {

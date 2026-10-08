@@ -119,15 +119,19 @@ export async function runAskFlow(
 			cancelled: true,
 		};
 	}
-	return ctx.ui.custom<AskResult>((...args) =>
-		createAskFlowController(args, {
-			...params,
-			config,
-			configNotice: notice?.text,
-			cwd: ctx.cwd,
-			ctx,
-			flowOptions,
-		})
+	return ctx.ui.custom<AskResult>(
+		Object.assign(
+			(...args: Parameters<typeof createAskFlowController>[0]) =>
+				createAskFlowController(args, {
+					...params,
+					config,
+					configNotice: notice?.text,
+					cwd: ctx.cwd,
+					ctx,
+					flowOptions,
+				}),
+			{ [Symbol.for("pi-extensions:input-dialog")]: true }
+		)
 	);
 }
 

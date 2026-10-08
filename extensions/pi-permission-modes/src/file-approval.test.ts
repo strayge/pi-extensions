@@ -5,7 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ApprovalRequest } from "./approvals.ts";
-import { approvalUI } from "./file-approval.ts";
+import { approvalUI, networkUI } from "./file-approval.ts";
+import { approvalDialogOptions } from "./input-dialog.ts";
 import { bindPath, revalidate } from "./paths.ts";
 
 function fixture(t: { after: (cleanup: () => void) => void }) {
@@ -47,6 +48,60 @@ test("directory approval chooses scope and lifetime in one menu", async (t) => {
     assert.equal(answer?.directory, f.directory);
     assert.deepEqual(answer?.binding, bindPath(f.directory));
   }
+});
+
+test("filesystem approval and every native scope-edit step retain the request's input intent", async (t) => {
+  const f = fixture(t);
+  const marker = Symbol.for("pi-extensions:input-dialog");
+  for (const agentWait of [undefined, false]) {
+    const controller = new AbortController();
+    let prompts = 0;
+    const checkOptions = (options: Parameters<ExtensionContext["ui"]["select"]>[2]) => {
+      assert.equal(options?.signal, controller.signal);
+      assert.equal(Reflect.get(options!, marker), agentWait === false ? false : undefined);
+    };
+    const ctx = { cwd: f.root, hasUI: true, mode: "rpc", ui: {
+      select: async (title, _items, options) => {
+        checkOptions(options);
+        prompts++;
+        if (title.startsWith("Choose directory scope")) return "Enter a path manually…";
+        return prompts === 1 ? "Edit directory scope" : "Allow for this session";
+      },
+      input: async (_title, current, options) => {
+        checkOptions(options);
+        prompts++;
+        assert.equal(current, f.directory);
+        return f.root;
+      },
+    } } as ExtensionContext;
+    const request = Object.freeze({ ...f.request, agentWait });
+    const answer = await approvalUI(() => ctx)(request, controller.signal);
+    assert.equal(answer?.directory, f.root);
+    assert.equal(answer?.lifetime, "session");
+    assert.equal(prompts, 4);
+  }
+});
+
+test("native opt-out metadata preserves existing dialog options without mutating them", () => {
+  const signal = new AbortController().signal;
+  const existing = { signal, timeout: 1234 };
+  const options = approvalDialogOptions(false, existing);
+  assert.equal(options.signal, signal);
+  assert.equal(options.timeout, 1234);
+  assert.equal(Reflect.get({ ...options }, Symbol.for("pi-extensions:input-dialog")), false);
+  assert.deepEqual(existing, { signal, timeout: 1234 });
+  assert.equal(approvalDialogOptions(undefined, existing), existing);
+});
+
+test("network approvals remain tracked and preserve the owner cancellation signal", async (t) => {
+  const f = fixture(t); const signal = new AbortController().signal;
+  const ctx = context(f.root, { select: async (title, _items, options) => {
+    assert.equal(title, "Network access: example.test:443");
+    assert.equal(options?.signal, signal);
+    assert.equal(Reflect.get(options!, Symbol.for("pi-extensions:input-dialog")), undefined);
+    return "Allow for this session";
+  } });
+  assert.equal(await networkUI(() => ctx, () => signal)("example.test", 443), "allow-session");
 });
 
 test("denying or dismissing the menu never opens another prompt", async (t) => {

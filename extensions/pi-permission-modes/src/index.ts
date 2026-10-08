@@ -31,6 +31,7 @@ import { discoverShellAccess } from "./bash-parse.ts";
 import { defaultConfig, loadConfig } from "./config-load.ts";
 import { createDirectTools } from "./direct-tools.ts";
 import { approvalUI, networkUI } from "./file-approval.ts";
+import { approvalDialogOptions } from "./input-dialog.ts";
 import { createSearchTools } from "./filtered-search.ts";
 import { normalizeDomain } from "./network.ts";
 import { assertBinding, bindPath, configLocation, modelPath } from "./paths.ts";
@@ -252,6 +253,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
           !(await ctx.ui.confirm(
             "Initialize permission policy v3?",
             "Backed up\nAll user permission policy and state files before reset\n\nDiscarded\nStored approvals across projects. They are not migrated.\n\nUnchanged\nRepository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted",
+            approvalDialogOptions(false),
           ))
         )
           return;
@@ -323,12 +325,12 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
       if (!action || action === "status" || action === "grants" || action === "inspect") ctx.ui.notify(permissionAwareness(active), "info");
       else if (action === "clear") {
         if (!rest.length) active.revoke();
-        else if (rest.length === 1 && rest[0] === "global") await active.changeGlobal({ kind: "clear" });
+        else if (rest.length === 1 && rest[0] === "global") await active.changeGlobal({ kind: "clear" }, undefined, false);
         else throw new Error("Usage: /perm clear [global]");
       } else if (action === "revoke") {
         if (rest.length !== 1 || !rest[0]) throw new Error("Usage: /perm revoke <approval-id|block:id|global:rule-id>");
         const id = rest[0];
-        if (id.startsWith("global:")) await active.changeGlobal({ kind: "revoke", id: id.slice("global:".length) });
+        if (id.startsWith("global:")) await active.changeGlobal({ kind: "revoke", id: id.slice("global:".length) }, undefined, false);
         else {
           const snapshot = active.snapshot();
           if (!snapshot.grants.some((g) => g.id === id) && !snapshot.exceptions.some((e) => e.id === id) && !active.sessionBlocks.some((b) => b.id === id)) throw new Error("Unknown or stale approval ID; use /perm inspect");
@@ -338,7 +340,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         const access = rest.shift();
         if ((access !== "read" && access !== "write") || !rest.length)
           throw new Error("Usage: /perm grant read|write <path>");
-        await active.requestGrant(modelPath(rest.join(" "), ctx.cwd), access, "User path request");
+        await active.requestGrant(modelPath(rest.join(" "), ctx.cwd), access, "User path request", undefined, false);
       } else active.select(action);
       showStatus();
     },
@@ -442,10 +444,10 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         owner = prior;
         prior.ask = approvalUI(context);
         prior.askNetwork = networkUI(context, () => prior.approvalSignal);
-        prior.confirmGlobal = async (preview, signal) => {
+        prior.confirmGlobal = async (preview, signal, agentWait) => {
           if (!ctx.hasUI) throw new Error("Global permission changes require the parent UI");
           signal?.throwIfAborted();
-          return ctx.ui.confirm(preview.title, preview.message, { signal });
+          return ctx.ui.confirm(preview.title, preview.message, approvalDialogOptions(agentWait, { signal }));
         };
         prior.warn = (message) => ctx.ui.notify(message, "warning");
         await prior.reload(loaded.global, undefined, resolution);
@@ -478,10 +480,10 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         owner = new PermissionOwner(catalog, {
           store,
           policyWriter: new GlobalPolicyWriter(resolution),
-          confirmGlobal: async (preview, signal) => {
+          confirmGlobal: async (preview, signal, agentWait) => {
             if (!ctx.hasUI) throw new Error("Global permission changes require the parent UI");
             signal?.throwIfAborted();
-            return ctx.ui.confirm(preview.title, preview.message, { signal });
+            return ctx.ui.confirm(preview.title, preview.message, approvalDialogOptions(agentWait, { signal }));
           },
           warn: (message) => ctx.ui.notify(message, "warning"),
           restored: restored.session,
@@ -538,7 +540,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         const active = getOwner();
         const accesses = await discoverShellAccess(command, cwd);
         for (const request of accesses)
-          await active.authorize([request.path], request.access, request.source, options.signal);
+          await active.authorize([request.path], request.access, request.source, options.signal, false);
         return active.run([path.resolve(cwd)], "read", "User shell", options.signal, async (snapshot, _targets, signal) => {
           const family = {
             id: active.id,
@@ -550,7 +552,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
           return runtime
             .operations(snapshot, family, () => active.check(snapshot.revision), pi.getFlag("no-sandbox") === true)
             .exec(command, cwd, { ...options, signal });
-        });
+        }, false);
       },
     },
   }));

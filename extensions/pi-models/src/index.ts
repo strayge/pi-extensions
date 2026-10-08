@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
 import { prioritizeModelsCommand } from "./autocomplete.ts";
 import { chooseModel } from "./selector.ts";
 import { modelKey } from "./sort.ts";
@@ -100,7 +100,13 @@ export default function (pi: ExtensionAPI): void {
       }
       if (!result.model) return;
       if (ctx.mode !== "tui") {
-        const action = await ctx.ui.select("Model action", ["Select", "Toggle favorite", "Cancel"]);
+        const action = await ctx.ui.select(
+          "Model action",
+          ["Select", "Toggle favorite", "Cancel"],
+          Object.assign({} as ExtensionUIDialogOptions, {
+            [Symbol.for("pi-extensions:input-dialog")]: false,
+          }),
+        );
         if (action === "Toggle favorite") {
           const key = modelKey(result.model);
           states[key] = { ...states[key], favorite: !states[key]?.favorite };

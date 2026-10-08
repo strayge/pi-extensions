@@ -18,9 +18,19 @@ interface PendingCompletion {
   suppressNotification: boolean;
 }
 
+interface CompletionClaim extends PendingCompletion {
+  context: PiExtensionContextSnapshot;
+  queued: boolean;
+  feedDelivered?: boolean;
+  // Undefined is unsent; false also covers an in-flight or failed dispatch.
+  notificationRouted?: boolean;
+}
+
 interface SessionState {
   activeTurnId?: string;
   pendingCompletion?: PendingCompletion;
+  completionClaim?: CompletionClaim;
+  workRevision: number;
   feedDeliveryFailed: boolean;
   stopped: boolean;
   pendingDialogs: number;
@@ -431,6 +441,7 @@ function stateFor(sessionStates: Map<string, SessionState>, sessionId: string): 
   let state = sessionStates.get(sessionId);
   if (!state) {
     state = {
+      workRevision: 0,
       feedDeliveryFailed: false,
       stopped: false,
       pendingDialogs: 0,
@@ -449,6 +460,9 @@ function eventTurnId(event: unknown): string | null {
 
 function beginTurn(sessionStates: Map<string, SessionState>, sessionId: string, event: unknown): string {
   const state = stateFor(sessionStates, sessionId);
+  state.completionClaim = undefined;
+  state.pendingCompletion = undefined;
+  state.workRevision += 1;
   const turnId = currentTurnId(sessionStates, sessionId, event);
   state.stopped = false;
   return turnId;
@@ -468,20 +482,29 @@ function finishTurn(sessionStates: Map<string, SessionState>, sessionId: string,
   const turnId = currentTurnId(sessionStates, sessionId, event);
   state.activeTurnId = undefined;
   state.pendingCompletion = undefined;
+  state.completionClaim = undefined;
   state.stopped = true;
   return turnId;
 }
 
-function settleTurn(sessionStates: Map<string, SessionState>, sessionId: string): PendingCompletion | undefined {
-  const state = sessionStates.get(sessionId);
-  const completion = state?.pendingCompletion;
-  if (!state || !completion || state.stopped) return undefined;
+function settleTurn(
+  state: SessionState,
+  context: PiExtensionContextSnapshot,
+): CompletionClaim | undefined {
+  if (state.stopped) return undefined;
+  if (state.completionClaim) return state.completionClaim;
+  const completion = state.pendingCompletion;
+  if (!completion) return undefined;
   state.activeTurnId = undefined;
   state.pendingCompletion = undefined;
-  // Keep the settlement claim while awaiting delivery so session_shutdown cannot
-  // emit a second Stop when terminal-feed delivery degrades.
-  state.stopped = true;
-  return completion;
+  // Reservation is not delivery: retain progress until Stop is dispatched or
+  // actual new work invalidates the claim.
+  state.completionClaim = {
+    ...completion,
+    context,
+    queued: false,
+  };
+  return state.completionClaim;
 }
 
 async function warn(
@@ -1404,13 +1427,20 @@ async function publishPiApprovalResponse(
 }
 
 interface PiUIDialogLifecycle {
+  context: PiExtensionContextSnapshot;
   turnId: string;
   resolveTurn: boolean;
+  workRevision: number;
   state: SessionState;
 }
 
+const inputDialogMarker = Symbol.for("pi-extensions:input-dialog");
+
+function dialogMarker(value: unknown): unknown {
+  return value == null ? undefined : (value as Record<symbol, unknown>)[inputDialogMarker];
+}
+
 function installPiUIDialogHooks(
-  pi: ExtensionAPI,
   dispatcher: PiCmuxCommandDispatcher,
   sessionStates: Map<string, SessionState>,
   context: ExtensionContext,
@@ -1421,90 +1451,95 @@ function installPiUIDialogHooks(
   ) => Promise<void>,
   onDialogResolved: () => void,
 ): (() => void) | undefined {
-  if (process.env.PI_CMUX_DISABLED === "1" || !context.hasUI) return undefined;
-  const ui = context.ui as any;
+  if (process.env.PI_CMUX_DISABLED === "1" || !context.hasUI || isChildSession(context)) return undefined;
+  const ui = context.ui as ExtensionContext["ui"] & Record<symbol, unknown>;
   const patchKey = Symbol.for("cmux.pi.cmux-dialog-hooks");
   if (ui[patchKey]) return undefined;
 
-  const originalConfirm = ui.confirm.bind(ui);
-  const originalSelect = ui.select.bind(ui);
-  const originalInput = ui.input.bind(ui);
-  const snapshot = () => snapshotContext(context);
-  const signal = (_message: string): PiUIDialogLifecycle | undefined => {
-    const current = snapshot();
+  const originals = { confirm: ui.confirm, select: ui.select, input: ui.input, custom: ui.custom };
+  let active = true;
+  let cohort: PiUIDialogLifecycle | undefined;
+  const receipts = new Set<PiUIDialogLifecycle>();
+  const valid = (dialog: PiUIDialogLifecycle): boolean => active
+    && sessionStates.get(dialog.context.sessionId!) === dialog.state;
+  const acquire = (): PiUIDialogLifecycle | undefined => {
+    if (!active) return undefined;
+    const current = snapshotContext(context);
     const sessionId = current.sessionId;
     if (!sessionId) return undefined;
-    const state = stateFor(sessionStates, sessionId);
-    const activeTurnId = state.activeTurnId;
-    const turnId = activeTurnId || randomUUID();
+    const state = sessionStates.get(sessionId);
+    if (!state) return undefined;
+    const dialog = {
+      context: current,
+      turnId: state.activeTurnId || state.completionClaim?.turnId || randomUUID(),
+      resolveTurn: state.activeTurnId !== undefined || state.completionClaim !== undefined,
+      workRevision: state.workRevision,
+      state,
+    };
+    receipts.add(dialog);
     state.pendingDialogs += 1;
-    void enqueueLifecycleTask(sessionId, current, () => publishPiQuestion(
-      dispatcher,
-      current,
-      turnId,
-    ));
-    return { turnId, resolveTurn: activeTurnId !== undefined, state };
+    if (!cohort) {
+      cohort = dialog;
+      void enqueueLifecycleTask(sessionId, current, () => {
+        if (valid(dialog)) return publishPiQuestion(dispatcher, current, dialog.turnId);
+      });
+    }
+    return dialog;
   };
-  const resolved = (dialog: PiUIDialogLifecycle | undefined) => {
-    const current = snapshot();
-    const sessionId = current.sessionId;
-    if (!sessionId || !dialog || sessionStates.get(sessionId) !== dialog.state) return;
+  const release = (dialog: PiUIDialogLifecycle | undefined) => {
+    if (!dialog || !receipts.delete(dialog)) return;
     dialog.state.pendingDialogs -= 1;
-    void enqueueLifecycleTask(sessionId, current, () => publishPiApprovalResponse(
-      dispatcher,
-      current,
-      dialog.turnId,
-      // An idle form may outlive the start of another main or background turn.
-      !dialog.resolveTurn && context.isIdle() && !dialog.state.activeTurnId
-        && !subagentManager()?.hasRunning(),
-    ));
+    if (!valid(dialog)) return;
+    if (receipts.size > 0) return;
+    const first = cohort!;
+    cohort = undefined;
+    const { context: current, state, turnId } = first;
+    void enqueueLifecycleTask(current.sessionId!, current, () => {
+      if (!valid(first)) return;
+      return publishPiApprovalResponse(
+        dispatcher,
+        current,
+        turnId,
+        // An idle form may outlive even a fully settled newer work turn.
+        !first.resolveTurn && first.workRevision === state.workRevision
+          && context.isIdle() && !state.activeTurnId && !state.completionClaim
+          && !subagentManager()?.hasRunning(),
+      );
+    });
     onDialogResolved();
   };
-
-  ui.confirm = (title: string, message: string, options?: unknown) => {
-    const dialog = signal([title, message].filter(Boolean).join(": "));
-    return Promise.resolve(originalConfirm(title, message, options)).finally(() => {
-      resolved(dialog);
-    });
+  const invoke = <T>(tracked: boolean, operation: () => Promise<T>): Promise<T> => {
+    if (!tracked || !active) return operation();
+    const dialog = acquire();
+    try {
+      return Promise.resolve(operation()).finally(() => release(dialog));
+    } catch (error) {
+      release(dialog);
+      throw error;
+    }
   };
-  ui.select = (title: string, options: string[], dialogOptions?: unknown) => {
-    const dialog = signal([title, ...(options || []).slice(0, 4)].filter(Boolean).join(" — "));
-    return Promise.resolve(originalSelect(title, options, dialogOptions)).finally(() => {
-      resolved(dialog);
-    });
+  const wrappers: typeof originals = {
+    confirm: (...args) => invoke(dialogMarker(args[2]) !== false, () => originals.confirm.apply(ui, args)),
+    select: (...args) => invoke(dialogMarker(args[2]) !== false, () => originals.select.apply(ui, args)),
+    input: (...args) => invoke(dialogMarker(args[2]) !== false, () => originals.input.apply(ui, args)),
+    custom: <T>(...args: Parameters<typeof ui.custom<T>>) => invoke(
+      dialogMarker(args[0]) === true,
+      () => originals.custom.call(ui, ...args) as Promise<T>,
+    ),
   };
-  ui.input = (title: string, placeholder?: string, options?: unknown) => {
-    const dialog = signal([title, placeholder].filter(Boolean).join(": "));
-    return Promise.resolve(originalInput(title, placeholder, options)).finally(() => {
-      resolved(dialog);
-    });
-  };
-  ui[patchKey] = true;
-
-  // pi-ask uses ui.custom rather than the standard dialog methods above.
-  const askFlows = new Map<string, PiUIDialogLifecycle>();
-  const unsubscribeAskStarted = pi.events.on("@eko24ive/pi-ask:started", (event) => {
-    const flowId = firstString(objectValue(event, ["flowId"]));
-    if (!flowId || askFlows.has(flowId)) return;
-    const dialog = signal("");
-    if (dialog) askFlows.set(flowId, dialog);
-  });
-  const unsubscribeAskCompleted = pi.events.on("@eko24ive/pi-ask:completed", (event) => {
-    const flowId = firstString(objectValue(event, ["flowId"]));
-    if (!flowId) return;
-    const dialog = askFlows.get(flowId);
-    askFlows.delete(flowId);
-    resolved(dialog);
-  });
+  Object.assign(ui, wrappers);
+  ui[patchKey] = wrappers;
 
   return () => {
-    unsubscribeAskStarted();
-    unsubscribeAskCompleted();
-    askFlows.clear();
-    ui.confirm = originalConfirm;
-    ui.select = originalSelect;
-    ui.input = originalInput;
-    delete ui[patchKey];
+    if (!active) return;
+    active = false;
+    for (const receipt of receipts) receipt.state.pendingDialogs -= 1;
+    receipts.clear();
+    cohort = undefined;
+    for (const method of ["confirm", "select", "input", "custom"] as const) {
+      if (ui[method] === wrappers[method]) Object.assign(ui, { [method]: originals[method] });
+    }
+    if (ui[patchKey] === wrappers) delete ui[patchKey];
   };
 }
 async function sendHook(
@@ -1658,7 +1693,7 @@ function prepareFeedDispatch(
   if (!sessionId) return undefined;
   if (!dispatcher.canDispatch(sessionId)) return undefined;
   const state = stateFor(sessionStates, sessionId);
-  if (state.stopped) return undefined;
+  if (state.stopped || state.completionClaim) return undefined;
   const cwd = context.cwd;
   const toolCallId = firstString(objectValue(event, ["toolCallId", "tool_call_id", "id"]));
   const toolName = firstString(objectValue(event, ["toolName", "tool_name", "name"]));
@@ -1717,26 +1752,25 @@ async function warnFeedDeliveryDropped(
 
 async function publishPendingCompletion(
   dispatcher: PiCmuxCommandDispatcher,
-  sessionStates: Map<string, SessionState>,
-  context: PiExtensionContextSnapshot,
+  state: SessionState,
   sessionId: string,
-  completion: PendingCompletion,
+  completion: CompletionClaim,
+  ownsClaim: () => boolean,
+  canPublish: () => boolean,
 ): Promise<void> {
-  await dispatcher.finishFeedForSession(sessionId);
-  const state = stateFor(sessionStates, sessionId);
-  const feedDelivered = !state.feedDeliveryFailed;
-  state.feedDeliveryFailed = false;
-  if (!feedDelivered) await warnFeedDeliveryDropped(context, sessionId);
-  const stopPayload: HookExtra = {
-    last_assistant_message: completion.lastAssistantMessage,
-    turn_id: completion.turnId,
-  };
-  if (completion.suppressNotification) {
-    // Stop normally creates cmux's native fallback notification when no explicit
-    // notification was routed. Mark intentional interruption as already handled.
-    stopPayload.cmux_notification_routed = true;
-  } else if (feedDelivered) {
-    const notificationRouted = await sendHook(dispatcher, "notification", context, {
+  if (!canPublish()) return;
+  const context = completion.context;
+  if (completion.feedDelivered === undefined) {
+    await dispatcher.finishFeedForSession(sessionId);
+    if (!ownsClaim()) return;
+    completion.feedDelivered = !state.feedDeliveryFailed;
+    state.feedDeliveryFailed = false;
+    if (!completion.feedDelivered) await warnFeedDeliveryDropped(context, sessionId);
+  }
+  if (!canPublish()) return;
+  if (!completion.suppressNotification && completion.feedDelivered && completion.notificationRouted === undefined) {
+    completion.notificationRouted = false;
+    completion.notificationRouted = await sendHook(dispatcher, "notification", context, {
       // cmux scans notification bodies before completion signals, so answer
       // text mentioning approvals or errors can override the settled state.
       message: completion.notificationType === "question"
@@ -1745,8 +1779,16 @@ async function publishPendingCompletion(
       turn_id: completion.turnId,
       notification: { type: completion.notificationType },
     });
-    if (notificationRouted) stopPayload.cmux_notification_routed = true;
   }
+  if (!canPublish()) return;
+  const stopPayload: HookExtra = {
+    last_assistant_message: completion.lastAssistantMessage,
+    turn_id: completion.turnId,
+  };
+  // Preserve intentional suppression and the routed result across deferred retries.
+  if (completion.suppressNotification || completion.notificationRouted) stopPayload.cmux_notification_routed = true;
+  state.stopped = true;
+  state.completionClaim = undefined;
   await sendHook(dispatcher, "stop", context, stopPayload);
 }
 
@@ -1830,7 +1872,8 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
     const sessionId = context.sessionId;
     if (!sessionId || !ctx.isIdle()) return;
     const state = sessionStates.get(sessionId);
-    if (!state?.pendingCompletion || state.stopped || state.pendingDialogs > 0) return;
+    if (!state || (!state.pendingCompletion && !state.completionClaim)
+      || state.stopped || state.pendingDialogs > 0) return;
     const manager = subagentManager();
     if (manager?.hasRunning()) {
       if (waitingForSubagents.has(state)) return;
@@ -1849,12 +1892,22 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
       });
       return;
     }
-    const completion = settleTurn(sessionStates, sessionId);
-    if (completion) {
-      enqueueLifecycleTask(sessionId, context, () => (
-        publishPendingCompletion(dispatcher, sessionStates, context, sessionId, completion)
-      ));
-    }
+    const completion = settleTurn(state, context);
+    if (!completion || completion.queued) return;
+    const ownsClaim = () => sessionStates.get(sessionId) === state && state.completionClaim === completion;
+    const canPublish = () => ownsClaim() && ctx.isIdle()
+      && state.pendingDialogs === 0 && !subagentManager()?.hasRunning();
+    completion.queued = true;
+    void enqueueLifecycleTask(sessionId, completion.context, async () => {
+      try {
+        await publishPendingCompletion(dispatcher, state, sessionId, completion, ownsClaim, canPublish);
+      } finally {
+        completion.queued = false;
+        // A receipt can release after publication returns but before queued is
+        // cleared. Recheck so that close's skipped retry is not lost.
+        if (ownsClaim()) publishCompletionWhenIdle(ctx);
+      }
+    });
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -1891,7 +1944,6 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
     }
     restorePiUIDialogHooks?.();
     restorePiUIDialogHooks = installPiUIDialogHooks(
-      pi,
       dispatcher,
       sessionStates,
       ctx,
@@ -2013,27 +2065,40 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
       return;
     }
     const state = stateFor(sessionStates, sessionId);
+    const completion = state.completionClaim;
     let stopPayload: HookExtra | undefined;
     if (!state.stopped) {
-      const turnId = finishTurn(sessionStates, sessionId, event);
+      const turnId = completion?.turnId || currentTurnId(sessionStates, sessionId, event);
+      finishTurn(sessionStates, sessionId, { turn_id: turnId });
       stopPayload = {
         turn_id: turnId,
         terminationReason: firstString(objectValue(event, ["reason"])) || "session_shutdown",
       };
     }
+    state.completionClaim = undefined;
+    restorePiUIDialogHooks?.();
+    restorePiUIDialogHooks = undefined;
     await enqueueLifecycleTask(sessionId, context, async () => {
+      const ownsState = () => sessionStates.get(sessionId) === state;
+      if (!ownsState()) return;
       await dispatcher.finishFeedForSession(sessionId);
+      if (!ownsState()) return;
       const feedDelivered = !state.feedDeliveryFailed;
       state.feedDeliveryFailed = false;
       if (!feedDelivered) await warnFeedDeliveryDropped(context, sessionId);
-      if (stopPayload) await sendHook(dispatcher, "stop", context, stopPayload);
+      if (!ownsState()) return;
+      if (stopPayload) {
+        // An in-flight notification may finish after shutdown invalidates its
+        // completion claim but before this ordered shutdown job dispatches Stop.
+        if (completion?.notificationRouted || completion?.suppressNotification) stopPayload.cmux_notification_routed = true;
+        await sendHook(dispatcher, "stop", context, stopPayload);
+      }
+      if (!ownsState()) return;
       try {
         await clearResumeBinding(dispatcher, context, sessionId);
       } finally {
-        releaseSessionRuntime(dispatcher, sessionStates, sessionId);
+        if (ownsState()) releaseSessionRuntime(dispatcher, sessionStates, sessionId);
       }
     });
-    restorePiUIDialogHooks?.();
-    restorePiUIDialogHooks = undefined;
   });
 }

@@ -2,12 +2,13 @@ import path from "node:path";
 import { DynamicBorder, ExtensionInputComponent, getSelectListTheme, keyHint, rawKeyHint, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { bindPath, modelPath, within } from "./paths.ts";
+import { approvalDialogOptions } from "./input-dialog.ts";
 import type { Access, PathBinding } from "./schema.ts";
 
 const manual = "Enter a path manually…";
 
 /** Scope selection changes the preview, never the authority; approval remains a separate step. */
-export async function editDirectoryScope(ctx: ExtensionContext, requested: string, current: string, access: Access, signal?: AbortSignal): Promise<PathBinding | undefined> {
+export async function editDirectoryScope(ctx: ExtensionContext, requested: string, current: string, access: Access, signal?: AbortSignal, agentWait = true): Promise<PathBinding | undefined> {
   signal?.throwIfAborted();
   const directories: string[] = [];
   for (let directory = requested; directory !== path.dirname(directory); directory = path.dirname(directory)) {
@@ -28,7 +29,7 @@ export async function editDirectoryScope(ctx: ExtensionContext, requested: strin
   try {
     let selected: string | undefined;
     if (ctx.mode === "tui") {
-      selected = await ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+      const factory: Parameters<typeof ctx.ui.custom<string | undefined>>[0] = (tui, theme, _kb, done) => {
         close = done;
         const list = new SelectList(items, Math.min(items.length, 10), getSelectListTheme());
         // Reserve the list's prefix and safety margin so it cannot crop labels before wrapping.
@@ -58,9 +59,10 @@ export async function editDirectoryScope(ctx: ExtensionContext, requested: strin
           invalidate: () => container.invalidate(),
           handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
         };
-      });
+      };
+      selected = await ctx.ui.custom(agentWait ? Object.assign(factory, { [Symbol.for("pi-extensions:input-dialog")]: true }) : factory);
     } else {
-      const label = await ctx.ui.select(`${title}\n\n${description}`, items.map((item) => item.label), { signal });
+      const label = await ctx.ui.select(`${title}\n\n${description}`, items.map((item) => item.label), approvalDialogOptions(agentWait, { signal }));
       selected = items.find((item) => item.label === label)?.value;
     }
     signal?.throwIfAborted();
@@ -68,7 +70,7 @@ export async function editDirectoryScope(ctx: ExtensionContext, requested: strin
     const manualEntry = selected === manual;
     if (manualEntry) {
       if (ctx.mode === "tui") {
-        selected = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+        const factory: Parameters<typeof ctx.ui.custom<string | undefined>>[0] = (_tui, _theme, _kb, done) => {
           close = done;
           const input = new class extends ExtensionInputComponent {
             render(width: number): string[] {
@@ -80,9 +82,10 @@ export async function editDirectoryScope(ctx: ExtensionContext, requested: strin
           });
           if (signal?.aborted) done(undefined);
           return input;
-        });
+        };
+        selected = await ctx.ui.custom(agentWait ? Object.assign(factory, { [Symbol.for("pi-extensions:input-dialog")]: true }) : factory);
       } else {
-        selected = await ctx.ui.input(`${inputTitle}\n\n${inputDescription}\nCurrent    ${current}`, current, { signal });
+        selected = await ctx.ui.input(`${inputTitle}\n\n${inputDescription}\nCurrent    ${current}`, current, approvalDialogOptions(agentWait, { signal }));
       }
       signal?.throwIfAborted();
     }

@@ -1,4 +1,8 @@
-import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionCommandContext,
+  ExtensionUIDialogOptions,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 import {
   type Component,
   Input,
@@ -127,7 +131,13 @@ export async function chooseModel(
     );
   const sorted = rankModels(options.models, options.states);
   const choices = sorted.map((model) => `[${model.provider}] ${model.name || model.id}`);
-  const choice = await ctx.ui.select("Select model", choices);
+  const choice = await ctx.ui.select(
+    "Select model",
+    choices,
+    Object.assign({} as ExtensionUIDialogOptions, {
+      [Symbol.for("pi-extensions:input-dialog")]: false,
+    }),
+  );
   const model = sorted[choices.indexOf(choice ?? "")];
   return model ? { model } : {};
 }

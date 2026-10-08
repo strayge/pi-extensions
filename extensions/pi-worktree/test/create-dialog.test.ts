@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import test from "node:test";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionCommandContext,
+  ExtensionUIDialogOptions,
+} from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   type CreateDialogProposal,
   confirmCreate,
   createWorktreeDialog,
 } from "../src/create-dialog.ts";
+import { createCustomSelectorHarness } from "./support.ts";
+
+const inputDialog = Symbol.for("pi-extensions:input-dialog");
 
 const proposal: CreateDialogProposal = {
   branch: "feat/example",
@@ -119,20 +125,59 @@ test("long paths remain reviewable on short terminals and every rendered line fi
 });
 
 test("RPC create uses one confirmation with full commit evidence and structured facts", async () => {
-  const confirmations: Array<{ title: string; message: string }> = [];
+  const confirmations: Array<{
+    title: string;
+    message: string;
+    options?: ExtensionUIDialogOptions;
+  }> = [];
   const ctx = {
     mode: "rpc",
     ui: {
-      async confirm(title: string, message: string) {
-        confirmations.push({ title, message });
+      async confirm(title: string, message: string, options?: ExtensionUIDialogOptions) {
+        confirmations.push({ title, message, options });
         return true;
       },
     },
   } as unknown as ExtensionCommandContext;
-  assert.equal(await confirmCreate(ctx, proposal), true);
+  assert.equal(await confirmCreate(ctx, proposal, false), true);
+  assert.equal(Reflect.get(confirmations[0]?.options ?? {}, inputDialog), false);
   assert.equal(confirmations.length, 1);
   assert.equal(confirmations[0]?.title, "Create worktree · feat/example");
   assert.ok(confirmations[0]?.message.includes(`Base     main · ${proposal.base.oid}`));
   assert.ok(confirmations[0]?.message.includes("Branch   feat/example (new)\nBase"));
   assert.doesNotMatch(confirmations[0]?.message ?? "", /conversation|copied|Current branch/);
+});
+
+test("create marks only agent factories and preserves the custom decision", async () => {
+  for (const agent of [true, false]) {
+    const ctx = {
+      mode: "tui",
+      ui: {
+        async custom(factory: unknown, options?: unknown) {
+          assert.equal(typeof factory, "function");
+          assert.equal(Reflect.get(factory as object, inputDialog), agent ? true : undefined);
+          assert.equal(options, undefined);
+          const dialog = createCustomSelectorHarness(factory);
+          assert.match(dialog.render().join("\n"), /Base {5}main · cdccf18b/);
+          dialog.handleInput(agent ? "\r" : "\u001b");
+          return dialog.result;
+        },
+      },
+    } as unknown as ExtensionCommandContext;
+    assert.equal(await confirmCreate(ctx, proposal, agent), agent);
+  }
+});
+
+test("agent native create remains tracked and preserves rejection", async () => {
+  const failure = new Error("confirmation failed");
+  const ctx = {
+    mode: "rpc",
+    ui: {
+      async confirm(_title: string, _message: string, options?: ExtensionUIDialogOptions) {
+        assert.equal(options, undefined);
+        throw failure;
+      },
+    },
+  } as unknown as ExtensionCommandContext;
+  await assert.rejects(confirmCreate(ctx, proposal, true), (error) => error === failure);
 });

@@ -36,6 +36,7 @@ import {
   type WorktreeRecord,
   worktreeForBranch,
 } from "./git.ts";
+import { manualDialogOptions } from "./input-dialog.ts";
 import { switchToWorktree } from "./session.ts";
 import type { WorktreeSettingsRuntime } from "./settings.ts";
 
@@ -388,7 +389,7 @@ export function registerWorktreeLifecycle(
       label: base,
       oid,
     };
-    if (!(await confirmCreate(ctx, { branch, base: provenance, path }))) {
+    if (!(await confirmCreate(ctx, { branch, base: provenance, path }, agent))) {
       report(
         ctx,
         agent,
@@ -479,16 +480,20 @@ export function registerWorktreeLifecycle(
           ctx.signal,
         )
       : [];
-    const choice = await confirmFinish(ctx, {
-      mainPath: target.path,
-      worktreePath: feature.path,
-      ignored: removal.ignored,
-      recoveryWarning: formatAdministrativeRecoveryWarning(removal.historyRisks),
-      branch: canDelete ? feature.branch : undefined,
-      tip: feature.head,
-      merged,
-      risk,
-    });
+    const choice = await confirmFinish(
+      ctx,
+      {
+        mainPath: target.path,
+        worktreePath: feature.path,
+        ignored: removal.ignored,
+        recoveryWarning: formatAdministrativeRecoveryWarning(removal.historyRisks),
+        branch: canDelete ? feature.branch : undefined,
+        tip: feature.head,
+        merged,
+        risk,
+      },
+      agent,
+    );
     if (choice === undefined) {
       report(
         ctx,
@@ -545,6 +550,7 @@ export function registerWorktreeLifecycle(
           stripTerminalControls(
             `Continue the full active conversation at ${record.path} (HEAD ${record.head})?`,
           ),
+          agent ? undefined : manualDialogOptions(),
         ))
       ) {
         report(ctx, agent, `Workspace switch cancelled. Active workspace remains ${ctx.cwd}.`);

@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createEventBus, SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createEventBus, SessionManager, type BashOperations, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defaultConfig } from "./config-load.ts";
 import permissionExtension from "./index.ts";
 import { bindPath } from "./paths.ts";
@@ -47,7 +47,7 @@ function fixture() {
     const results = []; for (const hook of hooks.get(name) ?? []) results.push(await hook(event as never, ctx)); return results;
   };
   return {
-    dir, project, other, agentDir, global, projectFile, state, ctx, manager, notifications,
+    dir, project, other, agentDir, global, projectFile, state, ctx, manager, notifications, tools,
     execute: (name: string, input: Record<string, unknown>) => tools.get(name)!.execute("probe", input, undefined, undefined, ctx),
     userBash: () => emit("user_bash", { type: "user_bash", command: "printf ok", excludeFromContext: false }),
     governed: () => {
@@ -195,6 +195,110 @@ test("global command routes distinguish declaration revocation from ordinary cle
   } finally { await f.close(); }
 });
 
+test("fresh and retained global callbacks inherit filesystem origin while manual policy edits opt out", async () => {
+  const f = fixture();
+  const marker = Symbol.for("pi-extensions:input-dialog");
+  try {
+    const file = path.join(f.dir, "notes"); writeFileSync(file, "NOTE");
+    await f.start();
+    f.ctx.ui.select = async () => "Remember for this project";
+    await f.perm(`grant read ${f.project}`);
+    let manual = true;
+    let selections = 0; let confirmations = 0;
+    f.ctx.ui.select = async (_title, _items, options) => {
+      selections++;
+      assert.equal(Reflect.get(options!, marker), manual ? false : undefined);
+      assert.ok(options?.signal);
+      return "Save globally";
+    };
+    f.ctx.ui.confirm = async (_title, _message, options) => {
+      confirmations++;
+      assert.equal(Reflect.get(options!, marker), manual ? false : undefined);
+      assert.equal(Reflect.get({ ...options }, marker), manual ? false : undefined);
+      return true;
+    };
+    for (const retained of [false, true]) {
+      if (retained) await f.reloadExtension();
+      manual = true;
+      await f.perm(`grant read ${file}`);
+      const id = (await f.awareness()).match(/global:[a-f0-9-]+/)![0];
+      await f.perm(`revoke ${id}`);
+      manual = false;
+      await f.execute("request_directory_access", { directory: f.other, access: "read", reason: "Agent directory", agentWait: false });
+      manual = true;
+      await f.perm("clear global");
+      assert.deepEqual(JSON.parse(readFileSync(f.global, "utf8")).pathRules, []);
+      for (const saved of [f.global, f.state]) assert.doesNotMatch(readFileSync(saved, "utf8"), /agentWait|input-dialog/);
+    }
+    assert.equal(selections, 4); assert.equal(confirmations, 8);
+    for (const tool of f.tools.values()) assert.doesNotMatch(JSON.stringify(tool.parameters), /agentWait|input-dialog/);
+  } finally { await f.close(); }
+});
+
+test("user shells opt out discovered filesystem accesses and working-directory approval without changing agent defaults", async () => {
+  const f = fixture(); const marker = Symbol.for("pi-extensions:input-dialog");
+  try {
+    const file = path.join(f.other, "notes"); writeFileSync(file, "NOTE");
+    await f.start();
+    const origins: unknown[] = [];
+    f.ctx.ui.select = async (_title, _items, options) => { origins.push(Reflect.get(options!, marker)); return undefined; };
+    const [{ operations }] = await f.userBash() as { operations: BashOperations }[];
+    await assert.rejects(operations.exec(`cat ${JSON.stringify(file)}`, f.project, { onData: () => {} }), /denied/);
+    await assert.rejects(operations.exec("printf ok", f.other, { onData: () => {} }), /denied/);
+    await assert.rejects(f.execute("bash", { command: `cat ${JSON.stringify(file)}`, agentWait: false }), /denied/);
+    await assert.rejects(f.execute("request_path_exception", { path: file, access: "read", reason: "Agent file", agentWait: false }), /denied/);
+    assert.deepEqual(origins, [false, false, undefined, undefined]);
+    assert.equal(existsSync(f.state), false, "denied requests must not persist authority or UI metadata");
+  } finally { await f.close(); }
+});
+
+test("both shell initialization orders keep shared-runtime network waits tracked with distinct-host prompts and same-host dedup", async (t) => {
+  const { SandboxManager } = await import("@anthropic-ai/sandbox-runtime");
+  const marker = Symbol.for("pi-extensions:input-dialog");
+  for (const manualFirst of [true, false]) {
+    const f = fixture();
+    let ask: Parameters<typeof SandboxManager.initialize>[1];
+    let host = "first.example.test";
+    let initializations = 0;
+    try {
+      const config = JSON.parse(readFileSync(f.global, "utf8"));
+      config.network = { default: "restricted", allowedDomains: [], deniedDomains: [] };
+      writeFileSync(f.global, JSON.stringify(config));
+      t.mock.method(SandboxManager, "reset", async () => {});
+      t.mock.method(SandboxManager, "initialize", async (_config: Parameters<typeof SandboxManager.initialize>[0], callback: typeof ask) => {
+        initializations++;
+        ask = callback;
+      });
+      t.mock.method(SandboxManager, "wrapWithSandbox", async () => {
+        assert.ok(ask);
+        assert.deepEqual(await Promise.all([ask({ host, port: 443 }), ask({ host: host.toUpperCase(), port: 80 })]), [true, true]);
+        return "printf ok";
+      });
+      t.mock.method(SandboxManager, "cleanupAfterCommand", () => {});
+      t.mock.method(SandboxManager, "annotateStderrWithSandboxFailures", () => "");
+      await f.start();
+      const prompts: string[] = [];
+      f.ctx.ui.select = async (title, _items, options) => {
+        prompts.push(title);
+        assert.ok(title.startsWith("Network access:"));
+        assert.ok(options?.signal);
+        assert.equal(Reflect.get(options!, marker), undefined);
+        return "Allow for this session";
+      };
+      const [{ operations }] = await f.userBash() as { operations: BashOperations }[];
+      const shell = async (manual: boolean) => {
+        if (manual) assert.equal((await operations.exec("printf manual", f.project, { onData: () => {}, timeout: 5 })).exitCode, 0);
+        else assert.match(JSON.stringify(await f.execute("bash", { command: "printf agent", timeout: 5 })), /ok/);
+      };
+      await shell(manualFirst);
+      host = "second.example.test";
+      await shell(!manualFirst);
+      assert.equal(initializations, 1, "same-family shell origins must not reset the captured network callback");
+      assert.deepEqual(prompts, ["Network access: first.example.test:443", "Network access: second.example.test:443"]);
+    } finally { await f.close(); t.mock.restoreAll(); }
+  }
+});
+
 test("session block commands, clear-global separation, reload and close lifecycle", async () => {
   const f = fixture();
   try {
@@ -324,8 +428,9 @@ test("init and reset previews explain losses and defaults while cancellation pre
     await f.start(); writeFileSync(f.state, "saved-state", { mode: 0o600 });
     const before = [f.global, f.projectFile, f.state].map((file) => readFileSync(file, "utf8"));
     let prompts = 0;
-    f.ctx.ui.confirm = async (title, message) => {
+    f.ctx.ui.confirm = async (title, message, options) => {
       prompts++;
+      assert.equal(Reflect.get(options!, Symbol.for("pi-extensions:input-dialog")), false);
       assert.equal(title, "Initialize permission policy v3?");
       assert.equal(message, "Backed up\nAll user permission policy and state files before reset\n\nDiscarded\nStored approvals across projects. They are not migrated.\n\nUnchanged\nRepository policy files.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted");
       return false;

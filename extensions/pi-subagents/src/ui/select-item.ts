@@ -15,9 +15,11 @@
  * between building and resolving cannot desync them.
  */
 
+import type { ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
+
 /** Minimal shape of the `ctx.ui` surface this needs. */
 export interface SelectUI {
-  select(title: string, options: string[]): Promise<string | undefined>;
+  select(title: string, options: string[], opts?: ExtensionUIDialogOptions): Promise<string | undefined>;
 }
 
 /**
@@ -31,6 +33,7 @@ export async function selectItem<T>(
   title: string,
   items: readonly T[],
   format: (item: T, index: number) => string,
+  options?: ExtensionUIDialogOptions,
 ): Promise<T | undefined> {
   // Pad the number so a 10+ item list keeps its columns aligned.
   const width = String(items.length).length;
@@ -39,7 +42,7 @@ export async function selectItem<T>(
     label: `${String(i + 1).padStart(width)}. ${format(item, i)}`,
   }));
 
-  const choice = await ui.select(title, rows.map(r => r.label));
+  const choice = await ui.select(title, rows.map(r => r.label), options);
   if (!choice) return undefined;
   return rows.find(r => r.label === choice)?.item;
 }

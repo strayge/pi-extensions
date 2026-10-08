@@ -214,94 +214,122 @@ test("remote runtime disposes active flows and submit listener", () => {
 	);
 });
 
-test("remote submit resolves an active ask flow and emits lifecycle events", async () => {
-	getAskConfigStore().setConfig({
-		...DEFAULT_ASK_CONFIG,
-		notifications: { ...DEFAULT_ASK_CONFIG.notifications, enabled: false },
-	});
-	const bus = new TestEventBus();
-	const remoteAsk = createRemoteAskRuntime(bus as never);
-	let component: { handleInput(data: string): void } | undefined;
-
-	bus.on(PI_ASK_STARTED_EVENT, (data) => {
-		const event = data as RemoteAskStartedEvent;
-		bus.emit(PI_ASK_SUBMIT_EVENT, {
-			version: 1,
-			requestId: "request-1",
-			flowId: event.flowId,
-			response: {
-				kind: "answer",
-				answers: { decision: { values: ["yes"] } },
-			},
+for (const kind of ["answer", "cancel"] as const) {
+	test(`remote ${kind} resolves a marked ask flow and preserves lifecycle events`, async () => {
+		getAskConfigStore().setConfig({
+			...DEFAULT_ASK_CONFIG,
+			notifications: { ...DEFAULT_ASK_CONFIG.notifications, enabled: false },
 		});
-	});
+		const bus = new TestEventBus();
+		const remoteAsk = createRemoteAskRuntime(bus as never);
+		let component:
+			| { handleInput(data: string): void; dispose(): void }
+			| undefined;
 
-	const result = await runAskFlow(
-		{
-			cwd: process.cwd(),
-			mode: "tui",
-			ui: {
-				custom(callback: (...args: unknown[]) => unknown) {
-					return new Promise((resolve) => {
-						component = callback(
-							{
-								requestRender() {
-									// Rendering is not needed for this controller input test.
+		bus.on(PI_ASK_STARTED_EVENT, (data) => {
+			const event = data as RemoteAskStartedEvent;
+			bus.emit(PI_ASK_SUBMIT_EVENT, {
+				version: 1,
+				requestId: "request-1",
+				flowId: event.flowId,
+				response:
+					kind === "answer"
+						? { kind, answers: { decision: { values: ["yes"] } } }
+						: { kind },
+			});
+		});
+
+		const result = await runAskFlow(
+			{
+				cwd: process.cwd(),
+				mode: "tui",
+				ui: {
+					custom(callback: (...args: unknown[]) => unknown, options: unknown) {
+						assert.equal(
+							Reflect.get(callback, Symbol.for("pi-extensions:input-dialog")),
+							true
+						);
+						assert.equal(options, undefined);
+						return new Promise((resolve) => {
+							component = callback(
+								{
+									requestRender() {
+										// Rendering is not needed for this controller input test.
+									},
 								},
-							},
-							plainTheme(),
-							{},
-							resolve
-						) as typeof component;
-					});
+								plainTheme(),
+								{},
+								resolve
+							) as typeof component;
+						}).finally(() => component?.dispose());
+					},
 				},
+			} as never,
+			{
+				questions: [
+					{
+						id: "decision",
+						prompt: "Proceed?",
+						options: [
+							{ value: "yes", label: "Yes" },
+							{ value: "no", label: "No" },
+						],
+					},
+				],
 			},
-		} as never,
-		{
-			questions: [
-				{
-					id: "decision",
-					prompt: "Proceed?",
-					options: [
-						{ value: "yes", label: "Yes" },
-						{ value: "no", label: "No" },
-					],
-				},
-			],
-		},
-		{ remote: { runtime: remoteAsk, source: "tool", toolCallId: "call-1" } }
-	);
+			{ remote: { runtime: remoteAsk, source: "tool", toolCallId: "call-1" } }
+		);
 
-	assert(component);
-	assert.deepEqual(result.answers.decision, {
-		values: ["yes"],
-		labels: ["Yes"],
-		indices: [1],
-		customText: undefined,
-		note: undefined,
-		optionNotes: undefined,
+		assert(component);
+		assert.equal(
+			Reflect.get(component, Symbol.for("pi-extensions:input-dialog")),
+			undefined
+		);
+		assert.equal(result.cancelled, kind === "cancel");
+		if (kind === "answer") {
+			assert.deepEqual(result.answers.decision, {
+				values: ["yes"],
+				labels: ["Yes"],
+				indices: [1],
+				customText: undefined,
+				note: undefined,
+				optionNotes: undefined,
+			});
+		}
+
+		const started = bus.events.find(
+			(event) => event.channel === PI_ASK_STARTED_EVENT
+		)?.data as RemoteAskStartedEvent;
+		assert.equal(started.flowId, "tool:call-1");
+		assert.equal(started.source, "tool");
+		assert.equal(started.questions[0]?.id, "decision");
+
+		const submitResult = bus.events.find(
+			(event) => event.channel === PI_ASK_SUBMIT_RESULT_EVENT
+		)?.data as RemoteAskSubmitResultEvent;
+		assert.equal(submitResult.ok, true);
+		assert.equal(submitResult.requestId, "request-1");
+		assert.equal(submitResult.flowId, "tool:call-1");
+
+		const completed = bus.events.find(
+			(event) => event.channel === PI_ASK_COMPLETED_EVENT
+		)?.data as RemoteAskCompletedEvent;
+		assert.equal(completed.flowId, "tool:call-1");
+		assert.deepEqual(completed.result, result);
+		assert.deepEqual(
+			bus.events.map((event) => event.channel),
+			[
+				PI_ASK_STARTED_EVENT,
+				PI_ASK_SUBMIT_EVENT,
+				PI_ASK_COMPLETED_EVENT,
+				PI_ASK_SUBMIT_RESULT_EVENT,
+			]
+		);
+
+		remoteAsk.disposeAll();
+		getAskConfigStore().setConfig(DEFAULT_ASK_CONFIG);
 	});
-
-	const started = bus.events.find(
-		(event) => event.channel === PI_ASK_STARTED_EVENT
-	)?.data as RemoteAskStartedEvent;
-	assert.equal(started.flowId, "tool:call-1");
-	assert.equal(started.source, "tool");
-	assert.equal(started.questions[0]?.id, "decision");
-
-	const submitResult = bus.events.find(
-		(event) => event.channel === PI_ASK_SUBMIT_RESULT_EVENT
-	)?.data as RemoteAskSubmitResultEvent;
-	assert.equal(submitResult.ok, true);
-
-	const completed = bus.events.find(
-		(event) => event.channel === PI_ASK_COMPLETED_EVENT
-	)?.data as RemoteAskCompletedEvent;
-	assert.equal(completed.flowId, "tool:call-1");
-	assert.equal(completed.result.cancelled, false);
-
-	getAskConfigStore().setConfig(DEFAULT_ASK_CONFIG);
-});
+}
 
 function plainTheme() {
 	return {

@@ -447,6 +447,10 @@ test("RPC range choices update the report directly from the loaded history witho
         titles.push(title);
         assert.deepEqual(options, [...SPEED_RANGES, "Close"]);
         assert.equal(selectedOptions.signal, signal);
+        assert.equal(
+          Reflect.get({ ...selectedOptions }, Symbol.for("pi-extensions:input-dialog")),
+          false,
+        );
         return choices.shift();
       },
     },
@@ -504,6 +508,7 @@ test("TUI report opens one bounded table and cleans its abort listener after Esc
         ) =>
           new Promise<void>((resolve) => {
             calls += 1;
+            assert.equal(Reflect.get(factory, Symbol.for("pi-extensions:input-dialog")), undefined);
             const component = factory(
               { terminal: { rows: 8 }, requestRender() {} },
               { fg: (_color: string, text: string) => text },

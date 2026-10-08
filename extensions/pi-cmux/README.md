@@ -7,15 +7,17 @@ resume behavior, with two additions:
 - **Background agents stay busy:** finishing the main turn does not publish Idle
   while the `pi-subagents` manager has running or queued agents. Child sessions
   cannot overwrite the parent workspace's status or resume binding.
-- **`pi-ask` forms request attention:** opening an `ask_user`, replay, or resumed
-  form sends cmux's semantic “needs input” notification. Answering or cancelling
-  resolves the waiting state. Standard confirm/select/input dialogs, including
-  filesystem/network approvals and global-grant confirmations from
-  `pi-permission-modes`, remain covered.
+- **Input dialogs request attention:** questions, agent permission approvals,
+  and agent worktree confirmations send cmux's semantic “needs input” notification.
+  Answering or cancelling resolves the wait; overlapping dialogs keep it active
+  until the last tracked dialog closes.
 
 Completion notifications use “Task completed” rather than the answer text, so
 mentions of permissions or errors cannot be mistaken for requests for input.
-Assistant questions and approval notifications remain unchanged.
+Assistant questions and approval notifications remain unchanged. New completion
+notification/Stop dispatch is deferred while a tracked dialog is open, not for
+an entire deferred worktree operation or gaps between screens. Already-dispatched
+requests cannot be recalled.
 
 Requires Pi >=1.0.2 and Node.js >=22.19.0. Outside a cmux surface, it does nothing.
 
@@ -66,16 +68,48 @@ remain supported.
 ## Integration boundaries
 
 `pi-subagents` and `pi-ask` are optional. Without them, normal Pi lifecycle and
-standard dialog notifications still work. Background tracking uses
-`Symbol.for("pi-subagents:manager")` (`hasRunning` / `waitForAll`); question tracking
-uses `@eko24ive/pi-ask:started` and `@eko24ive/pi-ask:completed` with matching
-`flowId` values.
+native dialog notifications still work. Background tracking uses
+`Symbol.for("pi-subagents:manager")` (`hasRunning` / `waitForAll`). The manager
+reports running/queued agent records, not workflow-only phases with no active child.
 
-The manager reports running/queued agent records, not workflow task state.
-Workflow-only phases with no running or queued child are not exposed by that
-protocol. Forms opened in a child use its own event bus; child-only `pi-ask`
-events are not relayed by this extension. Standard child permission dialogs
-forwarded through the parent UI remain covered.
+Input tracking uses the repository convention
+`Symbol.for("pi-extensions:input-dialog")`, not a built-in Pi API:
+
+| Dialog API | Marker location | Literal `true` | Literal `false` | Absent/other value |
+| --- | --- | --- | --- | --- |
+| `custom` | Factory function | Track | Ignore | Ignore |
+| `confirm`, `select`, `input` | Native dialog options | Track | Ignore | Track (legacy compatibility) |
+
+Use an enumerable symbol property (for example, `Object.assign`) so metadata
+survives option spreading, including child signal merging. Preserve all existing
+options and abort signals. The marker controls attention only, never permission
+policy or answer values.
+
+Repository coverage includes agent filesystem approvals and their scope/path
+editors, agent worktree create/finish/switch confirmations, and every `pi-ask`
+question form: `ask_user`, recovery, `/answer`, `/answer:again`, and `/ask:replay`.
+Manual answer/replay forms deliberately remain tracked. Runtime-mediated network
+approvals also remain tracked for **both agent shells and manual `user_bash`**.
+
+Manual filesystem approvals, global permission edits/reset, worktree safety
+confirmations, and native menus/settings opt out. Ordinary custom menus, settings,
+loaders, reports, and viewers stay unmarked; settings inside an open question do
+not end its wait. An agent joining an already-open manual filesystem approval
+inherits its untracked status; approval deduplication is unchanged.
+
+Unmodified third-party native menus can still cause false waits; unknown custom
+UI is ignored unless its factory opts in. Child custom dialogs remain unsupported
+by the child UI proxy. Native child approvals forwarded through the parent UI
+are tracked once.
+
+Deploy matching repository `pi-ask` and `pi-cmux` changes together. Older/upstream
+unmarked `pi-ask` forms lose custom wait tracking: cmux no longer subscribes to
+pi-ask's public lifecycle events and provides no event fallback. Other consumers
+of pi-ask's public remote events remain compatible.
+
+Automatic question recovery launches at normal Pi's `resources_discover` boundary,
+after all `session_start` handlers finish, with no extension load-order requirement.
+Custom SDK hosts must also perform post-start resource discovery for recovery.
 
 ## Development
 

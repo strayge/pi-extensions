@@ -323,8 +323,7 @@ test("resumed submit persists dismissal, delivers an answer, and emits remote li
 		});
 	});
 
-	const handlerResult = harness.start("resume");
-	assert.equal(handlerResult, undefined);
+	await harness.start("resume");
 	await delivery;
 
 	assert.deepEqual(harness.dismissedToolCallIds, ["call-1"]);
@@ -371,10 +370,10 @@ test("resumed cancel persists dismissal and does not reopen on a second resume",
 		});
 	});
 
-	harness.start("startup");
+	await harness.start("startup");
 	await cancellation;
 	await new Promise<void>((resolve) => setImmediate(resolve));
-	harness.start("resume");
+	await harness.start("resume");
 	await new Promise<void>((resolve) => setImmediate(resolve));
 
 	assert.deepEqual(harness.dismissedToolCallIds, ["call-1"]);
@@ -394,6 +393,121 @@ test("resumed cancel persists dismissal and does not reopen on a second resume",
 	getAskConfigStore().setConfig(DEFAULT_ASK_CONFIG);
 });
 
+for (const reason of ["startup", "resume", "fork"]) {
+	test(`pending ${reason} recovery opens once at discovery without blocking lifecycle dispatch`, {
+		timeout: 2000,
+	}, async (t) => {
+		getAskConfigStore().setConfig(disabledNotificationConfig());
+		const bus = new TestEventBus();
+		const remoteAsk = createRemoteAskRuntime(bus as never);
+		t.after(() => {
+			remoteAsk.disposeAll();
+			getAskConfigStore().setConfig(DEFAULT_ASK_CONFIG);
+		});
+		const harness = createResumeHarness([askToolCall("call-1")], remoteAsk);
+
+		await harness.startOnly(reason);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.deepEqual(harness.customMarkers, []);
+		await harness.discover();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.deepEqual(harness.customMarkers, [true]);
+		assert.deepEqual(harness.dismissedToolCallIds, []);
+		await harness.discover();
+		await harness.start(reason);
+		assert.deepEqual(harness.customMarkers, [true]);
+
+		cancelRecoveredAsk(bus);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.deepEqual(harness.dismissedToolCallIds, ["call-1"]);
+	});
+}
+
+test("warm-config recovery waits for delayed later startup handlers", {
+	timeout: 2000,
+}, async (t) => {
+	getAskConfigStore().setConfig(disabledNotificationConfig());
+	await getAskConfigStore().ensureLoaded();
+	const bus = new TestEventBus();
+	const remoteAsk = createRemoteAskRuntime(bus as never);
+	t.after(() => {
+		remoteAsk.disposeAll();
+		getAskConfigStore().setConfig(DEFAULT_ASK_CONFIG);
+	});
+	const harness = createResumeHarness([askToolCall("call-1")], remoteAsk);
+	let releaseStartup: (() => void) | undefined;
+	const startupGate = new Promise<void>((resolve) => {
+		releaseStartup = resolve;
+	});
+	let laterHookInstalled = false;
+	harness.onStart(() => startupGate);
+	harness.onStart(() => {
+		laterHookInstalled = true;
+		assert.deepEqual(harness.customMarkers, []);
+	});
+
+	const starting = harness.start("startup");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(laterHookInstalled, false);
+	assert.deepEqual(harness.customMarkers, []);
+	releaseStartup?.();
+	await starting;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(laterHookInstalled, true);
+	assert.deepEqual(harness.customMarkers, [true]);
+	assert.deepEqual(harness.dismissedToolCallIds, []);
+	cancelRecoveredAsk(bus);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+});
+
+test("new activations and shutdown discard unlaunched recovery; standalone startup still recovers", {
+	timeout: 2000,
+}, async (t) => {
+	getAskConfigStore().setConfig(disabledNotificationConfig());
+	const bus = new TestEventBus();
+	const remoteAsk = createRemoteAskRuntime(bus as never);
+	t.after(() => {
+		remoteAsk.disposeAll();
+		getAskConfigStore().setConfig(DEFAULT_ASK_CONFIG);
+	});
+	const branch: unknown[] = [askToolCall("call-1")];
+	const harness = createResumeHarness(branch, remoteAsk);
+
+	await harness.startOnly("startup");
+	await harness.startOnly("reload");
+	await harness.discover("reload");
+	await harness.startOnly("resume");
+	await harness.start("new");
+	await harness.startOnly("fork");
+	await harness.shutdown();
+	await harness.discover();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(harness.customMarkers, []);
+
+	await harness.startOnly("startup");
+	branch.splice(0, branch.length, askToolCall("call-2"));
+	await harness.start("resume");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(harness.customMarkers, [true]);
+	assert.equal(
+		findEvent<RemoteAskStartedEvent>(bus, PI_ASK_STARTED_EVENT).toolCallId,
+		"call-2"
+	);
+	cancelRecoveredAsk(bus);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(harness.dismissedToolCallIds, ["call-2"]);
+});
+
+function cancelRecoveredAsk(bus: TestEventBus) {
+	const started = findEvent<RemoteAskStartedEvent>(bus, PI_ASK_STARTED_EVENT);
+	bus.emit(PI_ASK_SUBMIT_EVENT, {
+		version: 1,
+		requestId: "cancel-recovery",
+		flowId: started.flowId,
+		response: { kind: "cancel" },
+	});
+}
+
 function createResumeHarness(
 	branch: unknown[],
 	remoteAsk: ReturnType<typeof createRemoteAskRuntime>,
@@ -403,16 +517,17 @@ function createResumeHarness(
 		onSend?: (text: string, sendOptions: unknown) => void;
 	} = {}
 ) {
-	let sessionStartHandler: ((event: any, ctx: any) => void) | undefined;
+	const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
 	const dismissedToolCallIds: string[] = [];
+	const customMarkers: unknown[] = [];
 	const sentMessages: Array<{ text: string; options: unknown }> = [];
 
 	registerPendingAskResume(
 		{
-			on(event: string, handler: (event: any, ctx: any) => void) {
-				if (event === "session_start") {
-					sessionStartHandler = handler;
-				}
+			on(event: string, handler: (event: any, ctx: any) => unknown) {
+				const registered = handlers.get(event) ?? [];
+				registered.push(handler);
+				handlers.set(event, registered);
 			},
 			appendEntry(customType: string, data: { toolCallId: string }) {
 				branch.push({ type: "custom", customType, data });
@@ -425,17 +540,19 @@ function createResumeHarness(
 		} as never,
 		remoteAsk
 	);
-	assert(sessionStartHandler);
-
 	const ctx = {
 		cwd: process.cwd(),
 		isIdle: () => options.idle ?? true,
 		mode: "tui",
 		sessionManager: { getBranch: () => branch },
 		ui: {
-			custom(callback: (...args: any[]) => unknown) {
+			custom(callback: (...args: any[]) => any) {
+				customMarkers.push(
+					Reflect.get(callback, Symbol.for("pi-extensions:input-dialog"))
+				);
+				let component: { dispose(): void } | undefined;
 				return new Promise((resolve) => {
-					callback(
+					component = callback(
 						{
 							requestRender() {
 								// Rendering is not needed for this lifecycle test.
@@ -445,7 +562,7 @@ function createResumeHarness(
 						{},
 						resolve
 					);
-				});
+				}).finally(() => component?.dispose());
 			},
 			notify(message: string) {
 				if (message.startsWith("Unanswered ask_user form dismissed")) {
@@ -458,11 +575,25 @@ function createResumeHarness(
 		},
 	};
 
+	async function dispatch(type: string, reason: string) {
+		for (const handler of handlers.get(type) ?? []) {
+			await handler({ type, reason, cwd: ctx.cwd }, ctx);
+		}
+	}
+
 	return {
+		customMarkers,
 		dismissedToolCallIds,
 		sentMessages,
-		start(reason: "startup" | "resume" | "fork") {
-			return sessionStartHandler?.({ type: "session_start", reason }, ctx);
+		onStart(handler: () => unknown) {
+			handlers.get("session_start")?.push(handler);
+		},
+		startOnly: (reason: string) => dispatch("session_start", reason),
+		discover: (reason = "startup") => dispatch("resources_discover", reason),
+		shutdown: () => dispatch("session_shutdown", "quit"),
+		async start(reason: string) {
+			await dispatch("session_start", reason);
+			await dispatch("resources_discover", "startup");
 		},
 	};
 }

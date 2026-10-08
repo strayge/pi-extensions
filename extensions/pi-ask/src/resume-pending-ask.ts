@@ -25,8 +25,18 @@ export function registerPendingAskResume(
 	remoteAsk: RemoteAskRuntime
 ): void {
 	let reopening = false;
+	let activation = 0;
+	let pendingRecovery:
+		| {
+				activation: number;
+				ctx: ExtensionContext;
+				pendingAsk: PendingAskToolCall;
+		  }
+		| undefined;
 
 	pi.on("session_start", (event, ctx) => {
+		activation += 1;
+		pendingRecovery = undefined;
 		if (reopening || ctx.mode !== "tui" || !REOPEN_REASONS.has(event.reason)) {
 			return;
 		}
@@ -36,19 +46,33 @@ export function registerPendingAskResume(
 			return;
 		}
 
+		pendingRecovery = { activation, ctx, pendingAsk };
+	});
+
+	pi.on("resources_discover", () => {
+		const recovery = pendingRecovery;
+		pendingRecovery = undefined;
+		if (!recovery || recovery.activation !== activation || reopening) {
+			return;
+		}
+
+		// All session-start handlers have finished before normal resource discovery.
 		reopening = true;
-		queueMicrotask(() => {
-			reopenPendingAsk(pi, ctx, pendingAsk, remoteAsk)
-				.catch((error) => {
-					ctx.ui.notify(
-						`Could not reopen unanswered ask_user form: ${formatError(error)}`,
-						"error"
-					);
-				})
-				.finally(() => {
-					reopening = false;
-				});
-		});
+		reopenPendingAsk(pi, recovery.ctx, recovery.pendingAsk, remoteAsk)
+			.catch((error) => {
+				recovery.ctx.ui.notify(
+					`Could not reopen unanswered ask_user form: ${formatError(error)}`,
+					"error"
+				);
+			})
+			.finally(() => {
+				reopening = false;
+			});
+	});
+
+	pi.on("session_shutdown", () => {
+		activation += 1;
+		pendingRecovery = undefined;
 	});
 }
 

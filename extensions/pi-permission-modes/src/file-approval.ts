@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AskApproval } from "./approvals.ts";
 import { editDirectoryScope } from "./directory-scope.ts";
+import { approvalDialogOptions } from "./input-dialog.ts";
 import { bindPath } from "./paths.ts";
 import type { NetAsk } from "./network.ts";
 
@@ -42,11 +43,11 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
           : request.kind === "file"
             ? ["Allow for this session", "Remember for this project", "Save globally", "Deny and block for this session", "Deny"]
             : ["Allow for this session", "Remember for this project", "Deny and block for this session", "Deny"],
-        { signal },
+        approvalDialogOptions(request.agentWait, { signal }),
       );
       signal?.throwIfAborted();
       if (request.kind === "directory" && choice === "Edit directory scope") {
-        const selected = await editDirectoryScope(ctx, requested, directory, request.access, signal);
+        const selected = await editDirectoryScope(ctx, requested, directory, request.access, signal, request.agentWait);
         signal?.throwIfAborted();
         if (selected) {
           binding = selected;

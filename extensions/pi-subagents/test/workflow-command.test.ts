@@ -46,7 +46,8 @@ function commandCtx() {
       // Two different pickers come through here: the agents menu, then the
       // inspector's own "which run". Take the Workflows entry exactly once, so
       // the menu closes on the way back out instead of looping.
-      select: vi.fn(async (title: string, options: string[]) => {
+      select: vi.fn(async (title: string, options: string[], nativeOptions: object) => {
+        expect(Reflect.get({ ...nativeOptions }, Symbol.for("pi-extensions:input-dialog"))).toBe(false);
         if (title === "Agents") {
           agentsOptions = options;
           if (entryTaken) return undefined;
@@ -57,6 +58,7 @@ function commandCtx() {
         return selectPick;
       }),
       custom: vi.fn(async (factory: (...args: unknown[]) => unknown, options?: unknown) => {
+        expect(Reflect.get(factory, Symbol.for("pi-extensions:input-dialog"))).toBeUndefined();
         const tui = { requestRender: () => {} };
         const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
         const instance = factory(tui, theme, {}, () => {}) as { dispose?: () => void };

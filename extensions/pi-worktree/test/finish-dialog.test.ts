@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import test from "node:test";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionCommandContext,
+  ExtensionUIDialogOptions,
+} from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   confirmFinish,
   createFinishDialog,
   type FinishDialogProposal,
 } from "../src/finish-dialog.ts";
+import { createCustomSelectorHarness } from "./support.ts";
+
+const inputDialog = Symbol.for("pi-extensions:input-dialog");
 
 const proposal: FinishDialogProposal = {
   mainPath: "/main",
@@ -174,19 +180,56 @@ test("RPC approval keeps structured line breaks and full deletion evidence", asy
   const ctx = {
     mode: "rpc",
     ui: {
-      async select(text: string, choices: string[]) {
+      async select(text: string, choices: string[], options?: ExtensionUIDialogOptions) {
+        assert.equal(Reflect.get(options ?? {}, inputDialog), false);
         title = text;
         assert.match(choices[0] ?? "", /KEEP branch/);
         return choices[0];
       },
     },
   } as unknown as ExtensionCommandContext;
-  assert.equal(await confirmFinish(ctx, { ...proposal, merged: false }), false);
+  assert.equal(await confirmFinish(ctx, { ...proposal, merged: false }, false), false);
   assert.ok(title.includes("Remove   /feature\nReturn   /main"));
   assert.ok(title.includes("Ignored to delete:\n  extensions/pi-cmux/node_modules/"));
   assert.doesNotMatch(title, /VERIFICATION|Main checkout HEAD|conversation/);
   assert.ok(title.includes(`Branch tip: ${proposal.tip}`));
   assert.match(title, /DATA-LOSS WARNING/);
+});
+
+test("finish marks only agent factories and preserves branch choices and cancellation", async () => {
+  for (const agent of [true, false]) {
+    const ctx = {
+      mode: "tui",
+      ui: {
+        async custom(factory: unknown, options?: unknown) {
+          assert.equal(typeof factory, "function");
+          assert.equal(Reflect.get(factory as object, inputDialog), agent ? true : undefined);
+          assert.equal(options, undefined);
+          const dialog = createCustomSelectorHarness(factory);
+          assert.match(dialog.render().join("\n"), /\[x\] Delete branch/);
+          dialog.handleInput(" ");
+          dialog.handleInput(agent ? "\r" : "\u001b");
+          return dialog.result;
+        },
+      },
+    } as unknown as ExtensionCommandContext;
+    assert.equal(await confirmFinish(ctx, proposal, agent), agent ? false : undefined);
+  }
+});
+
+test("agent native finish remains tracked with unchanged deletion and cancellation results", async () => {
+  for (const cancel of [false, true]) {
+    const ctx = {
+      mode: "rpc",
+      ui: {
+        async select(_title: string, choices: string[], options?: ExtensionUIDialogOptions) {
+          assert.equal(options, undefined);
+          return cancel ? undefined : choices[0];
+        },
+      },
+    } as unknown as ExtensionCommandContext;
+    assert.equal(await confirmFinish(ctx, proposal, true), cancel ? undefined : true);
+  }
 });
 
 for (const merged of [false, true]) {

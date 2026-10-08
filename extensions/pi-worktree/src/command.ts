@@ -30,6 +30,7 @@ import {
   worktreeIncarnation,
   worktreeInventory,
 } from "./git.ts";
+import { manualDialogOptions, manualMenuContext } from "./input-dialog.ts";
 import { switchToWorktree } from "./session.ts";
 import type { WorktreeSettingsRuntime } from "./settings.ts";
 import { loadWorktreeStatusCards, type WorktreeStatusCard } from "./status.ts";
@@ -173,7 +174,7 @@ export function registerWorktreeCommand(
             configure: async () => runFlow(() => configureRootFlow(ctx, settings)),
           },
         });
-        await runMenu(ctx, menu, {
+        await runMenu(manualMenuContext(ctx), menu, {
           getState: () => state,
           signal: owner.signal,
           isCurrent: owner.isCurrent,
@@ -198,6 +199,7 @@ async function configureRootFlow(
   const requested = await ctx.ui.input(
     "Worktree root (blank restores ~/.worktrees)",
     stripTerminalControls(current.configuredRoot ?? current.effectiveRoot),
+    manualDialogOptions(),
   );
   if (requested === undefined) return;
   const configuredRoot = requested.trim() || undefined;
@@ -228,7 +230,11 @@ async function addFlow(
     );
   }
 
-  const requestedBranch = await ctx.ui.input("Branch for the new worktree", "feat/my-change");
+  const requestedBranch = await ctx.ui.input(
+    "Branch for the new worktree",
+    "feat/my-change",
+    manualDialogOptions(),
+  );
   if (requestedBranch === undefined) return;
   const branchInput = requestedBranch.trim();
   if (!branchInput) throw new Error("Branch name is required.");
@@ -256,6 +262,7 @@ async function addFlow(
           : `Start point for ${branch} (required because HEAD is detached)`,
       ),
       stripTerminalControls(defaultStart ?? "commit-ish"),
+      manualDialogOptions(),
     );
     if (requestedStart === undefined) return;
     const explicitStart = requestedStart.trim();
@@ -273,6 +280,7 @@ async function addFlow(
   const requestedPath = await ctx.ui.input(
     stripTerminalControls(`Worktree path (blank uses ${suggestedPath})`),
     stripTerminalControls(suggestedPath),
+    manualDialogOptions(),
   );
   if (requestedPath === undefined) return;
   const targetPath = pathIdentity(
@@ -285,7 +293,7 @@ async function addFlow(
   }
 
   const summary = formatAddPreview(branch, branchExists, provenance, targetPath);
-  if (!(await ctx.ui.confirm("Create Git worktree", summary))) return;
+  if (!(await ctx.ui.confirm("Create Git worktree", summary, manualDialogOptions()))) return;
 
   assertTargetFilesystemAvailable(targetPath);
   const latestRecords = await listWorktrees(pi, ctx.cwd, ctx.signal);
@@ -335,6 +343,7 @@ async function addFlow(
     await ctx.ui.confirm(
       "Switch Pi workspace?",
       stripTerminalControls(`Continue this conversation in ${targetPath}?`),
+      manualDialogOptions(),
     )
   ) {
     const latest = await revalidateWorktreeIdentity(pi, ctx, created);
@@ -455,6 +464,7 @@ async function removeFlow(
     !(await ctx.ui.confirm(
       confirmationTitle,
       `Delete the worktree directory ${stripTerminalControls(selected.path)}? The branch will be preserved.${removalWarning}`,
+      manualDialogOptions(),
     ))
   ) {
     return;
@@ -633,6 +643,7 @@ async function pruneFlow(
         ? "Prune metadata and discard recovery history"
         : "Prune stale worktree metadata",
       stripTerminalControls(`${safePreview}${recoveryWarning}`),
+      manualDialogOptions(),
     ))
   ) {
     return;
@@ -878,7 +889,7 @@ async function selectWorktree(
       },
     },
   });
-  await runMenu(ctx, menu, {
+  await runMenu(manualMenuContext(ctx), menu, {
     getState: () => undefined,
     signal,
     isCurrent: () => !signal?.aborted,

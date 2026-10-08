@@ -534,7 +534,7 @@ export default function usageExtension(
         const action = await ctx.ui.select(
           formatProviderState(outcome.state, display),
           [HISTORY, REFRESH, ...(resetAction ? [resetAction] : []), DISPLAY, CLOSE],
-          { signal: controller.signal },
+          { signal: controller.signal, [Symbol.for("pi-extensions:input-dialog")]: false },
         );
         if (action === REFRESH) {
           force = true;
@@ -548,7 +548,7 @@ export default function usageExtension(
             retrying
               ? "The previous outcome is unknown. Retry the same idempotent request without risking a second reset?"
               : `Codex will choose and consume one of ${availableResets} saved resets for the current account. This cannot be undone.`,
-            { signal: controller.signal },
+            { signal: controller.signal, [Symbol.for("pi-extensions:input-dialog")]: false },
           );
           if (!confirmed || controller.signal.aborted) continue;
 

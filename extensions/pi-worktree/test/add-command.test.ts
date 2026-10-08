@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import type { ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
 import worktreeExtension from "../src/worktree.ts";
 import { type ExecFunction, oid, porcelain, result } from "./command-test-support.ts";
 import { createMockContext, createMockPi } from "./support.ts";
@@ -49,8 +50,12 @@ test("add creates a new branch with safe argv, verifies it, and can leave the se
     hasUI: true,
     mode: "tui",
     select: async () => "Add worktree",
-    input: async () => inputs.shift(),
-    confirm: async (title: string, message: string) => {
+    input: async (_title: string, _placeholder: string, options?: ExtensionUIDialogOptions) => {
+      assert.equal(Reflect.get(options ?? {}, Symbol.for("pi-extensions:input-dialog")), false);
+      return inputs.shift();
+    },
+    confirm: async (title: string, message: string, options?: ExtensionUIDialogOptions) => {
+      assert.equal(Reflect.get(options ?? {}, Symbol.for("pi-extensions:input-dialog")), false);
       if (title === "Create Git worktree") creationPreview = message;
       return confirms.shift() ?? false;
     },
@@ -70,6 +75,8 @@ test("add creates a new branch with safe argv, verifies it, and can leave the se
       oid,
     ]);
     assert.match(context.notifications.at(-1)?.message ?? "", /created.*repo-feature/i);
+    assert.deepEqual(inputs, [], "branch, base, and path inputs all ran");
+    assert.deepEqual(confirms, [], "create and switch confirmations both ran");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

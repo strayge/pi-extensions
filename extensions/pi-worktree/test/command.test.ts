@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ExecResult } from "@earendil-works/pi-coding-agent";
+import type { ExecResult, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
 import { createTuiHarness } from "@narumitw/pi-tui-kit/testing";
 import { createWorktreeSettingsRuntime, type WorktreeSettingsRuntime } from "../src/settings.ts";
 import worktreeExtension from "../src/worktree.ts";
@@ -222,10 +222,16 @@ test("remove deletes only a confirmed clean linked worktree and verifies deregis
   const context = createMockContext({
     cwd: main,
     hasUI: true,
-    mode: "tui",
-    select: async (_title: string, items: string[]) =>
-      selectCount++ === 0 ? "Remove worktree" : items[0],
-    confirm: async () => true,
+    mode: "rpc",
+    select: async (_title: string, items: string[], options?: ExtensionUIDialogOptions) => {
+      assert.equal(Reflect.get(options ?? {}, Symbol.for("pi-extensions:input-dialog")), false);
+      assert.ok(options?.signal instanceof AbortSignal, "both library menus retain cancellation");
+      return selectCount++ === 0 ? "Remove worktree" : items[0];
+    },
+    confirm: async (_title: string, _message: string, options?: ExtensionUIDialogOptions) => {
+      assert.equal(Reflect.get(options ?? {}, Symbol.for("pi-extensions:input-dialog")), false);
+      return true;
+    },
   });
   try {
     await mock.commands.get("worktree")?.handler("", context.ctx);
@@ -234,6 +240,7 @@ test("remove deletes only a confirmed clean linked worktree and verifies deregis
       ["worktree", "remove", linked],
     );
     assert.match(context.notifications.at(-1)?.message ?? "", /branch was preserved/i);
+    assert.equal(selectCount, 2, "root and linked-worktree RPC menus both ran");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -542,6 +549,8 @@ test("switch selection searches branch and path while preserving raw worktree id
     mode: "tui",
     sessionManager: { getSessionFile: () => undefined, getEntries: () => [] },
     custom: async (factory: Parameters<typeof tui.custom>[0], options?: unknown) => {
+      assert.equal(Reflect.get(factory, Symbol.for("pi-extensions:input-dialog")), undefined);
+      assert.equal(options, undefined);
       customCalls += 1;
       const pending = tui.custom(factory, options as never);
       await tui.waitForOpen();
@@ -909,9 +918,15 @@ test("prune always previews and cancellation prevents mutation", async () => {
     const context = createMockContext({
       cwd: "/repo",
       hasUI: true,
-      mode: "tui",
-      select: async () => "Prune stale metadata",
-      confirm: async () => confirm,
+      mode: "rpc",
+      select: async (_title: string, _items: string[], options?: ExtensionUIDialogOptions) => {
+        assert.equal(Reflect.get(options ?? {}, Symbol.for("pi-extensions:input-dialog")), false);
+        return "Prune stale metadata";
+      },
+      confirm: async (_title: string, _message: string, options?: ExtensionUIDialogOptions) => {
+        assert.equal(Reflect.get(options ?? {}, Symbol.for("pi-extensions:input-dialog")), false);
+        return confirm;
+      },
     });
     await mock.commands.get("worktree")?.handler("", context.ctx);
     assert.deepEqual(

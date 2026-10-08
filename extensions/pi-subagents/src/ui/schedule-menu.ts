@@ -11,6 +11,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentScheduler } from "../schedule.js";
 import type { ScheduledSubagent } from "../types.js";
+import { manualDialogOptions } from "./manual-dialog.ts";
 import { selectItem } from "./select-item.js";
 
 /** Format an ISO timestamp as relative time ("in 4h", "2d ago", "—"). */
@@ -94,10 +95,11 @@ export async function showSchedulesMenu(
     `Scheduled jobs (${jobs.length}) — select to cancel`,
     jobs,
     j => formatJob(j, scheduler),
+    manualDialogOptions(),
   );
   if (!job) return;
 
-  const ok = await ctx.ui.confirm(`Cancel "${job.name}"?`, formatDetails(job, scheduler));
+  const ok = await ctx.ui.confirm(`Cancel "${job.name}"?`, formatDetails(job, scheduler), manualDialogOptions());
   if (!ok) return;
 
   scheduler.removeJob(job.id);
