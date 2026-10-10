@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmdirSync } from "node:fs";
 import path from "node:path";
+import { ApprovalQueue, type ApprovalTask } from "./approval-queue.ts";
 import { NetworkSession, type NetAsk } from "./network.ts";
 import { assertBinding, bindFile, bindPath, resolvePermissionBinding, revalidate, within } from "./paths.ts";
 import { decide, freeze, resolveCatalog, type ResolutionContext } from "./policy.ts";
@@ -57,7 +58,8 @@ export class PermissionOwner {
   private leases = 0;
   private drained: (() => void)[] = [];
   private children = new Set<() => void>();
-  private pending = new Map<string, Promise<PathBinding | undefined>>();
+  readonly approvalQueue = new ApprovalQueue();
+  private pending = new Map<string, ApprovalTask<PathBinding | undefined>>();
   private approvalCancellation = new AbortController();
   private readonly store?: PermissionStore;
   private readonly policyWriter?: GlobalPolicyWriter;
@@ -104,6 +106,7 @@ export class PermissionOwner {
       (network) => this.persist(this.mode, this.grants, this.exceptions, network),
       restoredNetwork,
       () => !this.unavailable,
+      (operation, signal) => this.approvalQueue.run(operation, signal ? AbortSignal.any([signal, this.approvalSignal]) : this.approvalSignal),
     );
     this.persist(this.mode, this.grants, this.exceptions, this.network.snapshot());
   }
@@ -201,6 +204,11 @@ export class PermissionOwner {
   }
 
   async changeGlobal(mutation: GlobalMutation, signal?: AbortSignal, agentWait = true): Promise<void> {
+    const cancellation = signal ? AbortSignal.any([signal, this.approvalSignal]) : this.approvalSignal;
+    return this.approvalQueue.run(() => this.changeGlobalNow(mutation, cancellation, agentWait), cancellation);
+  }
+
+  private async changeGlobalNow(mutation: GlobalMutation, signal?: AbortSignal, agentWait = true): Promise<void> {
     this.snapshot();
     if (this.cacheStale) throw new Error("Permission cache is stale; restart before changing global authority");
     if (!this.policyWriter || !this.confirmGlobal) throw new Error("Global permission changes require the parent UI and trusted policy writer");
@@ -295,7 +303,7 @@ export class PermissionOwner {
     );
   }
 
-  private async approve(request: ApprovalRequest, revision: number, signal?: AbortSignal): Promise<PathBinding | undefined> {
+  private async approve(request: ApprovalRequest, revision: number, signal?: AbortSignal, inline = false): Promise<PathBinding | undefined> {
     signal = signal ? AbortSignal.any([signal, this.approvalSignal]) : this.approvalSignal;
     signal.throwIfAborted();
     const key = JSON.stringify([revision, request.kind, request.path, request.access, request.ruleId]);
@@ -303,7 +311,18 @@ export class PermissionOwner {
     if (!pending) {
       request = freeze({ ...request });
       const frozen = bindPath(request.path);
-      pending = (async () => {
+      pending = this.approvalQueue.enqueue(async () => {
+        const snapshot = this.snapshot();
+        revision = snapshot.revision;
+        assertBinding(frozen, request.kind === "exception");
+        const proposed = request.kind === "exception" ? undefined : {
+          scope: request.kind === "file" ? "file" as const : "tree" as const,
+          access: request.access,
+          binding: request.kind === "file" ? bindFile(frozen) : frozen,
+        };
+        const decision = decide(snapshot, frozen, request.access, proposed);
+        if (decision.action === "deny") throw new Error(`Filesystem access denied: ${request.path}`);
+        if (request.kind === "exception" && !decision.exceptions.some((exception) => exception.rule.id === request.ruleId && exception.access === request.access)) return undefined;
         const answer = await this.ask(request, signal);
         signal?.throwIfAborted();
         this.check(revision);
@@ -375,7 +394,7 @@ export class PermissionOwner {
               await this.approve({
                 kind: "exception", path: exception.rule.binding!.lexical, access: exception.access,
                 ruleId: exception.rule.id, scope: exception.rule.scope, reason: request.reason, create: false, agentWait: request.agentWait,
-              }, revision, signal);
+              }, revision, signal, true);
               // Only the requested exception may advance authority while this directory answer is pending.
               this.check(++revision);
             }
@@ -385,7 +404,7 @@ export class PermissionOwner {
             binding = bindPath(binding.lexical);
             created = binding;
           }
-          if (answer.lifetime === "global") await this.changeGlobal({ kind: "save", binding, access: request.access, scope: "tree" }, signal, request.agentWait);
+          if (answer.lifetime === "global") await this.changeGlobalNow({ kind: "save", binding, access: request.access, scope: "tree" }, signal, request.agentWait);
           else {
             const grants = [...this.grants, { id: randomUUID(), binding, access: request.access, lifetime: answer.lifetime }];
             this.persist(this.mode, grants, this.exceptions, this.network.snapshot(), signal);
@@ -394,7 +413,7 @@ export class PermissionOwner {
         } else if (request.kind === "file") {
           if (answer.directory || answer.binding) throw new Error("Exact-file grants cannot edit directory scope");
           const binding = bindFile(frozen);
-          if (answer.lifetime === "global") await this.changeGlobal({ kind: "save", binding, access: request.access, scope: "file" }, signal, request.agentWait);
+          if (answer.lifetime === "global") await this.changeGlobalNow({ kind: "save", binding, access: request.access, scope: "file" }, signal, request.agentWait);
           else {
             const grants = [...this.grants, { id: randomUUID(), binding, access: request.access, lifetime: answer.lifetime }];
             this.persist(this.mode, grants, this.exceptions, this.network.snapshot(), signal);
@@ -420,10 +439,13 @@ export class PermissionOwner {
           }
           throw error;
         }
-      })().finally(() => this.pending.delete(key));
+      }, signal);
+      pending.promise = pending.promise.finally(() => this.pending.delete(key));
       this.pending.set(key, pending);
     }
-    return await pending;
+    // Nested exceptions share the current dialog owner, even when a sibling queued them first.
+    if (inline) void pending.run();
+    return await pending.promise;
   }
 
   async authorize(

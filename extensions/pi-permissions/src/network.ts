@@ -3,7 +3,7 @@ export { normalizeDomain } from "./config-load.ts";
 import type { NetworkPolicy, NetworkSnapshot } from "./schema.ts";
 
 export type NetAskResult = "allow-session" | "allow-forever" | "deny" | "dismiss";
-export type NetAsk = (host: string, port?: number) => Promise<NetAskResult>;
+export type NetAsk = (host: string, port?: number, signal?: AbortSignal) => Promise<NetAskResult>;
 export const matchesDomainPattern = domainMatches;
 export function isHostAllowed(host: string, patterns: Iterable<string>): boolean {
   return [...patterns].some((p) => domainMatches(host, p));
@@ -15,7 +15,14 @@ export class NetworkSession {
   private readonly pending = new Map<string, Promise<boolean>>();
   private readonly persist: (state: NetworkSnapshot) => void;
   private readonly available: () => boolean;
-  constructor(policy: NetworkPolicy, persist: (state: NetworkSnapshot) => void, restored?: NetworkSnapshot, available = () => true) {
+  private readonly queueApproval: <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
+  constructor(
+    policy: NetworkPolicy,
+    persist: (state: NetworkSnapshot) => void,
+    restored?: NetworkSnapshot,
+    available = () => true,
+    queueApproval: <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T> = (operation) => operation(),
+  ) {
     this.current = restored ? structuredClone(restored) : {
       revision: 0,
       restricted: policy.default === "restricted",
@@ -36,6 +43,7 @@ export class NetworkSession {
       throw new Error("Invalid saved network policy");
     this.persist = persist;
     this.available = available;
+    this.queueApproval = queueApproval;
   }
   snapshot(): NetworkSnapshot {
     return structuredClone(this.current);
@@ -74,7 +82,8 @@ export class NetworkSession {
       throw new Error("An explicitly denied domain cannot be approved");
     this.change({ allowedDomains: [...new Set([...this.current.allowedDomains, ...domains])] });
   }
-  async decide(host: string, port?: number, ask?: NetAsk): Promise<boolean> {
+  async decide(host: string, port?: number, ask?: NetAsk, signal?: AbortSignal): Promise<boolean> {
+    signal?.throwIfAborted();
     if (!this.available()) return false;
     if (!this.current.restricted) return true;
     const normalized = normalizeDomain(host);
@@ -85,9 +94,15 @@ export class NetworkSession {
     if (!ask) return false;
     let pending = this.pending.get(host);
     if (!pending) {
-      const revision = this.current.revision;
-      pending = (async () => {
-        const answer = await ask(host, port);
+      pending = this.queueApproval(async () => {
+        signal?.throwIfAborted();
+        if (!this.available()) return false;
+        if (!this.current.restricted) return true;
+        if (isHostAllowed(host, this.current.deniedDomains)) return false;
+        if (isHostAllowed(host, this.current.allowedDomains)) return true;
+        const revision = this.current.revision;
+        const answer = await ask(host, port, signal);
+        signal?.throwIfAborted();
         if (!this.available() || this.current.revision !== revision) return false;
         if (answer === "allow-session" || answer === "allow-forever") {
           this.grant([host]);
@@ -95,9 +110,11 @@ export class NetworkSession {
         }
         if (answer === "deny") this.change({ deniedDomains: [...new Set([...this.current.deniedDomains, host])] });
         return false;
-      })().finally(() => this.pending.delete(host));
+      }, signal).finally(() => this.pending.delete(host));
       this.pending.set(host, pending);
     }
-    return pending;
+    const allowed = await pending;
+    signal?.throwIfAborted();
+    return allowed;
   }
 }

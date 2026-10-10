@@ -25,6 +25,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { ApprovalQueue } from "./approval-queue.ts";
 import { PermissionOwner } from "./approvals.ts";
 import { permissionAwareness } from "./awareness.ts";
 import { discoverShellAccess } from "./bash-parse.ts";
@@ -76,6 +77,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
   let ctx: ExtensionContext;
   let startupError: string | undefined;
   const status = createStatus(pi);
+  const setupApprovals = new ApprovalQueue();
   const getOwner = () => {
     if (!owner) throw new Error(`Filesystem policy unavailable: ${startupError ?? "session has not started"}`);
     return owner;
@@ -233,7 +235,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         const domain = normalizeDomain(raw);
         if (!domain || domain.startsWith("*."))
           throw new Error("Tool requests require an exact hostname; use /net allow for wildcard policy");
-        if (!(await active.network.decide(domain, undefined, active.askNetwork)))
+        if (!(await active.network.decide(domain, undefined, active.askNetwork, signal)))
           throw new Error(`Network access denied: ${domain}`);
       }
       showStatus();
@@ -249,19 +251,23 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
       const [action, ...rest] = args.trim().split(/\s+/);
       if (action === "reset" || action === "init") {
         if (!ctx.hasUI) throw new Error("Permission setup requires user acknowledgement in the UI");
-        if (
-          !(await ctx.ui.confirm(
-            "Initialize permission policy?",
-            "Backed up\nconfig.json and state-v4.json in the user permissions directory before reset\n\nDiscarded\nStored approvals across projects.\n\nUnchanged\nAll other files and directories.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted",
-            approvalDialogOptions(false),
-          ))
-        )
-          return;
         const resetting = owner;
         const root = startingRoot;
+        const cancellation = resetting && !resetting.reason ? resetting.approvalSignal : undefined;
+        const approved = await (resetting?.approvalQueue ?? setupApprovals).run(async () => {
+          if (!(await ctx.ui.confirm(
+            "Initialize permission policy?",
+            "Backed up\nconfig.json and state-v4.json in the user permissions directory before reset\n\nDiscarded\nStored approvals across projects.\n\nUnchanged\nAll other files and directories.\n\nNew defaults\nFilesystem   Project access\nNetworking   Unrestricted",
+            approvalDialogOptions(false, { signal: cancellation }),
+          ))) return false;
+          if (owner !== resetting || startingRoot !== root) throw new Error("Parent policy changed during reset; retry explicitly");
+          if (!root) throw new Error("The starting project root is unavailable; restart the session before resetting policy");
+          assertBinding(root);
+          resetting?.block("Policy reset is draining governed work; /reload required");
+          return true;
+        }, cancellation);
+        if (!approved) return;
         if (!root) throw new Error("The starting project root is unavailable; restart the session before resetting policy");
-        assertBinding(root);
-        resetting?.block("Policy reset is draining governed work; /reload required");
         await resetting?.drain();
         if (resetting) await runtime.shutdown(resetting.id);
         if (owner !== resetting || startingRoot !== root) throw new Error("Parent policy changed during reset; retry explicitly");

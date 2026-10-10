@@ -49,7 +49,7 @@ function fixture() {
   };
   return {
     dir, project, other, agentDir, global, projectFile, state, ctx, manager, notifications, tools,
-    execute: (name: string, input: Record<string, unknown>) => tools.get(name)!.execute("probe", input, undefined, undefined, ctx),
+    execute: (name: string, input: Record<string, unknown>, signal?: AbortSignal) => tools.get(name)!.execute("probe", input, signal, undefined, ctx),
     userBash: () => emit("user_bash", { type: "user_bash", command: "printf ok", excludeFromContext: false }),
     governed: () => {
       let present = false;
@@ -193,6 +193,86 @@ test("global command routes distinguish declaration revocation from ordinary cle
     await f.perm("clear global");
     assert.equal(JSON.parse(readFileSync(f.global, "utf8")).pathRules.length, 0);
   } finally { await f.close(); }
+});
+
+test("parallel filesystem and network requests keep each global confirmation with its approval", async () => {
+  const f = fixture();
+  try {
+    const second = path.join(f.dir, "second"); mkdirSync(second);
+    const config = JSON.parse(readFileSync(f.global, "utf8"));
+    config.network = { default: "restricted", allowedDomains: [], deniedDomains: [] };
+    writeFileSync(f.global, JSON.stringify(config));
+    await f.start();
+    let active = false;
+    const dialogs: string[] = [];
+    const respond = async <T>(label: string, answer: T): Promise<T> => {
+      assert.equal(active, false, "a permission dialog must not replace another active dialog");
+      active = true;
+      dialogs.push(label);
+      try {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return answer;
+      } finally { active = false; }
+    };
+    f.ctx.ui.select = (title) => title.startsWith("Network access:")
+      ? respond("network", "Allow for this session")
+      : respond(title.includes(f.other) ? "first" : "second", "Save globally");
+    f.ctx.ui.confirm = (_title, message) => respond(message.includes(f.other) ? "confirm first" : "confirm second", true);
+    const results = await Promise.allSettled([
+      f.execute("request_directory_access", { directory: f.other, access: "read", reason: "First directory" }),
+      f.execute("request_directory_access", { directory: second, access: "read", reason: "Second directory" }),
+      f.execute("request_network_access", { domains: ["queued.example.test"], reason: "Network request" }),
+    ]);
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
+    }
+    assert.deepEqual(dialogs, ["first", "confirm first", "second", "confirm second", "network"]);
+    assert.deepEqual(JSON.parse(readFileSync(f.global, "utf8")).pathRules, [
+      { path: f.other, scope: "tree", read: "allow" },
+      { path: second, scope: "tree", read: "allow" },
+    ]);
+    assert.match(await f.awareness(), /queued\.example\.test/);
+  } finally { await f.close(); }
+});
+
+test("cancelled network tools skip queued dialogs and cannot publish late active answers", async () => {
+  for (const queued of [true, false]) {
+    const f = fixture();
+    try {
+      const config = JSON.parse(readFileSync(f.global, "utf8"));
+      config.network = { default: "restricted", allowedDomains: [], deniedDomains: [] };
+      writeFileSync(f.global, JSON.stringify(config));
+      await f.start();
+      const dialogs: string[] = [];
+      let answer!: (value: string) => void;
+      let displayedSignal: AbortSignal | undefined;
+      f.ctx.ui.select = (title, _items, options) => {
+        dialogs.push(title.startsWith("Network access:") ? "network" : "filesystem");
+        displayedSignal = options?.signal;
+        return new Promise((resolve) => { answer = resolve; });
+      };
+      const first = queued ? f.execute("request_directory_access", { directory: f.other, access: "read", reason: "Active dialog" }) : undefined;
+      const controller = new AbortController();
+      const rejected = assert.rejects(f.execute("request_network_access", {
+        domains: ["cancelled.example.test"], reason: "Cancelled tool",
+      }, controller.signal), /abort/i);
+      controller.abort();
+      assert.equal(displayedSignal?.aborted, !queued);
+      if (queued) {
+        await rejected;
+        assert.deepEqual(dialogs, ["filesystem"]);
+        answer("Allow for this session");
+        await first;
+      } else {
+        answer("Allow for this session");
+        await rejected;
+      }
+      assert.doesNotMatch(await f.awareness(), /cancelled\.example\.test/);
+      f.ctx.ui.select = async () => "Allow for this session";
+      await f.execute("request_network_access", { domains: ["next.example.test"], reason: "Next tool" });
+      assert.match(await f.awareness(), /next\.example\.test/);
+    } finally { await f.close(); }
+  }
 });
 
 test("fresh and retained global callbacks inherit filesystem origin while manual policy edits opt out", async () => {

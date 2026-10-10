@@ -45,6 +45,28 @@ test("equivalent IPv4 spellings share configured, live, restored, and prompted n
   for (const alias of aliases) assert.equal(await open.decide(alias), false);
 });
 
+test("distinct concurrent hosts queue full decisions while equivalent hosts share one approval", async () => {
+  const f = fixture();
+  try {
+    let active = false; const hosts: string[] = [];
+    const ask = async (host: string): Promise<NetAskResult> => {
+      assert.equal(active, false);
+      active = true; hosts.push(host);
+      try {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return "allow-session";
+      } finally { active = false; }
+    };
+    assert.deepEqual(await Promise.all([
+      f.owner.network.decide("first.example", 443, ask),
+      f.owner.network.decide("FIRST.EXAMPLE", 80, ask),
+      f.owner.network.decide("second.example", 443, ask),
+    ]), [true, true, true]);
+    assert.deepEqual(hosts, ["first.example", "second.example"]);
+    assert.ok(f.owner.network.snapshot().allowedDomains.includes("second.example"));
+  } finally { f.close(); }
+});
+
 test("late non-UI network answers cannot install authority after shutdown or failed reload", async () => {
   for (const retiring of ["shutdown", "reload"] as const) {
     const f = fixture();

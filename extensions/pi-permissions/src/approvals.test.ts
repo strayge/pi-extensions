@@ -146,6 +146,88 @@ test("mixed-origin filesystem joins reuse immutable first-opening metadata witho
   }
 });
 
+test("cancelling a queued approval skips its dialog without releasing the active one", async () => {
+  const f = fixture();
+  try {
+    const cancelled = path.join(f.dir, "cancelled"); const next = path.join(f.dir, "next");
+    mkdirSync(cancelled); mkdirSync(next);
+    let answer!: (value: ApprovalAnswer) => void;
+    const requests: string[] = [];
+    f.owner.ask = (request) => {
+      requests.push(request.path);
+      return request.path === f.outside ? new Promise((resolve) => { answer = resolve; }) : Promise.resolve({ lifetime: "session" });
+    };
+    const first = f.owner.requestDirectory(f.outside, "read", "active");
+    const controller = new AbortController();
+    const second = f.owner.requestDirectory(cancelled, "read", "cancelled", controller.signal);
+    const rejected = assert.rejects(second, /abort/i);
+    const third = f.owner.requestDirectory(next, "read", "next");
+    assert.deepEqual(requests, [f.outside]);
+    controller.abort();
+    await rejected;
+    assert.deepEqual(requests, [f.outside]);
+    answer({ lifetime: "session" });
+    await Promise.all([first, third]);
+    assert.deepEqual(requests, [f.outside, next]);
+    assert.equal(f.owner.snapshot().grants.length, 2);
+  } finally { f.close(); }
+});
+
+test("queued approvals keep their original path identity before opening a dialog", async () => {
+  const f = fixture();
+  try {
+    const queued = path.join(f.dir, "queued"); mkdirSync(queued);
+    let answer!: (value: ApprovalAnswer) => void; let asked = 0;
+    f.owner.ask = () => { asked++; return new Promise((resolve) => { answer = resolve; }); };
+    const first = f.owner.requestDirectory(f.outside, "read", "active");
+    const second = assert.rejects(f.owner.requestDirectory(queued, "read", "queued"), /identity changed/);
+    renameSync(queued, `${queued}-old`); mkdirSync(queued);
+    answer({ lifetime: "session" });
+    await Promise.all([first, second]);
+    assert.equal(asked, 1);
+  } finally { f.close(); }
+});
+
+test("nested creation exceptions can reuse a sibling's queued approval without deadlocking", async () => {
+  const f = fixture(true);
+  try {
+    const target = path.join(f.outside, "new");
+    let answer!: (value: ApprovalAnswer) => void;
+    const requests: ApprovalRequest[] = [];
+    f.owner.ask = (request) => {
+      requests.push(request);
+      return request.kind === "directory" && request.path === target ? new Promise((resolve) => { answer = resolve; }) : Promise.resolve({ lifetime: "session" });
+    };
+    const first = f.owner.requestDirectory(target, "write", "create");
+    const sibling = assert.rejects(f.owner.authorize([target], "write", "sibling exception"), /Target changed/);
+    assert.equal(requests.length, 1);
+    answer({ lifetime: "session" });
+    await Promise.all([first, sibling]);
+    assert.deepEqual(requests.filter((request) => request.kind === "exception").map((request) => request.reason), ["sibling exception"]);
+    assert.equal(existsSync(target), true);
+    assert.equal(f.owner.snapshot().exceptions.length, 1);
+    assert.ok(f.owner.snapshot().grants.some((grant) => grant.binding.canonical === target));
+  } finally { f.close(); }
+});
+
+test("owner retirement cancels both active and queued approvals without opening another dialog", async () => {
+  const f = fixture();
+  try {
+    let asked = 0;
+    f.owner.ask = (_request, signal) => {
+      asked++;
+      return new Promise((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+    };
+    const first = f.owner.requestDirectory(f.outside, "read", "active");
+    const second = f.owner.requestDirectory(f.project, "read", "queued");
+    const rejected = [assert.rejects(first, /abort/i), assert.rejects(second, /abort/i)];
+    assert.equal(asked, 1);
+    f.owner.block("shutdown");
+    await Promise.all([...rejected, f.owner.drain()]);
+    assert.equal(asked, 1);
+  } finally { f.close(); }
+});
+
 test("owner retirement aborts active execution and drains its lease without cancelling ordinary mode switches", async () => {
   const f = fixture();
   try {

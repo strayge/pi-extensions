@@ -101,11 +101,11 @@ test("stale and aborted block answers never publish; a concurrent allow cannot b
   }
   const f = fixture(t); const file = path.join(f.target, "file");
   let answer!: (value: ApprovalAnswer) => void;
-  f.owner.ask = (request) => request.access === "write" ? new Promise((resolve) => { answer = resolve; }) : Promise.resolve({ action: "block" });
-  const pending = f.owner.requestGrant(file, "write", "pending allow");
-  const rejected = assert.rejects(pending, StaleAuthorityError);
-  await assert.rejects(f.owner.requestGrant(file, "read", "equal block"), /blocked/);
-  answer({ lifetime: "session" }); await rejected;
+  f.owner.ask = (request) => request.access === "read" ? new Promise((resolve) => { answer = resolve; }) : Promise.resolve({ lifetime: "session" });
+  const pending = f.owner.requestGrant(file, "read", "pending block");
+  const rejected = assert.rejects(pending, /blocked/);
+  const allow = assert.rejects(f.owner.requestGrant(file, "write", "queued allow"), /denied/);
+  answer({ action: "block" }); await Promise.all([rejected, allow]);
   assert.equal(f.owner.snapshot().grants.length, 0);
   assert.equal(decide(f.owner.snapshot(), bindPath(file), "write").action, "deny");
 });

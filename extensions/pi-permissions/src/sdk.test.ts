@@ -103,9 +103,12 @@ test("isolated SDK child keeps inherited direct and shell enforcement and sees p
     owner.ask = () => { entered(); return new Promise((resolve) => { answer = resolve; }); };
     const stale = read.execute("stale-child", { path: "sentinel" });
     await prompting;
-    await owner.changeGlobal({ kind: "save", scope: "tree", binding: bindPath(outside), access: "read" });
+    owner.select("yolo");
     answer({ lifetime: "session" });
     assert.match(JSON.stringify((await stale).content), /shared-live-grant/);
+    await owner.changeGlobal({ kind: "save", scope: "tree", binding: bindPath(outside), access: "read" });
+    owner.select("project");
+    assert.match(JSON.stringify((await read.execute("published-child", { path: "sentinel" })).content), /shared-live-grant/);
     assert.equal(owner.snapshot().grants.length, 0);
     assert.ok(!session.getAllTools().some((tool) => tool.name === "show_plan"));
   } finally {

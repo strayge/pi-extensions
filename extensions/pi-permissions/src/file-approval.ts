@@ -70,14 +70,18 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
 }
 
 export function networkUI(context: () => ExtensionContext, signal?: () => AbortSignal | undefined): NetAsk {
-  return async (host, port) => {
+  return async (host, port, callerSignal) => {
     const ctx = context();
     if (!ctx.hasUI) return "dismiss";
+    const ownerSignal = signal?.();
+    const cancellation = callerSignal && ownerSignal ? AbortSignal.any([callerSignal, ownerSignal]) : callerSignal ?? ownerSignal;
+    cancellation?.throwIfAborted();
     const choice = await ctx.ui.select(
       `Network access: ${host}${port ? `:${port}` : ""}`,
       ["Allow for this session", "Deny"],
-      { signal: signal?.() },
+      { signal: cancellation },
     );
+    cancellation?.throwIfAborted();
     return choice === "Allow for this session" ? "allow-session" : choice === "Deny" ? "deny" : "dismiss";
   };
 }
