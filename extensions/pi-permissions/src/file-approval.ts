@@ -23,6 +23,7 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
         `${request.kind === "exception" ? "Path-rule exception" : request.kind === "file" ? "File access" : "Directory access"} · ${request.access === "read" ? "Read-only" : "Read/write"}`,
         "",
         field("Path", directory),
+        ...(directory !== binding.canonical ? [field("Target", binding.canonical)] : []),
         ...(edited ? [field("Requested", request.path)] : []),
         field("Scope", scope),
         "",
@@ -30,6 +31,7 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
         request.reason,
         "",
         request.kind === "exception" ? `Note: This requires separate approval under a path rule.\n      ${blocking}` : `Note: ${blocking}`,
+        ...(request.kind !== "exception" ? ["", "Save globally", "Applies to all scoped profiles and projects.", "More-specific restrictions remain protected."] : []),
         ...(request.kind === "directory" && binding.missing.length ? [
           "",
           "On approval",

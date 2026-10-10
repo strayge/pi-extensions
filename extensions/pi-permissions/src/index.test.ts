@@ -195,7 +195,7 @@ test("global command routes distinguish declaration revocation from ordinary cle
   } finally { await f.close(); }
 });
 
-test("parallel filesystem and network requests keep each global confirmation with its approval", async () => {
+test("parallel global saves and network requests use one serialized dialog per approval", async () => {
   const f = fixture();
   try {
     const second = path.join(f.dir, "second"); mkdirSync(second);
@@ -217,7 +217,7 @@ test("parallel filesystem and network requests keep each global confirmation wit
     f.ctx.ui.select = (title) => title.startsWith("Network access:")
       ? respond("network", "Allow for this session")
       : respond(title.includes(f.other) ? "first" : "second", "Save globally");
-    f.ctx.ui.confirm = (_title, message) => respond(message.includes(f.other) ? "confirm first" : "confirm second", true);
+    f.ctx.ui.confirm = async () => assert.fail("Save globally is already an explicit approval");
     const results = await Promise.allSettled([
       f.execute("request_directory_access", { directory: f.other, access: "read", reason: "First directory" }),
       f.execute("request_directory_access", { directory: second, access: "read", reason: "Second directory" }),
@@ -226,7 +226,7 @@ test("parallel filesystem and network requests keep each global confirmation wit
     for (const result of results) {
       if (result.status === "rejected") throw result.reason;
     }
-    assert.deepEqual(dialogs, ["first", "confirm first", "second", "confirm second", "network"]);
+    assert.deepEqual(dialogs, ["first", "second", "network"]);
     assert.deepEqual(JSON.parse(readFileSync(f.global, "utf8")).pathRules, [
       { path: f.other, scope: "tree", read: "allow" },
       { path: second, scope: "tree", read: "allow" },
@@ -275,7 +275,7 @@ test("cancelled network tools skip queued dialogs and cannot publish late active
   }
 });
 
-test("fresh and retained global callbacks inherit filesystem origin while manual policy edits opt out", async () => {
+test("fresh and retained global saves need no second dialog while revoke and clear remain confirmed", async () => {
   const f = fixture();
   const marker = Symbol.for("pi-extensions:input-dialog");
   try {
@@ -293,7 +293,8 @@ test("fresh and retained global callbacks inherit filesystem origin while manual
     };
     f.ctx.ui.confirm = async (_title, _message, options) => {
       confirmations++;
-      assert.equal(Reflect.get(options!, marker), manual ? false : undefined);
+      assert.equal(manual, true);
+      assert.equal(Reflect.get(options!, marker), false);
       assert.equal(Reflect.get({ ...options }, marker), manual ? false : undefined);
       return true;
     };
@@ -310,7 +311,7 @@ test("fresh and retained global callbacks inherit filesystem origin while manual
       assert.deepEqual(JSON.parse(readFileSync(f.global, "utf8")).pathRules, []);
       for (const saved of [f.global, f.state]) assert.doesNotMatch(readFileSync(saved, "utf8"), /agentWait|input-dialog/);
     }
-    assert.equal(selections, 4); assert.equal(confirmations, 8);
+    assert.equal(selections, 4); assert.equal(confirmations, 4);
     for (const tool of f.tools.values()) assert.doesNotMatch(JSON.stringify(tool.parameters), /agentWait|input-dialog/);
   } finally { await f.close(); }
 });

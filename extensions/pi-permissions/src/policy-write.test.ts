@@ -589,6 +589,24 @@ test("committed global policy survives directory-flush and lock-cleanup failures
   } finally { t.mock.restoreAll(); syncBuiltinESMExports(); f.close(); }
 });
 
+test("cancelled and stale grant-menu answers cannot save global permissions without another confirmation", async () => {
+  for (const invalidation of ["cancel", "revision"] as const) {
+    const f = fixture();
+    try {
+      const controller = new AbortController();
+      const before = readFileSync(f.file, "utf8");
+      f.owner.confirmGlobal = async () => assert.fail("Global grant menus already confirm saves");
+      f.owner.ask = async () => {
+        if (invalidation === "cancel") controller.abort(); else f.owner.revoke();
+        return { lifetime: "global" };
+      };
+      await assert.rejects(f.owner.requestDirectory(f.outside, "read", "global save", controller.signal), invalidation === "cancel" ? { name: "AbortError" } : StaleAuthorityError);
+      assert.equal(readFileSync(f.file, "utf8"), before);
+      assert.equal(f.owner.snapshot().rules.length, 0);
+    } finally { f.close(); }
+  }
+});
+
 test("stale confirmations, external edits and cancellation cannot commit global changes", async () => {
   for (const change of ["revision", "document", "cancel"] as const) {
     const f = fixture();
@@ -647,34 +665,33 @@ test("absent policy is created as a v3 override retaining protections without ho
   } finally { f.close(); }
 });
 
-test("failed creation never removes a populated or replaced directory", async () => {
+test("failed creation never removes a populated or replaced directory", async (t) => {
   for (const change of ["populated", "replaced"] as const) {
     const f = fixture();
     try {
       const created = path.join(f.outside, "new");
-      f.owner.confirmGlobal = async () => {
+      t.mock.method(f.writer, "commit", () => {
         if (change === "replaced") { renameSync(created, `${created}-old`); mkdirSync(created); }
         else writeFileSync(path.join(created, "keep"), "KEEP");
-        return false;
-      };
-      await assert.rejects(f.owner.requestDirectory(created, "write", "cancel"), /cancelled/);
+        throw new Error("commit failed");
+      });
+      await assert.rejects(f.owner.requestDirectory(created, "write", "create"), /commit failed/);
       assert.equal(bindPath(created).missing.length, 0);
       if (change === "populated") assert.equal(readFileSync(path.join(created, "keep"), "utf8"), "KEEP");
       assert.equal(f.warnings.some((message) => message.includes("retained created directory")), true);
-    } finally { f.close(); }
+    } finally { t.mock.restoreAll(); f.close(); }
   }
 });
 
-test("failed pre-commit creation removes only the empty created directory and global-policy symlinks are rejected", async () => {
+test("failed pre-commit creation removes only the empty created directory and global-policy symlinks are rejected", async (t) => {
   const f = fixture();
   try {
     const created = path.join(f.outside, "new");
-    f.owner.confirmGlobal = async () => false;
-    f.owner.ask = async () => ({ lifetime: "global" });
-    await assert.rejects(f.owner.requestDirectory(created, "write", "cancel"), /cancelled/);
+    t.mock.method(f.writer, "commit", () => { throw new Error("commit failed"); });
+    await assert.rejects(f.owner.requestDirectory(created, "write", "create"), /commit failed/);
     assert.equal(bindPath(created).missing.length, 1);
-    f.owner.confirmGlobal = async () => true;
+    t.mock.restoreAll();
     rmSync(f.file); symlinkSync(path.join(f.outside, "missing-policy"), f.file);
     await assert.rejects(f.owner.changeGlobal({ kind: "clear" }), /ELOOP|symlink/i);
-  } finally { f.close(); }
+  } finally { t.mock.restoreAll(); f.close(); }
 });

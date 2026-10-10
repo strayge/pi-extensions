@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -38,7 +38,7 @@ test("directory approval chooses scope and lifetime in one menu", async (t) => {
       select: async (title, options) => {
         prompts++;
         assert.deepEqual(options, directoryOptions);
-        assert.equal(title, `Directory access · Read/write\n\nPath    ${f.directory}\nScope   Directory and all descendants\n\nReason\n${f.request.reason}\n\nNote: Blocking write access does not block reads.\n      Reads still require permission.`);
+        assert.equal(title, `Directory access · Read/write\n\nPath    ${f.directory}\nScope   Directory and all descendants\n\nReason\n${f.request.reason}\n\nNote: Blocking write access does not block reads.\n      Reads still require permission.\n\nSave globally\nApplies to all scoped profiles and projects.\nMore-specific restrictions remain protected.`);
         return choice;
       },
     }));
@@ -199,6 +199,20 @@ test("exact-file approval offers global saving without widening the scope", asyn
     },
   }));
   assert.deepEqual(await ask({ ...f.request, kind: "file" }), { action: "grant", lifetime: "global" });
+});
+
+test("global file approval displays the canonical target when the requested path is an alias", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.root, "file"); const alias = path.join(f.root, "alias");
+  writeFileSync(file, "NOTE"); symlinkSync(file, alias);
+  const ask = approvalUI(() => context(f.root, {
+    select: async (title) => {
+      assert.ok(title.includes(`Path    ${alias}\nTarget  ${file}\nScope   This file only`));
+      assert.ok(title.includes("Save globally\nApplies to all scoped profiles and projects."));
+      return "Save globally";
+    },
+  }));
+  assert.deepEqual(await ask({ ...f.request, kind: "file", path: alias }), { action: "grant", lifetime: "global" });
 });
 
 test("path-rule exceptions keep one menu without scope editing", async (t) => {

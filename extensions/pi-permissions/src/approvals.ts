@@ -208,12 +208,12 @@ export class PermissionOwner {
     return this.approvalQueue.run(() => this.changeGlobalNow(mutation, cancellation, agentWait), cancellation);
   }
 
-  private async changeGlobalNow(mutation: GlobalMutation, signal?: AbortSignal, agentWait = true): Promise<void> {
+  private async changeGlobalNow(mutation: GlobalMutation, signal?: AbortSignal, agentWait = true, approved = false): Promise<void> {
     this.snapshot();
     if (this.cacheStale) throw new Error("Permission cache is stale; restart before changing global authority");
     if (!this.policyWriter || !this.confirmGlobal) throw new Error("Global permission changes require the parent UI and trusted policy writer");
     const prepared = this.policyWriter.prepare(this.catalog, this.revision, mutation);
-    if (!(await this.confirmGlobal(prepared.preview, signal, agentWait))) throw new Error("Global permission change cancelled");
+    if (!approved && !(await this.confirmGlobal(prepared.preview, signal, agentWait))) throw new Error("Global permission change cancelled");
     signal?.throwIfAborted();
     const catalog = this.policyWriter.commit(prepared, (revision) => this.check(revision), signal);
     const previous = this.catalog;
@@ -404,7 +404,7 @@ export class PermissionOwner {
             binding = bindPath(binding.lexical);
             created = binding;
           }
-          if (answer.lifetime === "global") await this.changeGlobalNow({ kind: "save", binding, access: request.access, scope: "tree" }, signal, request.agentWait);
+          if (answer.lifetime === "global") await this.changeGlobalNow({ kind: "save", binding, access: request.access, scope: "tree" }, signal, request.agentWait, true);
           else {
             const grants = [...this.grants, { id: randomUUID(), binding, access: request.access, lifetime: answer.lifetime }];
             this.persist(this.mode, grants, this.exceptions, this.network.snapshot(), signal);
@@ -413,7 +413,7 @@ export class PermissionOwner {
         } else if (request.kind === "file") {
           if (answer.directory || answer.binding) throw new Error("Exact-file grants cannot edit directory scope");
           const binding = bindFile(frozen);
-          if (answer.lifetime === "global") await this.changeGlobalNow({ kind: "save", binding, access: request.access, scope: "file" }, signal, request.agentWait);
+          if (answer.lifetime === "global") await this.changeGlobalNow({ kind: "save", binding, access: request.access, scope: "file" }, signal, request.agentWait, true);
           else {
             const grants = [...this.grants, { id: randomUUID(), binding, access: request.access, lifetime: answer.lifetime }];
             this.persist(this.mode, grants, this.exceptions, this.network.snapshot(), signal);
