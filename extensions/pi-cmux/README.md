@@ -5,8 +5,9 @@ existing lifecycle, tool Feed, workspace metadata, notifications, and session
 resume behavior, with two additions:
 
 - **Background agents stay busy:** finishing the main turn does not publish Idle
-  while the `pi-subagents` manager has running or queued agents. Child sessions
-  cannot overwrite the parent workspace's status or resume binding.
+  while agents are running/queued or a background result is waiting for the
+  parent's automatic follow-up to finish. Child sessions cannot overwrite the
+  parent workspace's status or resume binding.
 - **Input dialogs request attention:** questions, agent permission approvals,
   and agent worktree confirmations send cmux's semantic “needs input” notification.
   Answering or cancelling resolves the wait; overlapping dialogs keep it active
@@ -69,8 +70,11 @@ remain supported.
 
 `pi-subagents` and `pi-ask` are optional. Without them, normal Pi lifecycle and
 native dialog notifications still work. Background tracking uses
-`Symbol.for("pi-subagents:manager")` (`hasRunning` / `waitForAll`). The manager
-reports running/queued agent records, not workflow-only phases with no active child.
+`Symbol.for("pi-subagents:manager")` (`hasRunning` / `waitForAll`). When its optional
+`getRecord` API is available, completion events and cards also track the parent
+handoff. Inline or RPC-consumed results do not require a follow-up turn. Older
+managers retain running/queued tracking only. Workflow-only phases with no active
+child remain outside this tracking.
 
 Input tracking uses the repository convention
 `Symbol.for("pi-extensions:input-dialog")`, not a built-in Pi API:

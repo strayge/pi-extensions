@@ -54,7 +54,14 @@ function payload(name: string): Record<string, unknown> {
   assert.ok(value, `Expected ${name} payload`);
   return value;
 }
-function background() {
+function background(
+  records: {
+    id: string;
+    description: string;
+    isBackground?: boolean;
+    resultConsumed?: boolean;
+  }[] = [],
+) {
   let running = true;
   let finishWait!: () => void;
   const finished = new Promise<void>((resolve) => {
@@ -63,6 +70,7 @@ function background() {
   let waits = 0;
   return {
     hasRunning: () => running,
+    getRecord: (id: string) => records.find((record) => record.id === id),
     waitForAll: () => {
       waits += 1;
       return finished;
@@ -122,13 +130,17 @@ function setup(options: { child?: boolean; hasUI?: boolean; transport?: boolean 
     input: async () => "value",
     custom,
   };
+  const branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]> = [];
   const ctx = {
     cwd: directory,
     mode: "tui",
     hasUI: options.hasUI ?? false,
     ui,
     isIdle: () => idle,
-    sessionManager: { getSessionId: () => (options.child ? "child" : "parent") },
+    sessionManager: {
+      getSessionId: () => (options.child ? "child" : "parent"),
+      getBranch: () => branch,
+    },
   } as unknown as ExtensionContext;
   let metadata = deferred();
   if (!options.transport) {
@@ -148,6 +160,7 @@ function setup(options: { child?: boolean; hasUI?: boolean; transport?: boolean 
     ctx,
     ui,
     handlers,
+    branch,
     idle(value: boolean) {
       idle = value;
     },
@@ -173,6 +186,23 @@ async function turn(harness: ReturnType<typeof setup>, text = "Done") {
   await harness.event("agent_settled");
   await flush();
 }
+function completionCard(
+  harness: ReturnType<typeof setup>,
+  record: { id: string; description: string },
+  others: { id: string; description: string }[] = [],
+): void {
+  harness.branch.push({
+    type: "custom_message",
+    id: `completion-${harness.branch.length}`,
+    parentId: harness.branch.at(-1)?.id ?? null,
+    timestamp: new Date().toISOString(),
+    customType: "subagent-notification",
+    content: "Review finished",
+    display: true,
+    details: { id: record.id, description: record.description, others },
+  });
+}
+
 const started = "@eko24ive/pi-ask:started";
 const completed = "@eko24ive/pi-ask:completed";
 const inputDialog = Symbol.for("pi-extensions:input-dialog");
@@ -300,6 +330,227 @@ test("running or queued background work defers completion without blocking settl
   assert.equal(hooks("notification").length, 0);
   manager.finish();
   await flush();
+  assert.equal(hooks("stop").length, 1);
+  await harness.event("session_shutdown");
+});
+
+for (const outcome of ["completed", "failed"]) {
+  test(`a ${outcome} background result waits for the parent's follow-up to settle`, async () => {
+    const record = {
+      id: "review",
+      description: "Review parsing",
+      isBackground: true,
+      resultConsumed: false,
+    };
+    const manager = background([record]);
+    registry[managerKey] = manager;
+    const harness = setup();
+    await harness.start();
+    await turn(harness);
+    harness.pi.events.emit(`subagents:${outcome}`, { id: record.id });
+    manager.finish();
+    await flush();
+    assert.equal(hooks("notification").length, 0);
+    assert.equal(hooks("stop").length, 0);
+
+    harness.idle(false);
+    await harness.event("agent_start");
+    await flush();
+    assert.equal(hooks("notification").length, 0);
+    completionCard(harness, record);
+    await harness.event("agent_end", {
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Review handled" }] }],
+    });
+    harness.idle(true);
+    harness.pi.events.emit("subagents:rpc:consume", { agentId: "unrelated" });
+    await flush();
+    assert.equal(hooks("notification").length, 0);
+    assert.equal(hooks("stop").length, 0);
+    await harness.event("agent_settled");
+    await flush();
+    assert.equal(hooks("notification").length, 1);
+    assert.equal(hooks("stop").length, 1);
+    assert.equal(payload("stop").last_assistant_message, "Review handled");
+    await harness.event("agent_settled");
+    await flush();
+    assert.equal(hooks("notification").length, 1);
+    await harness.event("session_shutdown");
+  });
+}
+
+test("an inline-consumed background result needs no parent wake-up", async () => {
+  const record = { id: "review", description: "Review", isBackground: true, resultConsumed: true };
+  const manager = background([record]);
+  registry[managerKey] = manager;
+  const harness = setup();
+  await harness.start();
+  await turn(harness);
+  harness.pi.events.emit("subagents:completed", { id: record.id });
+  manager.finish();
+  await flush();
+  assert.equal(hooks("notification").length, 1);
+  assert.equal(hooks("stop").length, 1);
+  await harness.event("session_shutdown");
+});
+
+for (const listenerOrder of ["before", "after"]) {
+  test(`RPC consumption releases a held completion (${listenerOrder} bridge subscription)`, async () => {
+    const record = {
+      id: "review",
+      description: "Review",
+      isBackground: true,
+      resultConsumed: false,
+    };
+    const manager = background([record]);
+    registry[managerKey] = manager;
+    const harness = setup();
+    const consume = () => {
+      record.resultConsumed = true;
+    };
+    if (listenerOrder === "before") harness.pi.events.on("subagents:rpc:consume", consume);
+    await harness.start();
+    if (listenerOrder === "after") harness.pi.events.on("subagents:rpc:consume", consume);
+    await turn(harness);
+    harness.pi.events.emit("subagents:completed", { id: record.id });
+    manager.finish();
+    await flush();
+    assert.equal(hooks("stop").length, 0);
+    harness.pi.events.emit("subagents:rpc:consume", { agentId: record.id });
+    await flush();
+    assert.equal(hooks("notification").length, 1);
+    assert.equal(hooks("stop").length, 1);
+    await harness.event("session_shutdown");
+  });
+}
+
+test("a previous completion card cannot release a resumed agent's pending result", async () => {
+  const record = { id: "review", description: "Review", isBackground: true, resultConsumed: false };
+  const manager = background([record]);
+  registry[managerKey] = manager;
+  const harness = setup();
+  await harness.start();
+  await turn(harness);
+  completionCard(harness, record);
+  harness.pi.events.emit("subagents:completed", { id: record.id });
+  manager.finish();
+  await flush();
+  await turn(harness, "Unrelated parent turn");
+  assert.equal(hooks("notification").length, 0);
+  assert.equal(hooks("stop").length, 0);
+  completionCard(harness, record);
+  await turn(harness, "New review handled");
+  assert.equal(hooks("notification").length, 1);
+  assert.equal(hooks("stop").length, 1);
+  await harness.event("session_shutdown");
+});
+
+for (const firstCard of ["held", "already delivered"]) {
+  test(`consuming a resumed run preserves its ${firstCard} earlier completion`, async () => {
+    const record = {
+      id: "review",
+      description: "Review",
+      isBackground: true,
+      resultConsumed: false,
+    };
+    const manager = background([record]);
+    registry[managerKey] = manager;
+    const harness = setup();
+    await harness.start();
+    await turn(harness);
+    harness.pi.events.emit("subagents:completed", { id: record.id });
+    if (firstCard === "already delivered") completionCard(harness, record);
+    harness.pi.events.emit("subagents:started", { id: record.id });
+    harness.pi.events.emit("subagents:completed", { id: record.id });
+    manager.finish();
+    await flush();
+    record.resultConsumed = true;
+    harness.pi.events.emit("subagents:rpc:consume", { agentId: record.id });
+    await flush();
+    assert.equal(hooks("notification").length, 0);
+    assert.equal(hooks("stop").length, 0);
+    if (firstCard === "held") {
+      completionCard(harness, {
+        id: record.id,
+        description: `${record.description} (earlier run)`,
+      });
+    }
+    await turn(harness, "Earlier review handled");
+    assert.equal(hooks("notification").length, 1);
+    assert.equal(hooks("stop").length, 1);
+    await harness.event("session_shutdown");
+  });
+}
+
+test("an earlier-run card is counted once across multiple same-ID resumes", async () => {
+  const record = { id: "review", description: "Review", isBackground: true, resultConsumed: false };
+  const manager = background([record]);
+  registry[managerKey] = manager;
+  const harness = setup();
+  await harness.start();
+  await turn(harness);
+  harness.pi.events.emit("subagents:completed", { id: record.id });
+  for (let run = 0; run < 2; run += 1) {
+    harness.pi.events.emit("subagents:started", { id: record.id });
+    harness.pi.events.emit("subagents:completed", { id: record.id });
+  }
+  manager.finish();
+  record.resultConsumed = true;
+  harness.pi.events.emit("subagents:rpc:consume", { agentId: record.id });
+  await flush();
+  assert.equal(hooks("stop").length, 0);
+  const earlier = { id: record.id, description: `${record.description} (earlier run)` };
+  completionCard(harness, earlier);
+  await turn(harness, "One earlier result handled");
+  assert.equal(hooks("stop").length, 0);
+  await turn(harness, "Unrelated follow-up");
+  assert.equal(hooks("stop").length, 0);
+  completionCard(harness, earlier);
+  await turn(harness, "Both earlier results handled");
+  assert.equal(hooks("notification").length, 1);
+  assert.equal(hooks("stop").length, 1);
+  await harness.event("session_shutdown");
+});
+
+test("grouped completion cards acknowledge every background result", async () => {
+  const records = ["first", "second"].map((id) => ({
+    id,
+    description: id,
+    isBackground: true,
+    resultConsumed: false,
+  }));
+  const manager = background(records);
+  registry[managerKey] = manager;
+  const harness = setup();
+  await harness.start();
+  await turn(harness);
+  for (const record of records) harness.pi.events.emit("subagents:completed", { id: record.id });
+  manager.finish();
+  await flush();
+  assert.equal(hooks("stop").length, 0);
+  const [first, second] = records;
+  assert.ok(first);
+  assert.ok(second);
+  completionCard(harness, first, [second]);
+  await turn(harness, "Both reviews handled");
+  assert.equal(hooks("notification").length, 1);
+  assert.equal(hooks("stop").length, 1);
+  await harness.event("session_shutdown");
+});
+
+test("session reactivation discards pending result handoffs", async () => {
+  const record = { id: "review", description: "Review", isBackground: true, resultConsumed: false };
+  const manager = background([record]);
+  registry[managerKey] = manager;
+  const harness = setup();
+  await harness.start();
+  await turn(harness);
+  harness.pi.events.emit("subagents:completed", { id: record.id });
+  manager.finish();
+  await flush();
+  assert.equal(hooks("stop").length, 0);
+  await harness.start();
+  await turn(harness);
+  assert.equal(hooks("notification").length, 1);
   assert.equal(hooks("stop").length, 1);
   await harness.event("session_shutdown");
 });

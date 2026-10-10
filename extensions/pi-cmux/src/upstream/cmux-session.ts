@@ -26,14 +26,25 @@ interface CompletionClaim extends PendingCompletion {
   notificationRouted?: boolean;
 }
 
+interface PendingSubagentResult {
+  id: string;
+  record: PiSubagentRecord;
+  current: boolean;
+  description: string;
+  afterEntryId?: string;
+}
+
 interface SessionState {
   activeTurnId?: string;
   pendingCompletion?: PendingCompletion;
   completionClaim?: CompletionClaim;
   workRevision: number;
+  parentSettled: boolean;
   feedDeliveryFailed: boolean;
   stopped: boolean;
   pendingDialogs: number;
+  pendingSubagentResults: Set<PendingSubagentResult>;
+  handledSubagentCards: Set<string>;
   toolCommands: Map<string, string>;
 }
 interface CommandResult {
@@ -408,13 +419,75 @@ function assistantCompletionFrom(event: unknown): AssistantCompletion {
 const childExtensionUIMarker = Symbol.for("pi-subagents:child-extension-ui");
 const subagentManagerKey = Symbol.for("pi-subagents:manager");
 
+interface PiSubagentRecord {
+  isBackground?: boolean;
+  resultConsumed?: boolean;
+  description: string;
+}
+
 interface PiSubagentManager {
   hasRunning(): boolean;
   waitForAll(): Promise<void>;
+  getRecord?(id: string): PiSubagentRecord | undefined;
 }
 
 function subagentManager(): PiSubagentManager | undefined {
   return (globalThis as unknown as Record<symbol, PiSubagentManager | undefined>)[subagentManagerKey];
+}
+
+function hasPendingSubagentResults(state: SessionState): boolean {
+  for (const pending of state.pendingSubagentResults) {
+    // A resumed record is mutable; consuming its latest run must not discard
+    // an earlier invocation's still-undelivered completion nudge.
+    if (pending.current && pending.record.resultConsumed === true) {
+      state.pendingSubagentResults.delete(pending);
+    }
+  }
+  if (state.pendingSubagentResults.size === 0) state.handledSubagentCards.clear();
+  return state.pendingSubagentResults.size > 0;
+}
+
+function deliveredSubagentResults(state: SessionState, ctx: ExtensionContext): Map<PendingSubagentResult, string> {
+  const delivered = new Map<PendingSubagentResult, string>();
+  if (state.pendingSubagentResults.size === 0) return delivered;
+  const pending = new Set([...state.pendingSubagentResults].reverse());
+  const branch = ctx.sessionManager.getBranch();
+  for (let index = branch.length - 1; index >= 0 && pending.size > 0; index -= 1) {
+    const entry = branch[index]!;
+    // A historical card with the same agent ID cannot acknowledge a new run.
+    for (const result of pending) {
+      if (entry.id === result.afterEntryId) pending.delete(result);
+    }
+    if (entry.type !== "custom_message" || entry.customType !== "subagent-notification") continue;
+    const others = objectValue(entry.details, ["others"]);
+    const notifications = [entry.details, ...(Array.isArray(others) ? others : [])];
+    for (const [index, details] of notifications.entries()) {
+      const cardKey = `${entry.id}:${index}`;
+      if (state.handledSubagentCards.has(cardKey)) continue;
+      const id = firstString(objectValue(details, ["id"]));
+      for (const result of pending) {
+        if (result.id !== id || objectValue(details, ["description"]) !== result.description) continue;
+        delivered.set(result, cardKey);
+        pending.delete(result);
+        // Several earlier runs can share the same ID and label. Each card
+        // acknowledges one invocation, not every run with matching metadata.
+        break;
+      }
+    }
+  }
+  return delivered;
+}
+
+function supersedeSubagentResults(state: SessionState, ctx: ExtensionContext, id: string): void {
+  if (![...state.pendingSubagentResults].some((pending) => pending.id === id && pending.current)) return;
+  const delivered = deliveredSubagentResults(state, ctx);
+  for (const pending of state.pendingSubagentResults) {
+    if (pending.id !== id || !pending.current) continue;
+    pending.current = false;
+    // pi-subagents labels older invocations when it builds their delayed card;
+    // cards already in the transcript retain their original description.
+    if (!delivered.has(pending)) pending.description += " (earlier run)";
+  }
 }
 
 function isChildSession(ctx: ExtensionContext): boolean {
@@ -442,9 +515,12 @@ function stateFor(sessionStates: Map<string, SessionState>, sessionId: string): 
   if (!state) {
     state = {
       workRevision: 0,
+      parentSettled: true,
       feedDeliveryFailed: false,
       stopped: false,
       pendingDialogs: 0,
+      pendingSubagentResults: new Set(),
+      handledSubagentCards: new Set(),
       toolCommands: new Map(),
     };
     sessionStates.set(sessionId, state);
@@ -1858,7 +1934,7 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
   const sessionStates = new Map<string, SessionState>();
   const lifecycleTasks = createPiLifecycleQueue();
   let restorePiUIDialogHooks: (() => void) | undefined;
-  let unsubscribeSubagentStarted: (() => void) | undefined;
+  let unsubscribeSubagents: (() => void) | undefined;
   const waitingForSubagents = new WeakSet<SessionState>();
 
   const enqueueLifecycleTask = (
@@ -1872,7 +1948,7 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
     const sessionId = context.sessionId;
     if (!sessionId || !ctx.isIdle()) return;
     const state = sessionStates.get(sessionId);
-    if (!state || (!state.pendingCompletion && !state.completionClaim)
+    if (!state || !state.parentSettled || (!state.pendingCompletion && !state.completionClaim)
       || state.stopped || state.pendingDialogs > 0) return;
     const manager = subagentManager();
     if (manager?.hasRunning()) {
@@ -1892,11 +1968,15 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
       });
       return;
     }
+    // Runner settlement precedes the completion nudge that wakes the parent.
+    // Keep Busy until that result is consumed or a parent run handles its card.
+    if (hasPendingSubagentResults(state)) return;
     const completion = settleTurn(state, context);
     if (!completion || completion.queued) return;
     const ownsClaim = () => sessionStates.get(sessionId) === state && state.completionClaim === completion;
-    const canPublish = () => ownsClaim() && ctx.isIdle()
-      && state.pendingDialogs === 0 && !subagentManager()?.hasRunning();
+    const canPublish = () => ownsClaim() && ctx.isIdle() && state.parentSettled
+      && state.pendingDialogs === 0 && !subagentManager()?.hasRunning()
+      && !hasPendingSubagentResults(state);
     completion.queued = true;
     void enqueueLifecycleTask(sessionId, completion.context, async () => {
       try {
@@ -1912,12 +1992,15 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     if (isChildSession(ctx)) return;
-    unsubscribeSubagentStarted?.();
-    unsubscribeSubagentStarted = pi.events.on("subagents:started", () => {
+    unsubscribeSubagents?.();
+    const subscriptions = [pi.events.on("subagents:started", (event) => {
       const context = snapshotContext(ctx);
       const sessionId = context.sessionId;
-      if (!sessionId || !ctx.isIdle()) return;
+      if (!sessionId) return;
       const state = stateFor(sessionStates, sessionId);
+      const id = firstString(objectValue(event, ["id"]));
+      if (id) supersedeSubagentResults(state, ctx, id);
+      if (!ctx.isIdle()) return;
       if (state.activeTurnId) return;
       // Scheduled and @handle spawns can start without a parent model turn.
       const turnId = beginTurn(sessionStates, sessionId, {});
@@ -1930,7 +2013,37 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
         sendHook(dispatcher, "prompt-submit", context, { turn_id: turnId })
       ));
       publishCompletionWhenIdle(ctx);
-    });
+    })];
+    const onSubagentComplete = (event: unknown): void => {
+      const sessionId = sessionIdFrom(ctx);
+      const state = sessionId ? sessionStates.get(sessionId) : undefined;
+      const id = firstString(objectValue(event, ["id"]));
+      const record = id ? subagentManager()?.getRecord?.(id) : undefined;
+      if (!state || !id || !record) return;
+      supersedeSubagentResults(state, ctx, id);
+      if (!record.isBackground || record.resultConsumed === true) return;
+      state.pendingSubagentResults.add({
+        id,
+        record,
+        current: true,
+        description: record.description,
+        afterEntryId: ctx.sessionManager.getBranch().at(-1)?.id,
+      });
+    };
+    subscriptions.push(
+      pi.events.on("subagents:completed", onSubagentComplete),
+      pi.events.on("subagents:failed", onSubagentComplete),
+      pi.events.on("subagents:rpc:consume", () => {
+        // Consumption cancels the nudge without starting a parent turn. Recheck
+        // after all RPC listeners have updated the record, regardless of order.
+        const sessionId = sessionIdFrom(ctx);
+        const state = sessionId ? sessionStates.get(sessionId) : undefined;
+        queueMicrotask(() => {
+          if (sessionId && sessionStates.get(sessionId) === state) publishCompletionWhenIdle(ctx);
+        });
+      }),
+    );
+    unsubscribeSubagents = () => { for (const unsubscribe of subscriptions) unsubscribe(); };
     const context = snapshotContext(ctx);
     const sessionId = context.sessionId;
     if (sessionId) {
@@ -1961,6 +2074,7 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
     const context = snapshotContext(ctx);
     const sessionId = context.sessionId;
     if (!sessionId) return;
+    stateFor(sessionStates, sessionId).parentSettled = false;
     const turnId = beginTurn(sessionStates, sessionId, event);
     enqueueLifecycleTask(sessionId, context, () => (
       sendHook(dispatcher, "prompt-submit", context, { prompt: event.prompt, turn_id: turnId })
@@ -1971,6 +2085,7 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
     const context = snapshotContext(ctx);
     const sessionId = context.sessionId;
     if (!sessionId) return;
+    stateFor(sessionStates, sessionId).parentSettled = false;
     // Idle sendMessage({ triggerTurn: true }) skips before_agent_start.
     // Normal prompts, retries, and queued continuations already own a turn;
     // keep that ID and its pending completion until agent_settled claims it.
@@ -2039,6 +2154,10 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
     const sessionId = context.sessionId;
     if (!sessionId) return;
     const state = stateFor(sessionStates, sessionId);
+    for (const [result, cardKey] of deliveredSubagentResults(state, ctx)) {
+      state.pendingSubagentResults.delete(result);
+      state.handledSubagentCards.add(cardKey);
+    }
     const assistantCompletion = assistantCompletionFrom(event);
     // Preserve the latest low-level result until Pi confirms no automatic work remains.
     state.pendingCompletion = {
@@ -2050,13 +2169,15 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    const sessionId = sessionIdFrom(ctx);
+    if (sessionId) stateFor(sessionStates, sessionId).parentSettled = true;
     publishCompletionWhenIdle(ctx);
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
     if (isChildSession(ctx)) return;
-    unsubscribeSubagentStarted?.();
-    unsubscribeSubagentStarted = undefined;
+    unsubscribeSubagents?.();
+    unsubscribeSubagents = undefined;
     const context = snapshotContext(ctx);
     const sessionId = context.sessionId;
     if (!sessionId) {
