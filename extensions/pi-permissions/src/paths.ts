@@ -75,6 +75,27 @@ export function assertBinding(binding: PathBinding, allowCreated = false): void 
     throw new Error(`Filesystem identity changed or is unavailable: ${binding.lexical}`);
 }
 
+/** Concurrent parent creation may advance a new write's binding, but never adopt a new leaf or symlink. */
+export function refreshWriteBinding(binding: PathBinding): PathBinding {
+  if (!binding.missing.length) {
+    assertBinding(binding);
+    return binding;
+  }
+  assertBinding(binding, true);
+  const current = bindPath(binding.lexical);
+  if (current.canonical !== binding.canonical || !current.missing.length)
+    throw new Error(`Write target changed: ${binding.lexical}`);
+  let parent = binding.prefix;
+  for (const component of binding.missing.slice(0, binding.missing.length - current.missing.length)) {
+    parent = path.join(parent, component);
+    if (!lstatSync(parent).isDirectory()) throw new Error(`Write parent is not a real directory: ${parent}`);
+  }
+  assertBinding(binding, true);
+  // Other mkdir workers may still add parents; once only the leaf is missing, validation stays strict.
+  assertBinding(current, current.missing.length > 1);
+  return current;
+}
+
 /** Atomic replacement changes the leaf object, not the authority granted to its name. */
 export function bindFile(binding: PathBinding): FileBinding {
   assertBinding(binding);

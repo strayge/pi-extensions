@@ -7,7 +7,8 @@ import {
   createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { PermissionOwner } from "./approvals.ts";
-import { assertBinding, bindPath, modelPath, readPath } from "./paths.ts";
+import { assertBinding, modelPath, readPath, refreshWriteBinding } from "./paths.ts";
+import { decide } from "./policy.ts";
 import type { FilesystemSnapshot, PathBinding } from "./schema.ts";
 
 /** Operations close over the authorized native target; Pi keeps the original input for display. */
@@ -101,19 +102,26 @@ export function createDirectTools(getOwner: () => PermissionOwner | undefined, c
         if (!owner) return createWriteToolDefinition(ctx.cwd || cwd).execute(...args);
         return owner.run([selected], "write", "Write file", signal, async (snapshot, [initial], signal) => {
           let target = initial!;
+          const parents = [target];
+          const checkWrite = () => {
+            signal.throwIfAborted();
+            owner.check(snapshot.revision);
+            // Advancing the binding must not forget any previously captured ancestor identity.
+            for (const parent of parents) assertBinding(parent, true);
+            const refreshed = refreshWriteBinding(target);
+            if (refreshed.prefix !== target.prefix) parents.push(refreshed);
+            target = refreshed;
+            if (decide(snapshot, target, "write").action !== "allow")
+              throw new Error(`Filesystem access denied: ${selected}`);
+          };
           const ops = {
             mkdir: async () => {
-              check(owner, snapshot, target, signal);
+              checkWrite();
               await mkdir(path.dirname(selected), { recursive: true });
-              signal?.throwIfAborted();
-              const after = bindPath(selected);
-              // Only the parent creation belongs to this operation; a new final entry is a race.
-              if (after.canonical !== target.canonical || (target.missing.length && !after.missing.length))
-                throw new Error(`Write target changed: ${selected}`);
-              target = after;
+              checkWrite();
             },
             writeFile: async (_path: string, text: string) => {
-              check(owner, snapshot, target, signal);
+              checkWrite();
               await writeFile(selected, text, { signal });
             },
           };
