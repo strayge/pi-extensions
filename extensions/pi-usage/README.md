@@ -4,8 +4,9 @@ Provider usage for [pi](https://github.com/earendil-works/pi): how much of the
 current account's quota is left, in the statusline and behind `/usage`.
 
 Supports OpenAI ChatGPT subscription windows for `/login openai` (`openai`)
-and legacy `openai-codex` sessions, OpenRouter API-key spend limits, and OpenCode
-Go usage windows, without pretending those limits mean the same thing.
+and legacy `openai-codex` sessions, Claude subscription limits for `/login anthropic`,
+OpenRouter API-key spend limits, and OpenCode Go usage windows, without pretending
+those limits mean the same thing.
 
 ## Installation
 
@@ -73,6 +74,24 @@ bucket matching the current Codex model is preferred when one is available. See
 
 There is no Codex CLI fallback: the CLI may be logged into a different account
 than pi's active runtime account.
+
+### Claude subscription (`anthropic`)
+
+Session, weekly, and model-scoped subscription limits from Anthropic's OAuth
+usage endpoint, using pi's active `/login anthropic` credential. Both legacy
+window fields and structured `limits` responses are supported, including reset
+times and extra-usage availability and percentage when supplied.
+
+Statusline: `anthropic [███┃░░░░] 41% 3h 12m`, with additional windows shown
+according to the display configuration. Structured session limits without a
+window duration have no pace marker or exhaustion projection.
+
+Ordinary API keys, environment-only tokens, custom/proxy endpoints, and
+Claude Code's separate credential stores are not used. Token refresh remains
+owned by pi. The endpoint is undocumented and can rate-limit requests; the
+existing five-minute cache and failure backoff apply. Requests time out after
+five seconds. Extra-usage credit balances are omitted because their units are
+undocumented.
 
 ### OpenRouter (`openrouter`)
 
@@ -434,7 +453,8 @@ fixed.
 
 ## Limitations
 
-- Only providers with a stable usage source and pi-resolvable runtime auth are supported.
+- Only providers with a supported usage source and pi-resolvable runtime auth are supported.
+- Anthropic's subscription usage endpoint is undocumented and may change.
 - OpenCode Go's usage endpoint does not provide window-start timestamps, so pace markers and exhaustion projections are unavailable for those windows.
 - Reports are snapshots and may themselves lag on the provider's side.
 - OpenRouter does not expose proactive request-rate counters on successful inference responses.

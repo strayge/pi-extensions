@@ -856,10 +856,10 @@ test("unsupported providers remain visible without publishing an error status", 
   const command = mock.commands.get("usage");
   assert.ok(command);
   const unsupportedModel = {
-    id: "claude",
-    name: "Claude",
-    provider: "anthropic",
-    baseUrl: "https://api.anthropic.com",
+    id: "test-model",
+    name: "Test model",
+    provider: "test-provider",
+    baseUrl: "https://unsupported.example.test",
   };
   let title = "";
   const { ctx, statuses } = createMockContext({
@@ -871,7 +871,7 @@ test("unsupported providers remain visible without publishing an error status", 
       return "Close";
     },
     modelRegistry: {
-      getProviderDisplayName: () => "Anthropic",
+      getProviderDisplayName: () => "Test provider",
       getAvailable: () => [],
       getAll: () => [],
     },

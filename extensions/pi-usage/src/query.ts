@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { validateHeaderValue } from "node:http";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { abortError, errorMessage, fingerprintResolvedAuth, redactUsageError } from "./core.ts";
+import { normalizeAnthropicUsagePayload } from "./providers/anthropic.ts";
 import {
   enrichCodexResetCreditExpirations,
   isCodexProvider,
@@ -32,6 +33,7 @@ const CODEX_REDEMPTION_CODES = new Set<CodexResetCreditRedemptionCode>([
 ]);
 const CODEX_ACCOUNT_CLAIM = "https://api.openai.com/auth";
 const CODEX_ACCOUNT_HEADER = "ChatGPT-Account-Id";
+const ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const MAX_SUCCESS_BODY_BYTES = 64 * 1024;
@@ -85,6 +87,28 @@ const CODEX_ADAPTER: UsageProviderAdapter = {
 export const SUPPORTED_ADAPTERS: readonly UsageProviderAdapter[] = [
   { ...CODEX_ADAPTER, id: "openai", displayName: "OpenAI" },
   CODEX_ADAPTER,
+  {
+    id: "anthropic",
+    displayName: "Anthropic",
+    semantics: { kind: "consumer-subscription", label: "Claude subscription limits" },
+    async query(auth, signal, timeoutMs) {
+      const payload = await fetchProviderJson(
+        ANTHROPIC_USAGE_URL,
+        {
+          ...auth,
+          headers: {
+            ...auth.headers,
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+          },
+        },
+        signal,
+        Math.min(timeoutMs, 5_000),
+        "Anthropic usage endpoint",
+      );
+      return normalizeAnthropicUsagePayload(payload, Date.now());
+    },
+  },
   {
     id: "openrouter",
     displayName: "OpenRouter",
@@ -164,18 +188,33 @@ export async function resolveUsageAuth(
       `${adapter.displayName} usage cannot send a proxy-resolved credential to the official usage endpoint.`,
     );
   }
-  // The OpenAI provider accepts both API keys and ChatGPT subscriptions. Only
-  // its resolved OAuth credential belongs at the ChatGPT usage endpoint.
-  if (adapter.id === "openai") {
+  // Subscription usage endpoints must never receive API-key credentials or
+  // authorization overrides belonging to a different runtime account.
+  if (adapter.id === "openai" || adapter.id === "anthropic") {
+    const target = adapter.id === "openai" ? "ChatGPT" : "Claude";
     if (providerResult?.source !== "OAuth" || !providerResult.auth.apiKey) return undefined;
     // Provider headers can override both registry views without changing the
     // OAuth source label; the underlying token remains the authority.
     const oauthAuthorization = `Bearer ${providerResult.auth.apiKey}`;
-    if (authorizationFrom(providerResult.auth) !== oauthAuthorization) {
-      throw new Error("OpenAI usage cannot send overridden provider authorization to ChatGPT.");
+    const hasOverride = (auth: RequestAuth) =>
+      authorizationFrom(auth) !== oauthAuthorization ||
+      (adapter.id === "anthropic" &&
+        Object.entries(auth.headers ?? {}).some(([name, value]) => {
+          const key = name.toLowerCase();
+          return (
+            (key === "authorization" && value !== oauthAuthorization) ||
+            (key === "x-api-key" && value !== providerResult.auth.apiKey)
+          );
+        }));
+    if (hasOverride(providerResult.auth)) {
+      throw new Error(
+        `${adapter.displayName} usage cannot send overridden provider authorization to ${target}.`,
+      );
     }
-    if (modelAuth && authorizationFrom(modelAuth) !== oauthAuthorization) {
-      throw new Error("OpenAI usage cannot send overridden model authorization to ChatGPT.");
+    if (modelAuth && hasOverride(modelAuth)) {
+      throw new Error(
+        `${adapter.displayName} usage cannot send overridden model authorization to ${target}.`,
+      );
     }
   }
   const auth = modelAuth ?? providerResult?.auth;
@@ -461,6 +500,7 @@ function hasOfficialUrlOrigin(value: string, providerId: string): boolean {
   const expected = {
     openai: "https://api.openai.com",
     "openai-codex": "https://chatgpt.com",
+    anthropic: "https://api.anthropic.com",
     openrouter: "https://openrouter.ai",
     "opencode-go": "https://opencode.ai",
   }[providerId];

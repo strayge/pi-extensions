@@ -53,7 +53,8 @@ export function formatUsageReport(
 
   if (isCodexProvider(report.providerId)) formatCodexReport(lines, report, config, now);
   else if (report.providerId === "openrouter") formatOpenRouterReport(lines, report, config);
-  else if (report.providerId === "opencode-go") formatOpenCodeGoReport(lines, report, config, now);
+  else if (report.providerId === "opencode-go" || report.providerId === "anthropic")
+    formatWindowReport(lines, report, config, now);
   else formatGenericReport(lines, report, config);
 
   if (report.notes) {
@@ -87,7 +88,8 @@ export function formatUsageSegments(
 ): UsageSegment[] | undefined {
   if (isCodexProvider(report.providerId)) return codexSegments(report, config, now, model);
   if (report.providerId === "openrouter") return openRouterSegments(report, config, now);
-  if (report.providerId === "opencode-go") return openCodeGoSegments(report, config, now);
+  if (report.providerId === "opencode-go" || report.providerId === "anthropic")
+    return windowSegments(report, config, now);
   return undefined;
 }
 
@@ -239,7 +241,7 @@ function formatOpenRouterReport(
   }
 }
 
-function formatOpenCodeGoReport(
+function formatWindowReport(
   lines: string[],
   report: UsageReport,
   config: UsageDisplayConfig,
@@ -248,6 +250,11 @@ function formatOpenCodeGoReport(
   for (const bucket of report.buckets) {
     lines.push(
       `${`${bucket.label} limit:`.padEnd(VALUE_COLUMN)}${formatReportCell(bucket, config, now)}`,
+    );
+  }
+  for (const metric of report.metrics) {
+    lines.push(
+      `${`${metric.label}:`.padEnd(VALUE_COLUMN)}${formatMetricValue(metric.value, metric.unit)}`,
     );
   }
 }
@@ -434,7 +441,7 @@ function formatProjection(
   return verbose ? `empty in ~${duration}` : `empty ${duration}`;
 }
 
-function openCodeGoSegments(
+function windowSegments(
   report: UsageReport,
   config: UsageDisplayConfig,
   now: number,
@@ -446,7 +453,7 @@ function openCodeGoSegments(
   if (cells.length === 0) return undefined;
 
   return cells.flatMap((cell, index) => [
-    { text: index === 0 ? "opencode-go " : config.statusline.separator },
+    { text: index === 0 ? `${report.providerId} ` : config.statusline.separator },
     ...cell,
   ]);
 }
