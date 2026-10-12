@@ -333,6 +333,52 @@ function harness(f: ReturnType<typeof fixture>, initialCwd: string) {
   };
 }
 
+test("model-facing worktree parameters serialize as a root object", () => {
+  const f = fixture();
+  try {
+    const h = harness(f, f.main);
+    const parameters = JSON.parse(JSON.stringify(h.active.tool.parameters));
+    assert.equal(parameters.type, "object");
+    assert.equal(parameters.anyOf, undefined);
+    assert.deepEqual(parameters.required, ["action"]);
+    assert.ok(parameters.properties.branch);
+    assert.ok(parameters.properties.base);
+    assert.ok(parameters.properties.path);
+  } finally {
+    f.close();
+  }
+});
+
+test("action-specific required arguments are rejected before queuing a proposal", async () => {
+  const f = fixture();
+  try {
+    const h = harness(f, f.main);
+    for (const request of [
+      { action: "create" },
+      { action: "create", branch: "" },
+      { action: "switch" },
+      { action: "switch", path: "" },
+    ]) {
+      await assert.rejects(
+        h.active.tool.execute(
+          "invalid",
+          request,
+          new AbortController().signal,
+          undefined,
+          h.active.ctx as unknown as Parameters<ToolDefinition["execute"]>[4],
+        ),
+        /Invalid worktree request/,
+      );
+    }
+    assert.equal(h.pending.length, 0);
+    assert.equal(h.operations.length, 0);
+    assert.equal(h.dialogs.length, 0);
+    assert.equal(h.active.manager.getBranch().length, 0);
+  } finally {
+    f.close();
+  }
+});
+
 test("prefilled create has one confirmation and carries the active conversation and pending result", async () => {
   const f = fixture();
   try {

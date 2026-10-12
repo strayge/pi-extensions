@@ -6,7 +6,8 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
+import { Value } from "typebox/value";
 import {
   assertTargetFilesystemAvailable,
   executeRemoval,
@@ -44,11 +45,19 @@ const APPROVAL = "worktree-approved";
 const OUTCOME = "worktree-outcome";
 const CONSUMED = "worktree-consumed";
 
-export type WorktreeRequest =
-  | { action: "create"; branch: string; base?: string; path?: string }
-  | { action: "switch"; path: string }
-  | { action: "finish"; path?: string }
-  | { action: "status" };
+const WorktreeRequestSchema = Type.Union([
+  Type.Object({
+    action: Type.Literal("create"),
+    branch: Type.String({ minLength: 1 }),
+    base: Type.Optional(Type.String()),
+    path: Type.Optional(Type.String()),
+  }),
+  Type.Object({ action: Type.Literal("switch"), path: Type.String({ minLength: 1 }) }),
+  Type.Object({ action: Type.Literal("finish"), path: Type.Optional(Type.String()) }),
+  Type.Object({ action: Type.Literal("status") }),
+]);
+
+export type WorktreeRequest = Static<typeof WorktreeRequestSchema>;
 
 interface FinishPlan {
   removal: RemovalPlan;
@@ -604,21 +613,28 @@ export function registerWorktreeLifecycle(
     promptGuidelines: [
       "Call worktree alone, never alongside other tools or in background children. A pending transition terminates the turn; await its factual completion in the new workspace before any edits. The agent owns implementation and merge decisions; this tool only manages workspaces.",
     ],
-    parameters: Type.Union([
-      Type.Object({
-        action: Type.Literal("create"),
-        branch: Type.String({ minLength: 1 }),
-        base: Type.Optional(Type.String()),
-        path: Type.Optional(Type.String()),
-      }),
-      Type.Object({ action: Type.Literal("switch"), path: Type.String({ minLength: 1 }) }),
-      Type.Object({ action: Type.Literal("finish"), path: Type.Optional(Type.String()) }),
-      Type.Object({ action: Type.Literal("status") }),
-    ]),
-    async execute(_id, request, signal, _update, ctx) {
+    parameters: Type.Object({
+      action: Type.Union([
+        Type.Literal("create"),
+        Type.Literal("switch"),
+        Type.Literal("finish"),
+        Type.Literal("status"),
+      ]),
+      branch: Type.Optional(Type.String({ minLength: 1, description: "Required for create." })),
+      base: Type.Optional(Type.String()),
+      path: Type.Optional(
+        Type.String({ description: "Required for switch; optional for create and finish." }),
+      ),
+    }),
+    async execute(_id, request: unknown, signal, _update, ctx) {
       if (!owningSession || ctx.sessionManager.getSessionId() !== owningSession) {
         throw new Error(
           "Worktree is only available to the owning foreground session, not background children.",
+        );
+      }
+      if (!Value.Check(WorktreeRequestSchema, request)) {
+        throw new Error(
+          "Invalid worktree request. Create requires a nonempty branch; switch requires a nonempty path.",
         );
       }
       if (request.action === "status") {
