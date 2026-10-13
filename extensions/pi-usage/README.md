@@ -385,10 +385,12 @@ remain excluded; reset-time rounding of up to two seconds is tolerated. Supporti
 cost and quota cover qualifying samples, not necessarily all selected activity.
 The calculation assumes Pi's prices are approximately right and attributes a
 mixed period's quota movement to its dominant model, which can underestimate
-that model's capacity when other models also consume quota. Estimates supported
-by less than 3 quota percentage points show `weak evidence`; unsupported weekly
-estimates are omitted, while recorded cost and sample details remain visible.
-These are not permanent model values or subscription billing prices.
+that model's capacity when other models also consume quota. Models with zero
+attributed quota percentage points are hidden from Quotas; their recorded costs
+remain in Models. Rows with positive attributed movement remain visible even
+when a weekly estimate is unavailable. Estimates supported by less than 3 quota
+percentage points show `weak evidence`. These are not permanent model values or
+subscription billing prices.
 
 Historical coverage is deliberately not claimed to be complete. Snapshot
 sampling is irregular and active-session-driven, so peaks, resets, and

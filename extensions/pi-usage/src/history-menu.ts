@@ -538,12 +538,14 @@ function quotaBucketLines(
       unstyledTitle = unstyledTitle.slice(prefixLength);
       return styled([{ text: prefix, tone: "dim" }, { text: line.slice(prefixLength) }], theme);
     });
-  if (bucket.modelEstimates?.length) {
+  const modelEstimates =
+    bucket.modelEstimates?.filter((estimate) => estimate.observedConsumedPercent > 0) ?? [];
+  if (modelEstimates.length > 0) {
     const indent = width > 2 ? "  " : "";
     const rows: Part[] = [
       { text: `Historical ${range} model averages · API-equivalent dollars`, tone: "dim" },
     ];
-    for (const estimate of bucket.modelEstimates) {
+    for (const estimate of modelEstimates) {
       const capacityCost =
         estimate.estimated100PercentCost === undefined
           ? "—"

@@ -567,6 +567,10 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
   provider.providerId = "openai-codex";
   provider.providerName = "OpenAI Codex";
   provider.identities = [identity];
+  const anthropic = view.quotas.providers.find((item) => item.providerId === "provider-b");
+  assert.ok(anthropic);
+  anthropic.providerId = "anthropic";
+  anthropic.providerName = "Anthropic";
   bucket.latest = { ...bucket.latest, groupId: "codex", windowMinutes: 10_080 };
   bucket.capacity = {
     observedConsumedPercent: 20,
@@ -591,6 +595,13 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
       observedConsumedPercent: 0,
       intervals: 1,
     },
+    {
+      model: "gpt-attributed",
+      recordedCost: 2,
+      sampleCost: 0,
+      observedConsumedPercent: 0.5,
+      intervals: 1,
+    },
   ];
 
   const state = { ...createHistoryMenuState(), tab: "Quotas" as const };
@@ -603,9 +614,10 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
     assert.ok(output.includes(`Historical ${range} model averages · API-equivalent dollars`));
     assert.match(output, /gpt-supported: recorded \$48\.00 · weekly 100% ≈ \$120\.00/);
     assert.match(output, /sample \$12\.60 \/ 10\.5 pp · 4 intervals \(≤15m\)/);
-    assert.match(output, /gpt-insufficient: recorded \$3\.00\n/);
-    assert.doesNotMatch(output, /insufficient data/);
-    assert.match(output, /sample \$1\.00 \/ 0 pp · 1 interval \(≤15m\)\n/);
+    assert.match(output, /gpt-attributed: recorded \$2\.00\n/);
+    assert.match(output, /sample \$0\.00 \/ 0\.5 pp · 1 interval \(≤15m\)/);
+    assert.match(output, /Anthropic\nFive-hour window:/);
+    assert.doesNotMatch(output, /gpt-insufficient|sample \$1\.00 \/ 0 pp|insufficient data/);
     assert.equal(output.match(/Historical .* model averages/g)?.length, 1);
     assert.doesNotMatch(output, /weak evidence|identity-[abc]|lifetime|permanent/i);
   }
@@ -616,7 +628,7 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
     assert.doesNotMatch(output, /model averages|API-equivalent|gpt-supported|insufficient data/);
   }
 
-  for (const consumed of [1, 2, 3]) {
+  for (const consumed of [0.001, 1, 2, 3]) {
     bucket.modelEstimates[0].observedConsumedPercent = consumed;
     const output = renderUsageHistory(history, state, 120, 100, {
       view,
@@ -634,8 +646,12 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
   bucket.observedPeak = 0;
   bucket.observedConsumption = 0;
   bucket.observations = [];
+  for (const estimate of bucket.modelEstimates) estimate.observedConsumedPercent = 0;
   const zeroQuota = renderUsageHistory(history, state, 120, 100, { view }).lines.join("\n");
-  assert.match(zeroQuota, /gpt-insufficient: recorded \$3\.00\n/);
+  assert.match(zeroQuota, /OpenAI Codex\nWeekly:/);
+  assert.match(zeroQuota, /Anthropic\nFive-hour window:/);
+  assert.doesNotMatch(zeroQuota, /model averages|gpt-supported|gpt-insufficient|gpt-attributed/);
+  assert.equal(bucket.modelEstimates.length, 3);
 });
 
 test("per-model quota rows sanitize model IDs and stay width-safe with real theme", () => {
@@ -685,9 +701,8 @@ test("per-model quota rows sanitize model IDs and stay width-safe with real them
     if (width === 120) {
       assert.match(output, /weekly 100% ≈\s+\$400\.00/);
       assert.match(output, /sample \$2\.00 \/ 0\.5 pp · 2 intervals \(≤15m\)/);
-      assert.match(output, /gpt-no-samples: recorded \$0\.00\n/);
-      assert.doesNotMatch(output, /insufficient data/);
-      assert.match(output, /sample \$0\.00 \/ 0 pp · 0 intervals \(≤15m\)/);
+      assert.doesNotMatch(output, /gpt-no-samples|insufficient data/);
+      assert.doesNotMatch(output, /sample \$0\.00 \/ 0 pp · 0 intervals \(≤15m\)/);
     }
   }
 });
