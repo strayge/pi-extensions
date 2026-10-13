@@ -1992,6 +1992,130 @@ test("overlapping identities and absent local consumption suppress capacity but 
   assert.ok(noCalls?.identities.every((identity) => identity.buckets[0]?.capacity === undefined));
 });
 
+test("Anthropic credential rotations share quota movement and provider-scoped capacity", () => {
+  const first = NOW - 10 * 60 * 60_000;
+  const last = NOW - 10 * 60_000;
+  const before: UsageSnapshotIdentity = { kind: "credential", id: "before-refresh" };
+  const after: UsageSnapshotIdentity = { kind: "credential", id: "after-refresh" };
+  const snapshots = [
+    { at: first - 1_000, identity: before, session: 0, weekly: 2 },
+    { at: first + 20 * 60_000, identity: before, session: 18, weekly: 3 },
+    { at: last - 20 * 60_000, identity: after, session: 0, weekly: 3 },
+    { at: last + 1_000, identity: after, session: 34, weekly: 6 },
+  ].map((sample, index) => {
+    const value = quotaSnapshot({
+      id: `anthropic-${index}`,
+      at: sample.at,
+      identity: sample.identity,
+      provider: "anthropic",
+      providerName: "Anthropic",
+      bucket: percentBucket(sample.session, {
+        id: "five_hour",
+        label: "Session",
+        windowMinutes: 300,
+      }),
+    });
+    value.report.buckets.push(
+      percentBucket(sample.weekly, { id: "seven_day", label: "Weekly", windowMinutes: 10_080 }),
+    );
+    return value;
+  });
+  for (const id of ["openai-one", "openai-two"]) {
+    snapshots.push(
+      quotaSnapshot({
+        id,
+        at: last,
+        provider: "openai",
+        identity: { kind: "account", id },
+        bucket: percentBucket(20),
+      }),
+    );
+  }
+  const history = loaded(
+    [
+      normalizedCall({ key: "first", provider: "anthropic", at: first, input: 50, cost: 1 }),
+      normalizedCall({ key: "last", provider: "anthropic", at: last, input: 50, cost: 1 }),
+      normalizedCall({ key: "other", provider: "openai", at: last, input: 7_000, cost: 9 }),
+    ],
+    snapshots.reverse(),
+  );
+  const savedSnapshots = JSON.stringify(history.snapshots);
+  const providers = deriveHistoryRange(history, 12 * 60 * 60_000).quotas.providers;
+  const anthropic = providers.find((provider) => provider.providerId === "anthropic");
+  assert.equal(anthropic?.identities.length, 1);
+  const buckets = anthropic?.identities[0]?.buckets;
+  const session = buckets?.find((bucket) => bucket.id === "five_hour");
+  const weekly = buckets?.find((bucket) => bucket.id === "seven_day");
+  assert.deepEqual(
+    session?.observations.map((sample) => sample.percentage),
+    [0, 18, 0, 34],
+  );
+  assert.equal(session?.observedConsumption, 52);
+  assert.equal(session?.observedResets, 1);
+  assert.equal(session?.capacity?.estimated100PercentTokens, (100 * 100) / 52);
+  assert.equal(session?.capacity?.lowerBound, true);
+  assert.ok(session?.capacity?.warnings.some((warning) => warning.includes("lower bound")));
+  assert.equal(weekly?.observedConsumption, 4);
+  assert.equal(weekly?.capacity?.estimated100PercentTokens, 2_500);
+  assert.equal(weekly?.capacity?.estimated100PercentCost, 50);
+  assert.deepEqual(weekly?.capacityWarnings, []);
+  assert.equal(
+    providers.find((provider) => provider.providerId === "openai")?.identities.length,
+    2,
+  );
+  assert.equal(JSON.stringify(history.snapshots), savedSnapshots);
+});
+
+test("Anthropic live credentials share history without filling missing sample boundaries", () => {
+  const first = NOW - 2 * 60 * 60_000;
+  const last = NOW - 10 * 60_000;
+  const snapshots = [
+    quotaSnapshot({
+      id: "start",
+      at: first - 1_000,
+      provider: "anthropic",
+      identity: { kind: "credential", id: "before-refresh" },
+      bucket: percentBucket(10),
+    }),
+    quotaSnapshot({
+      id: "stale-end",
+      at: last - 31 * 60_000,
+      provider: "anthropic",
+      identity: { kind: "credential", id: "after-refresh" },
+      bucket: percentBucket(20),
+    }),
+  ];
+  const live = quotaSnapshot({
+    id: "live",
+    at: NOW,
+    provider: "anthropic",
+    identity: { kind: "credential", id: "live-credential" },
+    bucket: percentBucket(40),
+  });
+  const view = deriveHistoryRange(
+    loaded(
+      [
+        normalizedCall({ key: "first", provider: "anthropic", at: first, input: 50 }),
+        normalizedCall({ key: "last", provider: "anthropic", at: last, input: 50 }),
+      ],
+      snapshots,
+    ),
+    3 * 60 * 60_000,
+    { live: { ...live.report, identity: live.identity, report: live.report } },
+  );
+  const provider = view.quotas.providers[0];
+  assert.equal(provider?.identities.length, 1);
+  const bucket = provider?.identities[0]?.buckets[0];
+  assert.equal(bucket?.observations.length, 2);
+  assert.equal(bucket?.observedConsumption, 10);
+  assert.equal(bucket?.current?.percentage, 40);
+  assert.equal(bucket?.capacity, undefined);
+  assert.deepEqual(bucket?.capacityWarnings, [
+    "quota samples do not cover both activity boundaries",
+  ]);
+  assert.deepEqual(live.identity, { kind: "credential", id: "live-credential" });
+});
+
 test("provider and identity labels come from the greatest capture time", () => {
   const newer = quotaSnapshot({
     id: "newer-labels",

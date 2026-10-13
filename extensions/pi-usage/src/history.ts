@@ -1798,6 +1798,22 @@ interface BucketSeries {
   observations: QuotaObservation[];
 }
 
+const ANTHROPIC_HISTORY_IDENTITY: UsageSnapshotIdentity = {
+  kind: "account",
+  id: createHash("sha256")
+    .update("pi-usage:history:anthropic:single-account")
+    .digest("hex")
+    .slice(0, 24),
+};
+
+/** Anthropic history assumes one account; credential rotation must not split its quota series. */
+function quotaHistoryIdentity(
+  providerId: string,
+  identity: UsageSnapshotIdentity,
+): UsageSnapshotIdentity {
+  return providerId === "anthropic" ? ANTHROPIC_HISTORY_IDENTITY : identity;
+}
+
 function collectQuotaSeries(history: LoadedHistory): {
   buckets: BucketSeries[];
   identities: IdentitySeries[];
@@ -1805,13 +1821,14 @@ function collectQuotaSeries(history: LoadedHistory): {
   const groups = new Map<string, BucketSeries>();
   const identities = new Map<string, IdentitySeries>();
   for (const { snapshot } of history.snapshots) {
-    const identityGroupKey = `${snapshot.report.providerId}\0${snapshot.identity.kind}\0${snapshot.identity.id}`;
+    const identity = quotaHistoryIdentity(snapshot.report.providerId, snapshot.identity);
+    const identityGroupKey = `${snapshot.report.providerId}\0${identity.kind}\0${identity.id}`;
     let identityGroup = identities.get(identityGroupKey);
     if (!identityGroup) {
       identityGroup = {
         providerId: snapshot.report.providerId,
         providerName: snapshot.report.providerName,
-        identity: snapshot.identity,
+        identity,
         identityLabel: snapshot.report.accountLabel,
         metadataCapturedAt: snapshot.report.capturedAt,
         capturedAt: [],
@@ -1825,13 +1842,13 @@ function collectQuotaSeries(history: LoadedHistory): {
     }
     identityGroup.capturedAt.push(snapshot.report.capturedAt);
     for (const bucket of snapshot.report.buckets) {
-      const key = `${snapshot.report.providerId}\0${snapshot.identity.kind}\0${snapshot.identity.id}\0${bucket.id}`;
+      const key = `${snapshot.report.providerId}\0${identity.kind}\0${identity.id}\0${bucket.id}`;
       let group = groups.get(key);
       if (!group) {
         group = {
           providerId: snapshot.report.providerId,
           providerName: snapshot.report.providerName,
-          identity: snapshot.identity,
+          identity,
           identityLabel: snapshot.report.accountLabel,
           id: bucket.id,
           observations: [],
@@ -2164,6 +2181,7 @@ function aggregateQuotas(
   calls: NormalizedCall[],
   live?: LiveQuotaContext,
 ): QuotaHistory {
+  const liveIdentity = live?.identity && quotaHistoryIdentity(live.providerId, live.identity);
   const series = collectQuotaSeries(history);
   const relevant = series.buckets.filter((group) =>
     group.observations.some(
@@ -2368,14 +2386,13 @@ function aggregateQuotas(
       provider.providerName = live.providerName;
       provider.liveReport = live.report;
     }
-    if (live.identity) {
+    if (liveIdentity) {
       let identity = provider.identities.find(
-        (item) =>
-          identityKey(item.identity) === identityKey(live.identity as UsageSnapshotIdentity),
+        (item) => identityKey(item.identity) === identityKey(liveIdentity),
       );
       if (!identity) {
         identity = {
-          identity: live.identity,
+          identity: liveIdentity,
           label: live.report.accountLabel,
           buckets: [],
         };
@@ -2413,12 +2430,12 @@ function aggregateQuotas(
     provider.identities.sort((a, b) => {
       const aCurrent =
         live?.providerId === provider.providerId &&
-        live.identity &&
-        identityKey(a.identity) === identityKey(live.identity);
+        liveIdentity &&
+        identityKey(a.identity) === identityKey(liveIdentity);
       const bCurrent =
         live?.providerId === provider.providerId &&
-        live.identity &&
-        identityKey(b.identity) === identityKey(live.identity);
+        liveIdentity &&
+        identityKey(b.identity) === identityKey(liveIdentity);
       return (
         Number(Boolean(bCurrent)) - Number(Boolean(aCurrent)) ||
         identityKey(a.identity).localeCompare(identityKey(b.identity))

@@ -725,6 +725,29 @@ test("Quotas present every visible identity with anonymous account numbering", (
   assert.doesNotMatch(output, /private-hash|identity-[abc]|Private Account Label|Subscription/);
 });
 
+test("Quotas show one Anthropic account across historical and live credential rotations", () => {
+  const history: LoadedHistory = {
+    now: NOW,
+    calls: [call("first", 0.5, "anthropic", "claude"), call("last", 0.49, "anthropic", "claude")],
+    snapshots: [
+      snapshot("start", "anthropic", "Anthropic", "before-refresh", NOW - 0.6 * 60 * 60_000, 10),
+      snapshot("end", "anthropic", "Anthropic", "after-refresh", NOW - 0.4 * 60 * 60_000, 20),
+    ],
+    warnings: [],
+    subagents: [],
+  };
+  const live = snapshot("live", "anthropic", "Anthropic", "live-credential", NOW, 90).snapshot;
+  const output = renderUsageHistory(
+    history,
+    { ...createHistoryMenuState(), tab: "Quotas" },
+    120,
+    100,
+    { live: { ...live.report, identity: live.identity, report: live.report } },
+  ).lines.join("\n");
+  assert.match(output, /Anthropic\nFive-hour window: 10% consumed · 100% ≈ \$4\.00/);
+  assert.doesNotMatch(output, /Account \d|overlapping quota identities|both activity boundaries/);
+});
+
 test("Cache cells preserve compact counts while dimming only count text", () => {
   const history = fixture();
   const view = deriveHistoryRange(history, HISTORY_RANGES[0].durationMs);

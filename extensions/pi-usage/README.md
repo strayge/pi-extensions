@@ -338,7 +338,10 @@ deduplicated globally by `observationId`, and an unambiguous persisted subagent
 call suppresses its matching transcript copy. Ambiguous associations are kept
 rather than silently undercounted and can produce a concise warning.
 
-Quota observations stay separated by provider, identity kind/id, and bucket.
+Quota observations stay separated by provider, identity kind/id, and bucket,
+except that **Anthropic history assumes one account** and combines observations
+across credential changes. A real Anthropic account switch is therefore combined
+too; live fetching and caching remain scoped to the active credential.
 When historical calls cannot be correlated conservatively to one identity,
 capacity is omitted instead of assigning them to whichever credential is
 current now. For an eligible bucket, the uniform extrapolation is:
