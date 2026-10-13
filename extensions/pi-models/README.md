@@ -17,6 +17,10 @@ remain selectable in All without being unhidden. Other preferences are preserved
 are visible by default. Non-terminal dialogs retain `[hidden]` badges and provide Show all/visible
 models and Hide/Unhide actions.
 
+llama.cpp models are omitted from both views when their cached catalogue is confirmed older than
+24 hours. Opening `/models` does not refresh it; models return after a successful refresh in pi.
+Other providers and missing or unreadable cache timestamps are unaffected.
+
 ## Installation
 
 ```bash

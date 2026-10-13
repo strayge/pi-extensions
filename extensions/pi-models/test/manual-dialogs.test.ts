@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -150,4 +150,65 @@ test("the rich model selector remains unmarked", async () => {
     },
   } as never;
   assert.equal(await chooseModel(context, { models: [model], states: {} }), result);
+});
+
+test("stale llama.cpp models are omitted from both views without refreshing or changing preferences", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-models-expired-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  });
+  const llama = { provider: "llama.cpp", id: "local" };
+  const available = [model, llama];
+  const checkedAt = Date.now() - 25 * 60 * 60 * 1000;
+  await writeFile(
+    join(dir, "models-store.json"),
+    JSON.stringify({
+      "llama.cpp": { models: [llama], checkedAt },
+      p: { models: [model], checkedAt },
+    }),
+  );
+  await mutateHistory((history) => {
+    history.models["llama.cpp/local"] = { favorite: true, thinkingLevel: "high" };
+  });
+  let handler!: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+  modelsExtension({
+    on() {},
+    registerCommand(_name: string, command: { handler: typeof handler }) {
+      handler = command.handler;
+    },
+    async setModel() {
+      assert.fail("Cancelling must not switch models");
+    },
+  } as never);
+  const choices = ["Show all models", "[p] m", "Cancel"];
+  await handler("", {
+    mode: "rpc",
+    modelRegistry: {
+      getAvailable: () => available,
+      async refresh() {
+        assert.fail("Cache expiration must not trigger a refresh");
+      },
+    },
+    ui: {
+      async select(title: string, labels: string[]) {
+        if (title === "Select model") {
+          assert.ok(labels.includes("[p] m"));
+          assert.ok(labels.every((label) => !label.startsWith("[llama.cpp]")));
+        }
+        const choice = choices.shift();
+        assert.ok(choice && labels.includes(choice));
+        return choice;
+      },
+    },
+  } as never);
+  assert.equal(choices.length, 0);
+  assert.deepEqual(available, [model, llama]);
+  assert.deepEqual((await loadHistory()).models["llama.cpp/local"], {
+    favorite: true,
+    thinkingLevel: "high",
+  });
 });

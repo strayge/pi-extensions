@@ -80,6 +80,21 @@ export async function loadHistory(file = historyPath()): Promise<ModelHistory> {
   }
 }
 
+/** Missing freshness metadata is not evidence that a local catalogue is stale. */
+export async function hasStaleLlamaCache(dir = getAgentDir(), now = Date.now()): Promise<boolean> {
+  try {
+    const cache = JSON.parse(await readFile(join(dir, "models-store.json"), "utf8"));
+    const checkedAt: unknown = cache?.["llama.cpp"]?.checkedAt;
+    return (
+      typeof checkedAt === "number" &&
+      Number.isFinite(checkedAt) &&
+      now - checkedAt > 24 * 60 * 60 * 1000
+    );
+  } catch {
+    return false;
+  }
+}
+
 let mutationQueue: Promise<void> = Promise.resolve();
 
 export function mutateHistory(

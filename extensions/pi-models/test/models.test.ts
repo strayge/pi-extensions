@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -7,7 +7,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { prioritizeModelsCommand } from "../src/autocomplete.ts";
 import { ModelSelector } from "../src/selector.ts";
 import { modelKey, rankModels } from "../src/sort.ts";
-import { loadHistory, mutateHistory, parseHistory } from "../src/store.ts";
+import { hasStaleLlamaCache, loadHistory, mutateHistory, parseHistory } from "../src/store.ts";
 
 const models = [
   { provider: "z", id: "old" },
@@ -238,4 +238,29 @@ test("visibility toggles in All dim the row, keep the cursor clear, and preserve
   selector.handleInput("\x1b");
   assert.deepEqual(result, { favorites: {}, hidden: { "p/a": false } });
   assert.deepEqual(states["p/a"], { favorite: true, lastUsedAt: 99, hidden: false });
+});
+
+test("only confirmed llama.cpp caches older than 24 hours expire", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-models-cache-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, "models-store.json");
+  const now = Date.UTC(2026, 9, 13);
+  const maxAge = 24 * 60 * 60 * 1000;
+  assert.equal(await hasStaleLlamaCache(dir, now), false);
+  const cases: [unknown, boolean][] = [
+    [now - maxAge - 1, true],
+    [now - maxAge, false],
+    [now - maxAge + 1, false],
+    [now + maxAge, false],
+    [undefined, false],
+    ["invalid", false],
+  ];
+  for (const [checkedAt, expected] of cases) {
+    await writeFile(file, JSON.stringify({ "llama.cpp": { checkedAt } }));
+    assert.equal(await hasStaleLlamaCache(dir, now), expected, `checkedAt=${String(checkedAt)}`);
+  }
+  await writeFile(file, JSON.stringify({ anthropic: { checkedAt: now - maxAge - 1 } }));
+  assert.equal(await hasStaleLlamaCache(dir, now), false);
+  await writeFile(file, "{invalid json");
+  assert.equal(await hasStaleLlamaCache(dir, now), false);
 });

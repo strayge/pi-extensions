@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionUIDialogOptions } from "@earendil-works/pi-
 import { prioritizeModelsCommand } from "./autocomplete.ts";
 import { chooseModel } from "./selector.ts";
 import { modelKey } from "./sort.ts";
-import { loadHistory, mutateHistory, type ThinkingLevel } from "./store.ts";
+import { hasStaleLlamaCache, loadHistory, mutateHistory, type ThinkingLevel } from "./store.ts";
 
 export default function (pi: ExtensionAPI): void {
   let activeModel: string | undefined;
@@ -81,7 +81,10 @@ export default function (pi: ExtensionAPI): void {
       const states = Object.fromEntries(
         Object.entries(history.models).map(([key, value]) => [key, { ...value }]),
       );
-      const models = ctx.modelRegistry.getAvailable();
+      let models = ctx.modelRegistry.getAvailable();
+      if (models.some((model) => model.provider === "llama.cpp") && (await hasStaleLlamaCache())) {
+        models = models.filter((model) => model.provider !== "llama.cpp");
+      }
       const result = await chooseModel(ctx, {
         models,
         states,
