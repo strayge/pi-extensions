@@ -110,6 +110,23 @@ test("session status pools efforts for the exact model and takes median non-reas
   assert.deepEqual(state.notifications, []);
 });
 
+test("session status uses only the newest ten measured requests", () => {
+  const entries: SessionEntry[] = [];
+  const add = (count: number, durationMs: number, data: object = {}) => {
+    for (let i = 0; i < count; i += 1) {
+      const entry = assistant();
+      entries.push(entry, annotation(entry, durationMs, data));
+    }
+  };
+  add(10, 1_000);
+  add(5, 4_000);
+  // Excluded calls must not take slots in the window.
+  add(5, 1_000, { outputTokens: 249 });
+  const state = setup(entries);
+  state.fire("session_start");
+  assert.equal(state.statuses.get("speed"), "312.5 tok/s");
+});
+
 test("legacy request timestamps never supply a fallback and failed or invalid measurements stay hidden", () => {
   const invalid: SessionEntry[] = [assistant()];
   for (const stopReason of ["error", "aborted", "length", undefined] as const) {

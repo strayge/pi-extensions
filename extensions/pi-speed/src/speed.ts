@@ -73,9 +73,13 @@ function exclusion(call: SpeedSample): "unsuccessful" | "untimed" | "noOutput" |
   return undefined;
 }
 
-/** Keep the session status and historical report on the same measured-request definition. */
-export function medianRequestRate(calls: SpeedSample[]): number | undefined {
-  return median(calls.filter((call) => !exclusion(call)).map(rate));
+/**
+ * Keep the session status and historical report on the same measured-request definition.
+ * `limit` keeps only the newest measured requests, so excluded calls never shrink the window.
+ */
+export function medianRequestRate(calls: SpeedSample[], limit?: number): number | undefined {
+  const measured = calls.filter((call) => !exclusion(call));
+  return median((limit === undefined ? measured : measured.slice(-limit)).map(rate));
 }
 
 /** Freeze all seven rolling days to the same history load, without mixing provider routes. */

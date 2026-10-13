@@ -115,8 +115,9 @@ network buffering can differ between days.
 
 ## Current-session speed status
 
-The `speed` status shows the median rate for the exact selected provider/model,
-for example `123.4 tok/s`. It uses `sessionManager.getBranch()`: the selected
+The `speed` status shows the median rate of the last 10 measured requests for
+the exact selected provider/model, for example `123.4 tok/s`, so it tracks
+current speed rather than the whole session. It uses `sessionManager.getBranch()`: the selected
 branch and its ancestors, excluding abandoned branches and separate subagent
 sessions. Reasoning levels are pooled. The item stays hidden until a usable
 measurement exists.

@@ -4,6 +4,9 @@ import { measurementForMessage, readStreamMeasurements } from "./measurement.ts"
 import { publishStatuslineItem } from "./publish.ts";
 import { medianRequestRate } from "./speed.ts";
 
+/** Recent requests reflect current provider load; a whole-session median goes stale in long sessions. */
+const RECENT_REQUESTS = 10;
+
 /** Rebuild from the selected branch so reloads and tree navigation cannot leak other requests. */
 export function registerSpeedStatus(pi: ExtensionAPI): void {
   const publish = publishStatuslineItem(pi, { id: "speed" });
@@ -38,7 +41,7 @@ export function registerSpeedStatus(pi: ExtensionAPI): void {
           ];
         })
       : [];
-    const rate = medianRequestRate(calls);
+    const rate = medianRequestRate(calls, RECENT_REQUESTS);
     setStatus(ctx, rate === undefined ? undefined : `${rate.toFixed(1)} tok/s`);
   };
 
