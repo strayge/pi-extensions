@@ -113,6 +113,26 @@ function wrapText(text: string, width: number): string[] {
   return wrapTextWithAnsi(text, Math.max(1, width));
 }
 
+/** Wrap before styling so ANSI boundaries cannot change whitespace or line breaks. */
+function wrapStyled(parts: Part[], width: number, theme?: HistoryTheme): string[] {
+  const text = styled(parts);
+  const lines = wrapText(text, width).filter((line) => visibleWidth(line) > 0);
+  if (!theme) return lines;
+  let sourceOffset = 0;
+  return lines.map((line) => {
+    const begin = text.indexOf(line, sourceOffset);
+    sourceOffset = begin + line.length;
+    let partOffset = 0;
+    const lineParts = parts.flatMap((part) => {
+      const start = Math.max(0, begin - partOffset);
+      const end = Math.min(part.text.length, sourceOffset - partOffset);
+      partOffset += part.text.length;
+      return start < end ? [{ ...part, text: part.text.slice(start, end) }] : [];
+    });
+    return styled(lineParts, theme);
+  });
+}
+
 function selectorLines(
   label: HistoryNavigationRow,
   values: readonly string[],
@@ -465,49 +485,52 @@ function quotaBucketTitles(buckets: QuotaBucketHistory[]): string[] {
   });
 }
 
-function quotaCapacityLine(capacity: QuotaBucketHistory["capacity"]): string | undefined {
+function quotaCapacityParts(capacity: QuotaBucketHistory["capacity"]): Part[] | undefined {
   if (!capacity) return undefined;
   const relation = capacity.lowerBound ? "≥" : "≈";
+  const prefix: Part = { text: `100% ${relation} `, tone: "dim" };
   const lowerBound = capacity.lowerBound ? " (lower bound)" : "";
   if (capacity.estimated100PercentCost !== undefined) {
     const capacityCost = money(capacity.estimated100PercentCost);
-    if (capacityCost !== "—") return `100% ${relation} ${capacityCost}${lowerBound}`;
+    if (capacityCost !== "—") return [prefix, { text: `${capacityCost}${lowerBound}` }];
   }
   const capacityTokens = tokens(capacity.estimated100PercentTokens);
   return capacityTokens === "—"
     ? undefined
-    : `100% ${relation} ${capacityTokens} tokens${lowerBound}`;
+    : [prefix, { text: `${capacityTokens} tokens${lowerBound}` }];
 }
 
 function quotaBucketLines(
   bucket: QuotaBucketHistory,
   width: number,
-  range: HistoryRangeLabel,
   title?: string,
   theme?: HistoryTheme,
 ): string[] {
   const bucketTitle = title ?? sanitizeArtifactLabel(bucket.label);
-  const fragments: string[] = [];
+  const fragments: Part[][] = [];
   const percentageObservations = bucket.observations.some((observation) =>
     usablePercentage(observation.percentage),
   );
-  const capacityLine = quotaCapacityLine(bucket.capacity);
+  const capacityParts = quotaCapacityParts(bucket.capacity);
 
   if (percentageObservations) {
     const resetSuffix =
       bucket.observedResets > 0
         ? ` · over ${number(bucket.observedResets)} ${bucket.observedResets === 1 ? "reset" : "resets"}`
         : "";
-    fragments.push(`${percent(bucket.observedConsumption).padStart(3)} consumed${resetSuffix}`);
+    fragments.push([
+      { text: `${percent(bucket.observedConsumption).padStart(3)} consumed` },
+      { text: resetSuffix, tone: "dim" },
+    ]);
   } else {
     const fallback = usablePercentage(bucket.current?.percentage)
       ? bucket.current.percentage
       : usablePercentage(bucket.historicalBoundary?.percentage)
         ? bucket.historicalBoundary.percentage
         : undefined;
-    if (fallback !== undefined) fragments.push(`${percent(fallback).padStart(3)} used`);
+    if (fallback !== undefined) fragments.push([{ text: `${percent(fallback).padStart(3)} used` }]);
   }
-  if (capacityLine) fragments.push(capacityLine);
+  if (capacityParts) fragments.push(capacityParts);
 
   const latestObservation = bucket.observations.at(-1);
   fragments.push(
@@ -515,59 +538,40 @@ function quotaBucketLines(
       rawFragment("current", bucket.current),
       rawFragment("latest", latestObservation),
       rawFragment("boundary", bucket.historicalBoundary),
-    ].filter((value): value is string => Boolean(value)),
+    ]
+      .filter((value): value is string => Boolean(value))
+      .map((text) => [{ text }]),
   );
 
-  let unstyledTitle = `${bucketTitle}:`;
-  const row = `${unstyledTitle}${fragments.length > 0 ? ` ${fragments.join(" · ")}` : ""}`;
-  const lines = wrapText(row, width)
-    .filter((line) => visibleWidth(line) > 0)
-    .map((line) => {
-      if (!theme || unstyledTitle.length === 0) return line;
-      if (unstyledTitle.startsWith(" ") && !line.startsWith(" "))
-        unstyledTitle = unstyledTitle.trimStart();
-      let prefixLength = 0;
-      while (
-        prefixLength < line.length &&
-        prefixLength < unstyledTitle.length &&
-        line[prefixLength] === unstyledTitle[prefixLength]
-      ) {
-        prefixLength += 1;
-      }
-      const prefix = line.slice(0, prefixLength);
-      unstyledTitle = unstyledTitle.slice(prefixLength);
-      return styled([{ text: prefix, tone: "dim" }, { text: line.slice(prefixLength) }], theme);
-    });
+  const rowParts: Part[] = [{ text: `${bucketTitle}:`, tone: "dim" }];
+  for (const [index, fragment] of fragments.entries()) {
+    rowParts.push({ text: index === 0 ? " " : " · ", tone: "dim" }, ...fragment);
+  }
+  const lines = wrapStyled(rowParts, width, theme);
   const modelEstimates =
     bucket.modelEstimates?.filter((estimate) => estimate.observedConsumedPercent > 0) ?? [];
   if (modelEstimates.length > 0) {
     const indent = width > 2 ? "  " : "";
-    const rows: Part[] = [
-      { text: `Historical ${range} model averages · API-equivalent dollars`, tone: "dim" },
-    ];
     for (const estimate of modelEstimates) {
       const capacityCost =
         estimate.estimated100PercentCost === undefined
           ? "—"
           : money(estimate.estimated100PercentCost);
-      const capacity = capacityCost === "—" ? "" : ` · weekly 100% ≈ ${capacityCost}`;
       const evidence =
         capacityCost !== "—" && estimate.observedConsumedPercent < 3 ? " · weak evidence" : "";
-      rows.push(
-        {
-          text: `${sanitizeArtifactLabel(estimate.model)}: recorded ${money(estimate.recordedCost)}${capacity}${evidence}`,
-        },
-        {
-          text: `sample ${money(estimate.sampleCost)} / ${decimal(estimate.observedConsumedPercent)} pp · ${number(estimate.intervals)} ${estimate.intervals === 1 ? "interval" : "intervals"} (≤15m)`,
-          tone: "dim",
-        },
-      );
-    }
-    for (const row of rows) {
+      const parts: Part[] = [
+        { text: `${sanitizeArtifactLabel(estimate.model)}: ` },
+        { text: money(estimate.recordedCost), tone: "dim" },
+      ];
+      if (capacityCost !== "—") {
+        parts.push({ text: " · 100% ≈ ", tone: "dim" }, { text: capacityCost });
+      }
+      parts.push({
+        text: `${evidence} · sample ${money(estimate.sampleCost)} / ${decimal(estimate.observedConsumedPercent)} pp`,
+        tone: "dim",
+      });
       lines.push(
-        ...wrapText(row.text, width - visibleWidth(indent))
-          .filter((line) => visibleWidth(line) > 0)
-          .map((line) => styled([{ text: `${indent}${line}`, tone: row.tone }], theme)),
+        ...wrapStyled(parts, width - visibleWidth(indent), theme).map((line) => `${indent}${line}`),
       );
     }
   }
@@ -627,7 +631,7 @@ function visibleQuotaBucket(bucket: QuotaBucketHistory): boolean {
     return true;
 
   return (
-    quotaCapacityLine(bucket.capacity) !== undefined ||
+    quotaCapacityParts(bucket.capacity) !== undefined ||
     bucket.modelEstimates?.some(
       (estimate) => usableRawNumber("usd", estimate.recordedCost) && estimate.recordedCost > 0,
     ) === true
@@ -653,12 +657,7 @@ function quotaPresentationProviders(view: HistoryRangeView): QuotaProviderHistor
   });
 }
 
-function quotasLines(
-  view: HistoryRangeView,
-  width: number,
-  range: HistoryRangeLabel,
-  theme?: HistoryTheme,
-): string[] {
+function quotasLines(view: HistoryRangeView, width: number, theme?: HistoryTheme): string[] {
   const providers = quotaPresentationProviders(view);
   if (providers.length === 0) {
     return ["No quota observations in range", ...warningLines(view, "Quotas", theme)];
@@ -678,7 +677,7 @@ function quotasLines(
       }
       const titles = quotaBucketTitles(identity.buckets);
       for (const [bucketIndex, bucket] of identity.buckets.entries()) {
-        lines.push(...quotaBucketLines(bucket, width, range, titles[bucketIndex], theme));
+        lines.push(...quotaBucketLines(bucket, width, titles[bucketIndex], theme));
       }
     }
   }
@@ -695,7 +694,7 @@ function contentLines(
 ): string[] {
   if (state.tab === "Models") return modelsLines(view, width, theme);
   if (state.tab === "Cache") return cacheLines(view, width, theme);
-  return quotasLines(view, width, state.range, theme);
+  return quotasLines(view, width, theme);
 }
 
 function wrappedContentLines(

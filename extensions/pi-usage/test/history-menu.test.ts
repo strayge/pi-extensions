@@ -550,6 +550,8 @@ test("Quotas compact names, aligned percentages, details, and indented warnings"
   }).lines;
   assert.ok(themedNormal.some((line) => line.includes(theme.fg("dim", "Weekly:"))));
   assert.ok(themedNormal.some((line) => line.includes("58% consumed")));
+  assert.ok(themedNormal.some((line) => line.includes(theme.fg("dim", " · over 1 reset"))));
+  assert.ok(themedNormal.some((line) => line.includes(`${theme.fg("dim", "100% ≈ ")}$650.61`)));
   assert.ok(
     themedNormal.some((line) =>
       line.includes(theme.fg("dim", "  late usage is missing from the capacity interval")),
@@ -611,14 +613,16 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
       padToHeight: false,
     }).lines.join("\n");
     assert.match(output, /Weekly: 20% consumed · 100% ≈ \$200\.00/);
-    assert.ok(output.includes(`Historical ${range} model averages · API-equivalent dollars`));
-    assert.match(output, /gpt-supported: recorded \$48\.00 · weekly 100% ≈ \$120\.00/);
-    assert.match(output, /sample \$12\.60 \/ 10\.5 pp · 4 intervals \(≤15m\)/);
-    assert.match(output, /gpt-attributed: recorded \$2\.00\n/);
-    assert.match(output, /sample \$0\.00 \/ 0\.5 pp · 1 interval \(≤15m\)/);
+    assert.match(output, /Weekly:[^\n]*\n {2}gpt-supported:/);
+    assert.match(
+      output,
+      /gpt-supported: \$48\.00 · 100% ≈ \$120\.00 · sample \$12\.60 \/ 10\.5 pp\n/,
+    );
+    assert.match(output, /gpt-attributed: \$2\.00 · sample \$0\.00 \/ 0\.5 pp\n/);
     assert.match(output, /Anthropic\nFive-hour window:/);
     assert.doesNotMatch(output, /gpt-insufficient|sample \$1\.00 \/ 0 pp|insufficient data/);
-    assert.equal(output.match(/Historical .* model averages/g)?.length, 1);
+    assert.doesNotMatch(output, /Historical .* model averages|API-equivalent dollars|≤15m/);
+    assert.doesNotMatch(output, /recorded|weekly 100%|\d+ intervals?/);
     assert.doesNotMatch(output, /weak evidence|identity-[abc]|lifetime|permanent/i);
   }
   for (const tab of ["Models", "Cache"] as const) {
@@ -634,7 +638,7 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
       view,
       padToHeight: false,
     }).lines.join("\n");
-    assert.equal(output.includes("weekly 100% ≈ $120.00 · weak evidence"), consumed < 3);
+    assert.equal(output.includes("100% ≈ $120.00 · weak evidence"), consumed < 3);
     assert.doesNotMatch(output, /insufficient data · weak evidence/);
   }
 
@@ -687,7 +691,7 @@ test("per-model quota rows sanitize model IDs and stay width-safe with real them
   );
   const theme = new Theme(colors as never, colors as never, "truecolor");
   const state = { ...createHistoryMenuState(), tab: "Quotas" as const };
-  for (const width of [1, 2, 3, 10, 24, 80, 120]) {
+  for (let width = 1; width <= 240; width += 1) {
     const options = { view, padToHeight: false };
     const plain = renderUsageHistory(history, state, width, 10_000, options).lines;
     const themed = renderUsageHistory(history, state, width, 10_000, { ...options, theme }).lines;
@@ -698,11 +702,22 @@ test("per-model quota rows sanitize model IDs and stay width-safe with real them
     for (const forbidden of ["\x1b", "https://evil", "\r", "\t"])
       assert.equal(output.includes(forbidden), false);
     assert.doesNotMatch(output, /x{100}|identity-[abc]/);
-    if (width === 120) {
-      assert.match(output, /weekly 100% ≈\s+\$400\.00/);
-      assert.match(output, /sample \$2\.00 \/ 0\.5 pp · 2 intervals \(≤15m\)/);
-      assert.doesNotMatch(output, /gpt-no-samples|insufficient data/);
-      assert.doesNotMatch(output, /sample \$0\.00 \/ 0 pp · 0 intervals \(≤15m\)/);
+    if (width === 120 || width === 240) {
+      assert.match(output, /100% ≈\s+\$400\.00/);
+      assert.match(output, /sample \$2\.00 \/ 0\.5 pp/);
+      assert.doesNotMatch(
+        output,
+        /gpt-no-samples|insufficient data|recorded|weekly 100%|\d+ intervals?/,
+      );
+    }
+    if (width === 240) {
+      assert.ok(themed.some((line) => line.includes(theme.fg("dim", "$10.00"))));
+      assert.ok(themed.some((line) => line.includes(`${theme.fg("dim", " · 100% ≈ ")}$400.00`)));
+      assert.ok(
+        themed.some((line) =>
+          line.includes(theme.fg("dim", " · weak evidence · sample $2.00 / 0.5 pp")),
+        ),
+      );
     }
   }
 });

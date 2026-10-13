@@ -363,8 +363,10 @@ future capacity.
 
 Main Codex weekly buckets also show per-model historical averages for the
 **selected range**, in API-equivalent dollars, without replacing the aggregate
-estimate. Each row includes the model's full recorded cost in that range and
-supporting sample cost, quota percentage points, and qualifying interval count:
+estimate. Each model row includes its full recorded cost in that range, followed
+by the 100% estimate when available and inline sample cost and quota percentage
+points. Recorded model cost, reset details, estimate labels, and sample details
+are dimmed; estimated amounts stay at normal brightness.
 
 ```text
 model weekly 100% cost = sample recorded cost × 100 / sample quota consumption (pp)
