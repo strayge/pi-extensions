@@ -22,6 +22,9 @@ import {
   type NormalizedCall,
   reduceQuotaMovement,
 } from "../src/history.ts";
+import { normalizeAnthropicUsagePayload } from "../src/providers/anthropic.ts";
+import { normalizeCodexBackendPayload } from "../src/providers/codex.ts";
+import { normalizeOpenCodeGoUsagePayload } from "../src/providers/opencode-go.ts";
 import type { UsageBucket, UsageSnapshot, UsageSnapshotIdentity } from "../src/types.ts";
 
 const NOW = Date.parse("2026-09-12T12:00:00.000Z");
@@ -2758,11 +2761,32 @@ test("point calls at the selected range start are valid calibration activity", (
   assert.equal(row?.estimated100PercentCost, 100);
 });
 
-test("model dollar calibration supports OpenAI aliases but only main weekly Codex quotas", () => {
-  const cases = [
+test("model dollar calibration covers shared quota windows but not scoped or spend buckets", () => {
+  const cases: Array<{ provider: string; extra: Partial<UsageBucket>; supported: boolean }> = [
     { provider: "openai", extra: {}, supported: true },
-    { provider: "openai-codex", extra: { windowMinutes: 300 }, supported: false },
+    { provider: "openai", extra: { windowMinutes: 300 }, supported: true },
+    { provider: "openai-codex", extra: { windowMinutes: 300 }, supported: true },
+    { provider: "openai-codex", extra: { groupId: undefined }, supported: true },
     { provider: "openai-codex", extra: { groupId: "spark" }, supported: false },
+    { provider: "anthropic", extra: { id: "five_hour", windowMinutes: 300 }, supported: true },
+    {
+      provider: "anthropic",
+      extra: { id: "five_hour", windowMinutes: undefined },
+      supported: true,
+    },
+    { provider: "anthropic", extra: { id: "seven_day" }, supported: true },
+    { provider: "anthropic", extra: { id: "weekly:sonnet" }, supported: false },
+    { provider: "anthropic", extra: { id: "weekly:opus" }, supported: false },
+    { provider: "anthropic", extra: { id: "weekly:custom:surface" }, supported: false },
+    { provider: "anthropic", extra: { id: "extra_usage" }, supported: false },
+    ...["rolling", "weekly", "monthly"].map((id) => ({
+      provider: "opencode-go",
+      extra: { id, windowMinutes: undefined },
+      supported: true,
+    })),
+    { provider: "opencode-go", extra: { id: "unknown" }, supported: false },
+    { provider: "openai-codex", extra: { unit: "usd" }, supported: false },
+    { provider: "openrouter", extra: {}, supported: false },
     { provider: "provider-a", extra: {}, supported: false },
   ];
   for (const options of cases) {
@@ -2775,10 +2799,114 @@ test("model dollar calibration supports OpenAI aliases but only main weekly Code
     const bucket = deriveHistoryRange(loaded([call], snapshots), 60 * 60_000).quotas.providers.find(
       (provider) => provider.providerId === options.provider,
     )?.identities[0]?.buckets[0];
+    const context = `${options.provider}/${options.extra.id ?? "codex:primary"}`;
     if (options.supported) {
-      assert.equal(bucket?.modelEstimates?.[0]?.estimated100PercentCost, 50);
+      assert.equal(bucket?.modelEstimates?.[0]?.estimated100PercentCost, 50, context);
     } else {
-      assert.equal(bucket?.modelEstimates, undefined);
+      assert.equal(bucket?.modelEstimates, undefined, context);
+    }
+  }
+});
+
+test("model quota estimates isolate provider costs and each normalized shared window", () => {
+  const resetsAt = NOW / 1000 + 604_800;
+  const snapshots: UsageSnapshot[] = [];
+  for (const [minutesAgo, used] of [
+    [15, 10],
+    [0, 12],
+  ] as const) {
+    const capturedAt = NOW - minutesAgo * 60_000;
+    const reports = [
+      normalizeCodexBackendPayload(
+        {
+          rate_limit: {
+            primary_window: {
+              used_percent: used * 2,
+              limit_window_seconds: 18_000,
+              reset_at: resetsAt,
+            },
+            secondary_window: {
+              used_percent: used,
+              limit_window_seconds: 604_800,
+              reset_at: resetsAt,
+            },
+          },
+        },
+        capturedAt,
+      ),
+      normalizeAnthropicUsagePayload(
+        {
+          five_hour: { utilization: used * 2, resets_at: new Date(resetsAt * 1000).toISOString() },
+          seven_day: { utilization: used, resets_at: new Date(resetsAt * 1000).toISOString() },
+          seven_day_sonnet: {
+            utilization: used,
+            resets_at: new Date(resetsAt * 1000).toISOString(),
+          },
+          extra_usage: { is_enabled: true, utilization: used },
+        },
+        capturedAt,
+      ),
+      normalizeOpenCodeGoUsagePayload(
+        {
+          usage: Object.fromEntries(
+            ["rolling", "weekly", "monthly"].map((key, index) => [
+              key,
+              {
+                status: "ok",
+                percent: used * (index + 1),
+                resetsAt: new Date(resetsAt * 1000).toISOString(),
+              },
+            ]),
+          ),
+        },
+        capturedAt,
+      ),
+    ];
+    for (const report of reports) {
+      snapshots.push({
+        version: 1,
+        observationId: `${report.providerId}-${minutesAgo}`,
+        identity: {
+          kind: "credential",
+          id: report.providerId === "anthropic" ? `credential-${minutesAgo}` : "credential",
+        },
+        modelId: "same-model",
+        report,
+      });
+    }
+  }
+  const providers = [
+    { provider: "openai-codex", cost: 1, expected: { "codex:primary": 25, "codex:secondary": 50 } },
+    { provider: "anthropic", cost: 3, expected: { five_hour: 75, seven_day: 150 } },
+    { provider: "opencode-go", cost: 5, expected: { rolling: 250, weekly: 125, monthly: 500 / 6 } },
+  ];
+  const calls = providers.map(({ provider, cost }) => ({
+    ...codexModelCall(provider, 14, cost, "same-model"),
+    provider,
+  }));
+  calls.push({ ...codexModelCall("unrelated", 14, 1000, "same-model"), provider: "openrouter" });
+  const view = deriveHistoryRange(loaded(calls, snapshots), 60 * 60_000);
+  for (const { provider, cost, expected } of providers) {
+    const history = view.quotas.providers.find((item) => item.providerId === provider);
+    assert.ok(history);
+    assert.equal(history.identities.length, 1);
+    const buckets = history.identities[0]?.buckets ?? [];
+    assert.equal(
+      buckets.filter((bucket) => bucket.modelEstimates !== undefined).length,
+      Object.keys(expected).length,
+    );
+    for (const bucket of buckets) {
+      const estimate = Object.entries(expected).find(([id]) => id === bucket.id)?.[1];
+      if (estimate === undefined) {
+        assert.equal(bucket.modelEstimates, undefined);
+        continue;
+      }
+      assert.ok(bucket.modelEstimates);
+      assert.equal(bucket.modelEstimates.length, 1);
+      assert.equal(bucket.modelEstimates[0]?.model, "same-model");
+      assert.equal(bucket.modelEstimates[0]?.recordedCost, cost);
+      assert.equal(bucket.modelEstimates[0]?.sampleCost, cost);
+      assert.equal(bucket.modelEstimates[0]?.estimated100PercentCost, estimate);
     }
   }
 });

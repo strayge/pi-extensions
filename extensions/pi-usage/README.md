@@ -361,15 +361,18 @@ quota window keeps an otherwise valid estimate but labels it a lower bound.
 These are empirical 100%-equivalents, not provider billing rules or guaranteed
 future capacity.
 
-Main Codex weekly buckets also show per-model historical averages for the
-**selected range**, in API-equivalent dollars, without replacing the aggregate
-estimate. Each model row includes its full recorded cost in that range, followed
-by the 100% estimate when available and inline sample cost and quota percentage
-points. Recorded model cost, reset details, estimate labels, and sample details
-are dimmed; estimated amounts stay at normal brightness.
+Shared quota windows for OpenAI/Codex, Anthropic, and OpenCode Go also show
+per-model historical averages for the **selected range**, in API-equivalent
+dollars, without replacing the aggregate estimate. This includes session/rolling,
+weekly, and monthly windows when supplied; each 100% estimate applies to the
+window containing its row. Model-scoped quotas and Anthropic's extra-usage bucket
+do not receive per-model estimates. Each model row includes its full recorded cost
+in that range, followed by the 100% estimate when available and inline sample cost
+and quota percentage points. Recorded model cost, reset details, estimate labels,
+and sample details are dimmed; estimated amounts stay at normal brightness.
 
 ```text
-model weekly 100% cost = sample recorded cost × 100 / sample quota consumption (pp)
+model window 100% cost = sample recorded cost × 100 / sample quota consumption (pp)
 ```
 
 Samples use active measurement windows of up to 15 minutes where that exact
@@ -390,7 +393,7 @@ mixed period's quota movement to its dominant model, which can underestimate
 that model's capacity when other models also consume quota. Models with zero
 attributed quota percentage points are hidden from Quotas; their recorded costs
 remain in Models. Rows with positive attributed movement remain visible even
-when a weekly estimate is unavailable. Estimates supported by less than 3 quota
+when an estimate is unavailable. Estimates supported by less than 3 quota
 percentage points show `weak evidence`. These are not permanent model values or
 subscription billing prices.
 

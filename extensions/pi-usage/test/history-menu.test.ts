@@ -22,7 +22,7 @@ import {
   showUsageHistory,
   updateHistoryMenuState,
 } from "../src/history-menu.ts";
-import type { UsageSnapshot } from "../src/types.ts";
+import type { UsageBucket, UsageSnapshot } from "../src/types.ts";
 
 const NOW = Date.UTC(2026, 8, 12, 12);
 initTheme("dark", false);
@@ -656,6 +656,90 @@ test("Quotas add selected-range model dollar averages without replacing aggregat
   assert.match(zeroQuota, /Anthropic\nFive-hour window:/);
   assert.doesNotMatch(zeroQuota, /model averages|gpt-supported|gpt-insufficient|gpt-attributed/);
   assert.equal(bucket.modelEstimates.length, 3);
+});
+
+test("shared quota model estimates render under each provider's window label", () => {
+  const providers: Array<{ id: string; name: string; buckets: UsageBucket[] }> = [
+    {
+      id: "openai-codex",
+      name: "OpenAI Codex",
+      buckets: [
+        { id: "codex:primary", label: "5h", groupId: "codex", windowMinutes: 300, unit: "percent" },
+        {
+          id: "codex:secondary",
+          label: "Weekly",
+          groupId: "codex",
+          windowMinutes: 10080,
+          unit: "percent",
+        },
+      ],
+    },
+    {
+      id: "anthropic",
+      name: "Anthropic",
+      buckets: [
+        { id: "five_hour", label: "Session", unit: "percent" },
+        { id: "seven_day", label: "Weekly", windowMinutes: 10080, unit: "percent" },
+      ],
+    },
+    {
+      id: "opencode-go",
+      name: "OpenCode Go",
+      buckets: [
+        { id: "rolling", label: "Rolling", unit: "percent" },
+        { id: "weekly", label: "Weekly", unit: "percent" },
+        { id: "monthly", label: "Monthly", unit: "percent" },
+      ],
+    },
+  ];
+  const state = { ...createHistoryMenuState(), tab: "Quotas" as const };
+  for (const provider of providers) {
+    const snapshots = [15, 0].map((minutesAgo) => {
+      const observation = snapshot(
+        `${provider.id}-${minutesAgo}`,
+        provider.id,
+        provider.name,
+        "identity",
+        NOW - minutesAgo * 60_000,
+        minutesAgo === 15 ? 10 : 14,
+      );
+      observation.snapshot.report.buckets = provider.buckets.map((bucket) => ({
+        ...bucket,
+        used: minutesAgo === 15 ? 10 : 14,
+        limit: 100,
+        resetsAt: NOW / 1000 + 604_800,
+      }));
+      return observation;
+    });
+    const history: LoadedHistory = {
+      now: NOW,
+      calls: [
+        call("model-call", 14 / 60, provider.id, "model-estimate", {
+          cost: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1 },
+        }),
+      ],
+      snapshots,
+      warnings: [],
+      subagents: [],
+    };
+    const output = renderUsageHistory(history, state, 200, 100, { padToHeight: false }).lines.join(
+      "\n",
+    );
+    assert.ok(output.includes(provider.name));
+    assert.equal(output.match(/model-estimate:/g)?.length, provider.buckets.length);
+    for (const bucket of provider.buckets) {
+      assert.match(
+        output,
+        new RegExp(
+          `${bucket.label}: +4% consumed[^\\n]*\\n {2}model-estimate: \\$1\\.00 · 100% ≈ \\$25\\.00 · sample \\$1\\.00 / 4 pp`,
+        ),
+      );
+    }
+    for (const width of [20, 80]) {
+      const lines = renderUsageHistory(history, state, width, 100, { padToHeight: false }).lines;
+      assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    }
+  }
 });
 
 test("per-model quota rows sanitize model IDs and stay width-safe with real theme", () => {

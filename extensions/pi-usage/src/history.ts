@@ -2304,12 +2304,17 @@ function aggregateQuotas(
           (item): item is QuotaObservation & { percentage: number } =>
             item.percentage !== undefined,
         );
+        // Only shared quota windows can be correlated with all of a provider's model calls.
         if (
-          isCodexProvider(provider.providerId) &&
-          bucket.latest.windowMinutes === 10_080 &&
-          (bucket.latest.groupId === undefined
-            ? bucket.id === "codex" || bucket.id.startsWith("codex:")
-            : bucket.latest.groupId === "codex")
+          bucket.latest.unit === "percent" &&
+          ((isCodexProvider(provider.providerId) &&
+            (bucket.latest.groupId === undefined
+              ? bucket.id === "codex" || bucket.id.startsWith("codex:")
+              : bucket.latest.groupId === "codex")) ||
+            (provider.providerId === "anthropic" &&
+              (bucket.id === "five_hour" || bucket.id === "seven_day")) ||
+            (provider.providerId === "opencode-go" &&
+              (bucket.id === "rolling" || bucket.id === "weekly" || bucket.id === "monthly")))
         ) {
           bucket.modelEstimates = estimateModelQuotas(
             capacityObservations,
