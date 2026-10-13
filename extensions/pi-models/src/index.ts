@@ -75,7 +75,7 @@ export default function (pi: ExtensionAPI): void {
     }
   });
   pi.registerCommand("models", {
-    description: "Choose from all available models",
+    description: "Choose a model and manage favorites and visibility",
     handler: async (_args, ctx) => {
       const history = await loadHistory();
       const states = Object.fromEntries(
@@ -87,35 +87,48 @@ export default function (pi: ExtensionAPI): void {
         states,
         current: ctx.model ? modelKey(ctx.model) : undefined,
       });
-      if (result.favorites && Object.keys(result.favorites).length > 0) {
+      if (
+        Object.keys(result.favorites ?? {}).length > 0 ||
+        Object.keys(result.hidden ?? {}).length > 0
+      ) {
         try {
           await mutateHistory((next) => {
             for (const [key, favorite] of Object.entries(result.favorites ?? {})) {
               next.models[key] = { ...next.models[key], favorite };
             }
+            for (const [key, hidden] of Object.entries(result.hidden ?? {})) {
+              next.models[key] = { ...next.models[key], hidden };
+            }
           });
         } catch (error) {
-          ctx.ui.notify(`Could not save model favorite: ${String(error)}`, "error");
+          ctx.ui.notify(`Could not save model preferences: ${String(error)}`, "error");
         }
       }
       if (!result.model) return;
       if (ctx.mode !== "tui") {
+        const key = modelKey(result.model);
+        const visibilityAction = states[key]?.hidden ? "Unhide model" : "Hide model";
         const action = await ctx.ui.select(
           "Model action",
-          ["Select", "Toggle favorite", "Cancel"],
+          ["Select", "Toggle favorite", visibilityAction, "Cancel"],
           Object.assign({} as ExtensionUIDialogOptions, {
             [Symbol.for("pi-extensions:input-dialog")]: false,
           }),
         );
-        if (action === "Toggle favorite") {
-          const key = modelKey(result.model);
-          states[key] = { ...states[key], favorite: !states[key]?.favorite };
+        const field =
+          action === "Toggle favorite"
+            ? "favorite"
+            : action === visibilityAction
+              ? "hidden"
+              : undefined;
+        if (field) {
+          const value = !states[key]?.[field];
           try {
             await mutateHistory((next) => {
-              next.models[key] = { ...next.models[key], favorite: states[key]?.favorite };
+              next.models[key] = { ...next.models[key], [field]: value };
             });
           } catch (error) {
-            ctx.ui.notify(`Could not save model favorite: ${String(error)}`, "error");
+            ctx.ui.notify(`Could not save model preferences: ${String(error)}`, "error");
           }
           return;
         }

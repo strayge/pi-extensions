@@ -58,25 +58,30 @@ test("malformed records are discarded but valid records survive", () => {
   const history = parseHistory({
     version: 1,
     models: {
-      good: { favorite: true, lastUsedAt: 4, thinkingLevel: "high" },
+      good: { favorite: true, hidden: true, lastUsedAt: 4, thinkingLevel: "high" },
+      visible: { hidden: false },
       bad: "no",
-      nan: { lastUsedAt: "4", thinkingLevel: "extreme" },
+      nan: { hidden: "true", lastUsedAt: "4", thinkingLevel: "extreme" },
     },
   });
   assert.deepEqual(history.models, {
-    good: { favorite: true, lastUsedAt: 4, thinkingLevel: "high" },
+    good: { favorite: true, hidden: true, lastUsedAt: 4, thinkingLevel: "high" },
+    visible: { hidden: false },
   });
 });
 
 test("mutation reloads and preserves unavailable entries", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-models-"));
   const file = join(dir, "model-history.json");
-  await writeFile(file, JSON.stringify({ version: 1, models: { "gone/id": { favorite: true } } }));
+  await writeFile(
+    file,
+    JSON.stringify({ version: 1, models: { "gone/id": { favorite: true, hidden: true } } }),
+  );
   await mutateHistory((history) => {
     history.models["live/id"] = { lastUsedAt: 3 };
   }, file);
   assert.deepEqual((await loadHistory(file)).models, {
-    "gone/id": { favorite: true },
+    "gone/id": { favorite: true, hidden: true },
     "live/id": { lastUsedAt: 3 },
   });
   assert.match(await readFile(file, "utf8"), /"version": 1/);
@@ -140,5 +145,97 @@ test("favorite toggle retains the highlighted model after resorting", () => {
   assert.deepEqual(result, {
     model: { provider: "p", id: "second" },
     favorites: { "p/second": true },
+    hidden: {},
   });
+});
+
+test("hidden favorites are excluded unless All is requested", () => {
+  const states = { "z/old": { favorite: true, hidden: true } };
+  assert.deepEqual(rankModels(models, states).map(modelKey), ["a/never", "a/new"]);
+  assert.deepEqual(rankModels(models, states, "", true).map(modelKey), [
+    "z/old",
+    "a/never",
+    "a/new",
+  ]);
+});
+
+test("hiding selects the next row, falls back at the end, and saves changes on Escape", () => {
+  let result: unknown;
+  const selector = new ModelSelector({
+    models: ["a", "b", "c"].map((id) => ({ provider: "p", id })),
+    states: {},
+    done: (value) => {
+      result = value;
+    },
+  });
+  selector.handleInput("\x1b[B");
+  selector.handleInput("\x04");
+  assert.ok(selector.render(80).some((line) => line.startsWith(">  [p] c")));
+  selector.handleInput("\x04");
+  assert.ok(selector.render(80).some((line) => line.startsWith(">  [p] a")));
+  selector.handleInput("\x04");
+  assert.ok(selector.render(80).some((line) => line.includes("Tab shows all")));
+  selector.handleInput("\x04");
+  selector.handleInput("\x1b");
+  assert.deepEqual(result, {
+    favorites: {},
+    hidden: { "p/a": true, "p/b": true, "p/c": true },
+  });
+});
+
+test("switching views preserves search and selecting a hidden model does not unhide it", () => {
+  const hidden = { provider: "p", id: "hidden" };
+  const states = { "p/hidden": { favorite: true, hidden: true } };
+  let result: unknown;
+  const selector = new ModelSelector({
+    models: [hidden, { provider: "p", id: "visible" }],
+    states,
+    done: (value) => {
+      result = value;
+    },
+  });
+  selector.handleInput("h");
+  assert.ok(selector.render(80).some((line) => line.includes("No matching visible models")));
+  selector.handleInput("\t");
+  assert.ok(selector.render(80)[0]?.includes("All"));
+  assert.ok(selector.render(80).some((line) => line.startsWith("> *[p] hidden")));
+  selector.handleInput("\t");
+  assert.ok(selector.render(80).some((line) => line.includes("No matching visible models")));
+  selector.handleInput("\t");
+  selector.handleInput("\r");
+  assert.deepEqual(result, { model: hidden, favorites: {}, hidden: {} });
+  assert.equal(states["p/hidden"].hidden, true);
+});
+
+test("visibility toggles in All dim the row, keep the cursor clear, and preserve preferences", () => {
+  const states = { "p/a": { favorite: true, lastUsedAt: 99 } };
+  let result: unknown;
+  const selector = new ModelSelector({
+    models: ["a", "b"].map((id) => ({ provider: "p", id })),
+    states,
+    current: "p/a",
+    theme: {
+      fg: (color, text) => (color === "dim" ? `\x1b[2m${text}\x1b[22m` : text),
+    },
+    done: (value) => {
+      result = value;
+    },
+  });
+  selector.handleInput("\t");
+  selector.handleInput("\x04");
+  const hiddenRow = selector.render(80).find((line) => line.startsWith(">"));
+  assert.ok(hiddenRow);
+  assert.ok(hiddenRow.startsWith("> \x1b[2m*[p] a ✓\x1b[22m"));
+  assert.ok(!hiddenRow.includes("[hidden]"));
+  for (const width of [1, 3, 20, 80]) {
+    for (const line of selector.render(width)) assert.ok(visibleWidth(line) <= width);
+  }
+  selector.handleInput("\x04");
+  const visibleRow = selector.render(80).find((line) => line.startsWith(">"));
+  assert.ok(visibleRow);
+  assert.ok(visibleRow.startsWith("> *[p] a ✓"));
+  assert.ok(!visibleRow.includes("\x1b[2m"));
+  selector.handleInput("\x1b");
+  assert.deepEqual(result, { favorites: {}, hidden: { "p/a": false } });
+  assert.deepEqual(states["p/a"], { favorite: true, lastUsedAt: 99, hidden: false });
 });

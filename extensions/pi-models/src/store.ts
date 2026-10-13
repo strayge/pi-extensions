@@ -16,6 +16,7 @@ const thinkingLevels = new Set<ThinkingLevel>([
 
 export interface ModelRecord {
   favorite?: boolean;
+  hidden?: boolean;
   lastUsedAt?: number;
   thinkingLevel?: ThinkingLevel;
 }
@@ -39,11 +40,13 @@ export function parseHistory(value: unknown): ModelHistory {
     if (!raw || typeof raw !== "object" || !key) continue;
     const record = raw as {
       favorite?: unknown;
+      hidden?: unknown;
       lastUsedAt?: unknown;
       thinkingLevel?: unknown;
     };
     const clean: ModelRecord = {};
     if (typeof record.favorite === "boolean") clean.favorite = record.favorite;
+    if (typeof record.hidden === "boolean") clean.hidden = record.hidden;
     if (
       typeof record.thinkingLevel === "string" &&
       thinkingLevels.has(record.thinkingLevel as ThinkingLevel)
@@ -59,6 +62,7 @@ export function parseHistory(value: unknown): ModelHistory {
     }
     if (
       clean.favorite !== undefined ||
+      clean.hidden !== undefined ||
       clean.lastUsedAt !== undefined ||
       clean.thinkingLevel !== undefined
     ) {

@@ -5,6 +5,7 @@ export interface ModelLike {
 }
 export interface ModelState {
   favorite?: boolean;
+  hidden?: boolean;
   lastUsedAt?: number;
 }
 export interface RankedModel<T extends ModelLike> {
@@ -31,11 +32,13 @@ export function rankModels<T extends ModelLike>(
   models: readonly T[],
   states: Record<string, ModelState>,
   query = "",
+  showHidden = false,
 ): T[] {
   const ranked: RankedModel<T>[] = [];
   for (const model of models) {
     const key = identity(model);
     const state = states[key] ?? {};
+    if (state.hidden && !showHidden) continue;
     const fields = [model.provider, model.id, key, model.name ?? ""];
     const score = query.trim()
       ? Math.max(...fields.map((field) => fuzzyScore(field, query.trim())))

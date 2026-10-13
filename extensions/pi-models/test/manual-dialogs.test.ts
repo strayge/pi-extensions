@@ -9,12 +9,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import modelsExtension from "../src/index.ts";
 import { chooseModel } from "../src/selector.ts";
-import { loadHistory } from "../src/store.ts";
+import { loadHistory, mutateHistory } from "../src/store.ts";
 
 const marker = Symbol.for("pi-extensions:input-dialog");
 const model = { provider: "p", id: "m" };
 
-test("/models native selection and favorite actions are manual without changing their results", async (t) => {
+test("/models native selection, favorites, and visibility actions remain manual", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "pi-models-manual-"));
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = dir;
@@ -35,7 +35,23 @@ test("/models native selection and favorite actions are manual without changing 
       return true;
     },
   } as never);
-  const choices = ["[p] m", "Toggle favorite", "[p] m", "Select"];
+  await mutateHistory((history) => {
+    history.models["p/m"] = { thinkingLevel: "high" };
+  });
+  const choices = [
+    "[p] m",
+    "Toggle favorite",
+    "[p] m",
+    "Hide model",
+    "Show all models",
+    "[p] m [hidden]",
+    "Select",
+    "Show all models",
+    "[p] m [hidden]",
+    "Unhide model",
+    "[p] m",
+    "Select",
+  ];
   const titles: string[] = [];
   const context = {
     mode: "rpc",
@@ -45,7 +61,9 @@ test("/models native selection and favorite actions are manual without changing 
         titles.push(title);
         assert.equal(Reflect.get(options ?? {}, marker), false);
         assert.equal(Reflect.get({ ...options }, marker), false);
-        return choices.shift();
+        const choice = choices.shift();
+        assert.ok(choice && _labels.includes(choice));
+        return choice;
       },
     },
   } as never;
@@ -53,8 +71,71 @@ test("/models native selection and favorite actions are manual without changing 
   assert.equal((await loadHistory()).models["p/m"]?.favorite, true);
   assert.deepEqual(selected, []);
   await handler("", context);
+  assert.equal((await loadHistory()).models["p/m"]?.hidden, true);
+  assert.deepEqual(selected, []);
+  await handler("", context);
   assert.deepEqual(selected, [model]);
-  assert.deepEqual(titles, ["Select model", "Model action", "Select model", "Model action"]);
+  assert.equal((await loadHistory()).models["p/m"]?.hidden, true);
+  await handler("", context);
+  assert.deepEqual((await loadHistory()).models["p/m"], {
+    favorite: true,
+    hidden: false,
+    thinkingLevel: "high",
+  });
+  await handler("", context);
+  assert.deepEqual(selected, [model, model]);
+  assert.deepEqual(titles, [
+    "Select model",
+    "Model action",
+    "Select model",
+    "Model action",
+    "Select model",
+    "Select model",
+    "Model action",
+    "Select model",
+    "Select model",
+    "Model action",
+    "Select model",
+    "Model action",
+  ]);
+});
+
+test("closing the rich picker saves visibility and favorites without switching models", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-models-visibility-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  });
+  await mutateHistory((history) => {
+    history.models["p/m"] = { thinkingLevel: "high" };
+  });
+  let handler!: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+  modelsExtension({
+    on() {},
+    registerCommand(_name: string, command: { handler: typeof handler }) {
+      handler = command.handler;
+    },
+    async setModel() {
+      assert.fail("Closing without a selection must not switch models");
+    },
+  } as never);
+  await handler("", {
+    mode: "tui",
+    modelRegistry: { getAvailable: () => [model] },
+    ui: {
+      async custom() {
+        return { favorites: { "p/m": true }, hidden: { "p/m": true } };
+      },
+    },
+  } as never);
+  assert.deepEqual((await loadHistory()).models["p/m"], {
+    favorite: true,
+    hidden: true,
+    thinkingLevel: "high",
+  });
 });
 
 test("the rich model selector remains unmarked", async () => {
