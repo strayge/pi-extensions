@@ -676,7 +676,6 @@ function quotasLines(
       }
       const titles = quotaBucketTitles(identity.buckets);
       for (const [bucketIndex, bucket] of identity.buckets.entries()) {
-        if (bucketIndex > 0) lines.push("");
         lines.push(...quotaBucketLines(bucket, width, range, titles[bucketIndex], theme));
       }
     }

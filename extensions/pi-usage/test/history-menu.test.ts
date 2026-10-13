@@ -736,6 +736,14 @@ test("Quotas show one Anthropic account across historical and live credential ro
     warnings: [],
     subagents: [],
   };
+  for (const [index, item] of history.snapshots.entries()) {
+    item.snapshot.report.buckets.push({
+      id: "weekly",
+      label: "Weekly",
+      unit: "percent",
+      used: index + 1,
+    });
+  }
   const live = snapshot("live", "anthropic", "Anthropic", "live-credential", NOW, 90).snapshot;
   const output = renderUsageHistory(
     history,
@@ -745,6 +753,7 @@ test("Quotas show one Anthropic account across historical and live credential ro
     { live: { ...live.report, identity: live.identity, report: live.report } },
   ).lines.join("\n");
   assert.match(output, /Anthropic\nFive-hour window: 10% consumed · 100% ≈ \$4\.00/);
+  assert.match(output, /Five-hour window:[^\n]*\nWeekly:/);
   assert.doesNotMatch(output, /Account \d|overlapping quota identities|both activity boundaries/);
 });
 
