@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
 import { prioritizeModelsCommand } from "./autocomplete.ts";
+import { GoCatalogCache } from "./opencode-go-cache.ts";
 import { chooseModel } from "./selector.ts";
 import { modelKey } from "./sort.ts";
 import { hasStaleLlamaCache, loadHistory, mutateHistory, type ThinkingLevel } from "./store.ts";
@@ -7,6 +8,8 @@ import { hasStaleLlamaCache, loadHistory, mutateHistory, type ThinkingLevel } fr
 export default function (pi: ExtensionAPI): void {
   let activeModel: string | undefined;
   let activeThinking: ThinkingLevel | undefined;
+  const goCatalog = new GoCatalogCache();
+  pi.on("session_shutdown", () => goCatalog.dispose());
 
   pi.on("session_start", (_event, ctx) => {
     activeModel = ctx.model ? modelKey(ctx.model) : undefined;
@@ -85,10 +88,19 @@ export default function (pi: ExtensionAPI): void {
       if (models.some((model) => model.provider === "llama.cpp") && (await hasStaleLlamaCache())) {
         models = models.filter((model) => model.provider !== "llama.cpp");
       }
+      const hasGoModels = models.some((model) => model.provider === "opencode-go");
+      if (hasGoModels) await goCatalog.load();
       const result = await chooseModel(ctx, {
         models,
         states,
         current: ctx.model ? modelKey(ctx.model) : undefined,
+        annotations: hasGoModels ? goCatalog.annotations(models) : undefined,
+        refreshAnnotations: hasGoModels
+          ? async () => {
+              await goCatalog.refresh();
+              return goCatalog.annotations(models);
+            }
+          : undefined,
       });
       if (
         Object.keys(result.favorites ?? {}).length > 0 ||

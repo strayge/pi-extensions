@@ -22,6 +22,9 @@ export interface SelectorOptions {
   models: readonly ModelLike[];
   states: Record<string, ModelState>;
   current?: string;
+  annotations?: Record<string, string>;
+  refreshAnnotations?: () => Promise<Record<string, string>>;
+  onUpdate?: () => void;
   theme?: Pick<Theme, "fg">;
   done?: (result: SelectorResult) => void;
 }
@@ -57,9 +60,11 @@ export class ModelSelector implements Component {
       const mark = this.options.states[key]?.favorite ? "*" : " ";
       const cursor = index === this.selected ? ">" : " ";
       const name = model.name || model.id;
+      const annotation = this.options.annotations?.[key];
+      const suffix = annotation ? `  ${annotation}` : "";
       if (this.options.states[key]?.hidden) {
         const current = key === this.options.current ? " ✓" : "";
-        const row = `${mark}[${model.provider}] ${name}${current}`;
+        const row = `${mark}[${model.provider}] ${name}${current}${suffix}`;
         return `${cursor} ${this.options.theme?.fg("dim", row) ?? row}`;
       }
       const provider = this.options.theme
@@ -67,7 +72,8 @@ export class ModelSelector implements Component {
         : `[${model.provider}]`;
       const current =
         key === this.options.current ? (this.options.theme?.fg("warning", " ✓") ?? " ✓") : "";
-      return `${cursor} ${mark}${provider} ${name}${current}`;
+      const styledSuffix = suffix ? (this.options.theme?.fg("dim", suffix) ?? suffix) : "";
+      return `${cursor} ${mark}${provider} ${name}${current}${styledSuffix}`;
     });
     const position =
       this.models.length > maxVisible ? `  (${this.selected + 1}/${this.models.length})` : "";
@@ -91,6 +97,12 @@ export class ModelSelector implements Component {
       "Enter select | Esc close",
     ];
     return lines.map((line) => truncateToWidth(line, safe, ""));
+  }
+  setAnnotations(annotations: Record<string, string>): void {
+    if (this.disposed) return;
+    this.options.annotations = annotations;
+    this.invalidate();
+    this.options.onUpdate?.();
   }
   handleInput(data: string): void {
     if (this.disposed) return;
@@ -152,15 +164,33 @@ export async function chooseModel(
   options: SelectorOptions,
 ): Promise<SelectorResult> {
   if (ctx.mode === "tui")
-    return ctx.ui.custom(
-      (_tui, theme, _keys, done) => new ModelSelector({ ...options, theme, done }),
-    );
+    return ctx.ui.custom((tui, theme, _keys, done) => {
+      const selector = new ModelSelector({
+        ...options,
+        theme,
+        done,
+        onUpdate: () => tui.requestRender(),
+      });
+      void options
+        .refreshAnnotations?.()
+        .then((annotations) => selector.setAnnotations(annotations))
+        .catch(() => {});
+      return selector;
+    });
+  void options
+    .refreshAnnotations?.()
+    .then((annotations) => {
+      options.annotations = annotations;
+    })
+    .catch(() => {});
   let showHidden = false;
   for (;;) {
     const sorted = rankModels(options.models, options.states, "", showHidden);
     const choices = sorted.map((model) => {
-      const hidden = options.states[modelKey(model)]?.hidden ? " [hidden]" : "";
-      return `[${model.provider}] ${model.name || model.id}${hidden}`;
+      const key = modelKey(model);
+      const hidden = options.states[key]?.hidden ? " [hidden]" : "";
+      const annotation = options.annotations?.[key];
+      return `[${model.provider}] ${model.name || model.id}${hidden}${annotation ? `  ${annotation}` : ""}`;
     });
     const toggleView = showHidden ? "Show visible models" : "Show all models";
     const choice = await ctx.ui.select(

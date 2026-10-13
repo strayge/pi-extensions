@@ -3,9 +3,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { prioritizeModelsCommand } from "../src/autocomplete.ts";
-import { ModelSelector } from "../src/selector.ts";
+import { chooseModel, ModelSelector, type SelectorResult } from "../src/selector.ts";
 import { modelKey, rankModels } from "../src/sort.ts";
 import { hasStaleLlamaCache, loadHistory, mutateHistory, parseHistory } from "../src/store.ts";
 
@@ -238,6 +239,79 @@ test("visibility toggles in All dim the row, keep the cursor clear, and preserve
   selector.handleInput("\x1b");
   assert.deepEqual(result, { favorites: {}, hidden: { "p/a": false } });
   assert.deepEqual(states["p/a"], { favorite: true, lastUsedAt: 99, hidden: false });
+});
+
+test("allowance suffixes are dim, preserve selection markers, and fit narrow widths", () => {
+  const selector = new ModelSelector({
+    models: [{ provider: "opencode-go", id: "gpt", name: "GPT 6 Luna" }],
+    states: {},
+    current: "opencode-go/gpt",
+    annotations: { "opencode-go/gpt": "$15/mo · ~21,150 req/mo" },
+    theme: { fg: (color, text) => (color === "dim" ? `\x1b[2m${text}\x1b[22m` : text) },
+  });
+  const row = selector.render(100).find((line) => line.startsWith(">"));
+  assert.ok(row?.startsWith(">  [opencode-go] GPT 6 Luna ✓\x1b[2m  $15/mo"));
+  for (const width of [1, 3, 20, 50, 100]) {
+    for (const line of selector.render(width)) assert.ok(visibleWidth(line) <= width);
+  }
+  selector.handleInput("\t");
+  selector.handleInput("\x04");
+  assert.ok(
+    selector
+      .render(100)
+      .some((line) => line.startsWith("> \x1b[2m") && line.includes("~21,150 req/mo")),
+  );
+});
+
+test("the picker opens before annotations arrive and does not render after disposal", async () => {
+  let resolveRefresh!: (value: Record<string, string>) => void;
+  const refresh = new Promise<Record<string, string>>((resolve) => {
+    resolveRefresh = resolve;
+  });
+  let selector!: ModelSelector;
+  let renders = 0;
+  const context = {
+    mode: "tui",
+    ui: {
+      custom(
+        factory: (
+          tui: object,
+          theme: object,
+          keys: object,
+          done: (result: SelectorResult) => void,
+        ) => ModelSelector,
+      ) {
+        return new Promise<SelectorResult>((resolve) => {
+          selector = factory(
+            {
+              requestRender() {
+                renders++;
+              },
+            },
+            { fg: (_color: string, text: string) => text },
+            {},
+            resolve,
+          );
+        });
+      },
+    },
+  } as unknown as ExtensionCommandContext;
+  const pending = chooseModel(context, {
+    models: [{ provider: "opencode-go", id: "gpt", name: "GPT 6 Luna" }],
+    states: {},
+    refreshAnnotations: () => refresh,
+  });
+  assert.ok(selector.render(100).some((line) => line.includes("GPT 6 Luna")));
+  assert.ok(selector.render(100).every((line) => !line.includes("req/mo")));
+  resolveRefresh({ "opencode-go/gpt": "$15/mo · ~21,150 req/mo" });
+  await refresh;
+  assert.equal(renders, 1);
+  assert.ok(selector.render(100).some((line) => line.includes("~21,150 req/mo")));
+  selector.handleInput("\r");
+  assert.equal((await pending).model?.id, "gpt");
+  selector.dispose();
+  selector.setAnnotations({});
+  assert.equal(renders, 1);
 });
 
 test("only confirmed llama.cpp caches older than 24 hours expire", async (t) => {

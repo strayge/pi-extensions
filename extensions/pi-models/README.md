@@ -12,6 +12,17 @@ Use Up/Down and Enter to select, Ctrl+F to toggle a favorite, Ctrl+D to hide/unh
 close. Favorite and visibility changes are saved even when closing without selecting a model.
 Typing filters the current view by provider, model ID, provider/model ID, or model name.
 
+OpenCode Go rows show dim monthly allowances and recalculated request estimates, for example
+`$15/mo · ~21,150 req/mo`. Values come from OpenCode's current published catalog, not a bundled
+model table, and use the **Go** plan (not Go Plus). Monthly requests are estimated as five times
+its rounded five-hour estimate, based on the current 20% window allowance; they are not fixed
+request caps and can differ slightly from the documentation's estimates.
+
+The picker opens without waiting for the network and updates when a refresh completes. The catalog
+is cached globally in `opencode-go-models.json` and checked at most hourly while opening `/models`.
+Offline or incompatible updates retain the last good values, marked `[stale]` after an hour;
+models without a safe catalog match have no suffix.
+
 Hiding affects only `/models`, not the active model, built-in `/model`, or model cycling. Hidden models
 remain selectable in All without being unhidden. Other preferences are preserved, and new models
 are visible by default. Non-terminal dialogs retain `[hidden]` badges and provide Show all/visible
