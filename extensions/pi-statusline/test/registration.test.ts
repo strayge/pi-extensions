@@ -280,7 +280,12 @@ test("changed options are pushed once, per id, with every instance", () => {
   }
 
   assert.deepEqual(pushed, [
-    { id: "usage", version: 3, instances: [{ options: { barWidth: 12 } }, { options: {} }] },
+    {
+      id: "usage",
+      owner: "test-session",
+      version: 3,
+      instances: [{ options: { barWidth: 12 } }, { options: {} }],
+    },
   ]);
 });
 

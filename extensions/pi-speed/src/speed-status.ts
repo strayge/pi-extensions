@@ -15,7 +15,7 @@ export function registerSpeedStatus(pi: ExtensionAPI): void {
     if (!ctx.hasUI) return;
     try {
       ctx.ui.setStatus("speed", value);
-      publish(value);
+      publish(ctx, value);
     } catch (error) {
       if (!isStaleExtensionContextError(error)) throw error;
     }

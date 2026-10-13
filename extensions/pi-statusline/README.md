@@ -279,9 +279,19 @@ Other extensions can put their own text in the statusline over pi's shared event
 bus. A producer publishes an item and may suggest where it belongs; the
 suggestion is only a default — if your config names the id, your placement wins.
 
+Every slot message (`publish`, `clear`, `register`, `unregister`, `request`,
+`options` on `statusline:*`) carries a non-empty `owner`: the sending session's id
+from `ctx.sessionManager.getSessionId()`. The statusline and helpers ignore
+messages for another session and unstamped messages; `ctx.ui.setStatus` works
+as before. The registry drops traffic and emits nothing until session start;
+helpers only answer requests/options after `publish(ctx, …)` or `slot.refresh(ctx)`
+supplies an owner.
+
 ```typescript
+const owner = ctx.sessionManager.getSessionId();
 pi.events.emit("statusline:publish", {
   id: "usage",
+  owner,
   text: "42%",
   icon: "📊",
   color: "muted",
@@ -289,13 +299,14 @@ pi.events.emit("statusline:publish", {
   defaultPlacement: { line: 1, side: "right", order: 10 },  // a hint
 });
 
-pi.events.emit("statusline:clear", { id: "usage" });
+pi.events.emit("statusline:clear", { id: "usage", owner });
 ```
 
 `src/publish.ts` wraps this in a small helper that also re-publishes when the
-statusline asks (`statusline:request`, emitted at session start, which covers
-extensions that loaded before it). The file depends on nothing else here, so
-copy it into your own extension rather than taking a dependency:
+owning statusline asks (`statusline:request` with `{ owner }` at session start),
+recovering traffic dropped before that session adopted its owner. The file depends
+on nothing else here, so copy it into your own extension rather than taking a
+dependency:
 
 ```typescript
 const publish = publishStatuslineItem(pi, {
@@ -303,8 +314,8 @@ const publish = publishStatuslineItem(pi, {
   icon: "📊",
   defaultPlacement: { line: 1, side: "right" },
 });
-publish("42%");       // show
-publish(undefined);   // hide
+publish(ctx, "42%");       // show
+publish(ctx, undefined);   // hide
 ```
 
 `pi-usage` in this repo publishes its `usage` slot exactly this way, so
@@ -334,6 +345,7 @@ const slot = registerStatuslineSlot(pi, {
   ],
   onOptions: (options) => save({ ...config, ...options }),
 });
+slot.refresh(ctx);  // at session start, and when your own config changes
 ```
 
 Values live in the item, so two placements of the same slot can differ:

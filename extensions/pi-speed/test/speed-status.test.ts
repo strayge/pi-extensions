@@ -75,7 +75,11 @@ function setup(entries: SessionEntry[] = [], allEntries = entries) {
   const context = createMockContext({
     hasUI: true,
     model: MODEL,
-    sessionManager: { getBranch: () => branch, getEntries: () => all },
+    sessionManager: {
+      getSessionId: () => "test-session",
+      getBranch: () => branch,
+      getEntries: () => all,
+    },
     modelRegistry: new Proxy({}, { get: () => assert.fail("speed must not resolve auth") }),
   });
   return {
@@ -213,14 +217,58 @@ test("speed remains an independent replayable slot and clears stale values", () 
   state.pi.events.on("statusline:publish", (value) => published.push(value));
   state.pi.events.on("statusline:clear", (value) => cleared.push(value));
   state.fire("session_start");
-  assert.deepEqual(published, [{ id: "speed", text: "500.0 tok/s" }]);
-  state.pi.events.emit("statusline:request", {});
+  assert.deepEqual(published, [{ id: "speed", text: "500.0 tok/s", owner: "test-session" }]);
+  state.pi.events.emit("statusline:request", { owner: "test-session" });
   state.fire("turn_end");
   assert.equal(published.length, 2);
   state.fire("session_shutdown");
-  assert.deepEqual(cleared, [{ id: "speed" }]);
-  state.pi.events.emit("statusline:request", {});
+  assert.deepEqual(cleared, [{ id: "speed", owner: "test-session" }]);
+  state.pi.events.emit("statusline:request", { owner: "test-session" });
   assert.equal(published.length, 2);
+});
+
+test("shared-bus requests replay only the owning session's speed", () => {
+  const mock = createMockPi();
+  registerSpeedStatus(mock.pi);
+  registerSpeedStatus(mock.pi);
+  const contexts = ["parent-session", "child-session"].map((owner, index) => {
+    const entry = assistant();
+    const entries = [entry, annotation(entry, (index + 1) * 1_000)];
+    return createMockContext({
+      hasUI: true,
+      model: MODEL,
+      sessionManager: {
+        getSessionId: () => owner,
+        getBranch: () => entries,
+        getEntries: () => entries,
+      },
+    }).ctx;
+  });
+  const published: unknown[] = [];
+  const cleared: unknown[] = [];
+  mock.pi.events.on("statusline:publish", (value) => published.push(value));
+  mock.pi.events.on("statusline:clear", (value) => cleared.push(value));
+  mock.pi.events.emit("statusline:request", {});
+  assert.deepEqual(published, []);
+  for (const [index, ctx] of contexts.entries()) {
+    mock.events.get("session_start")?.[index]?.({}, ctx);
+  }
+  const parent = { id: "speed", text: "500.0 tok/s", owner: "parent-session" };
+  const child = { id: "speed", text: "250.0 tok/s", owner: "child-session" };
+  assert.deepEqual(published, [parent, child]);
+  mock.pi.events.emit("statusline:request", {});
+  assert.deepEqual(published, [parent, child]);
+  mock.pi.events.emit("statusline:request", { owner: "parent-session" });
+  assert.deepEqual(published, [parent, child, parent]);
+  mock.pi.events.emit("statusline:request", { owner: "child-session" });
+  assert.deepEqual(published, [parent, child, parent, child]);
+  for (const [index, ctx] of contexts.entries()) {
+    mock.events.get("session_shutdown")?.[index]?.({}, ctx);
+  }
+  assert.deepEqual(cleared, [
+    { id: "speed", owner: "parent-session" },
+    { id: "speed", owner: "child-session" },
+  ]);
 });
 
 test("missing models and non-UI sessions do not inspect history", () => {
@@ -231,6 +279,7 @@ test("missing models and non-UI sessions do not inspect history", () => {
       hasUI,
       model: hasUI ? undefined : MODEL,
       sessionManager: {
+        getSessionId: () => "test-session",
         getBranch: () => assert.fail("must not inspect branch"),
         getEntries: () => assert.fail("must not inspect annotations"),
       },
@@ -246,7 +295,11 @@ test("stale contexts suppress status writes", () => {
   const { ctx } = createMockContext({
     hasUI: true,
     model: MODEL,
-    sessionManager: { getBranch: () => [], getEntries: () => [] },
+    sessionManager: {
+      getSessionId: () => "test-session",
+      getBranch: () => [],
+      getEntries: () => [],
+    },
     ui: {
       setStatus: () => {
         throw new Error("This extension ctx is stale after session replacement or reload");
@@ -254,4 +307,11 @@ test("stale contexts suppress status writes", () => {
     },
   });
   assert.doesNotThrow(() => mock.events.get("session_start")?.[0]?.({}, ctx));
+  const staleOwnerContext = createMockContext({ hasUI: true }).ctx;
+  Object.defineProperty(staleOwnerContext, "sessionManager", {
+    get: () => {
+      throw new Error("This extension ctx is stale after session replacement or reload");
+    },
+  });
+  assert.doesNotThrow(() => mock.events.get("session_shutdown")?.[0]?.({}, staleOwnerContext));
 });

@@ -6,13 +6,14 @@
  * Standalone by design: it talks to pi's shared event bus and imports nothing
  * from the statusline package. With no statusline installed the events go
  * nowhere and the calls cost nothing, so this stays alongside
- * `ctx.ui.setStatus`, which is what a stock pi footer reads.
+ * `ctx.ui.setStatus`, which is what a stock pi footer reads. Messages carry
+ * the calling session's owner, and replays only match that session owner.
  *
  * Unlike the reference helper, the setter takes a color per call — a mode's
  * color is part of what the chip reports, so it changes as the mode does.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const PUBLISH_CHANNEL = "statusline:publish";
 const CLEAR_CHANNEL = "statusline:clear";
@@ -47,30 +48,37 @@ export interface SlotDefinition {
 /**
  * Returns a setter for one slot; `undefined` hides it.
  *
- * The last value is re-sent whenever the statusline asks for it, which covers
- * the statusline starting after this extension has already published — load
- * order between extensions is not fixed.
+ * The last value is re-sent when the owning session's statusline asks for it,
+ * recovering publications dropped before the statusline's session_start.
+ * Pass the context performing each write so unchanged text moves with sessions.
  */
 export function publishStatuslineItem(
   pi: ExtensionAPI,
   definition: SlotDefinition,
-): (text: string | undefined, color?: SlotColor) => void {
+): (ctx: Pick<ExtensionContext, "sessionManager">, text: string | undefined, color?: SlotColor) => void {
+  let sessionOwner: string | undefined;
   let current: string | undefined;
   let currentColor: SlotColor | undefined;
 
   const send = () => {
-    if (current === undefined) pi.events.emit(CLEAR_CHANNEL, { id: definition.id });
-    else pi.events.emit(PUBLISH_CHANNEL, { ...definition, color: currentColor ?? definition.color, text: current });
+    if (current === undefined) pi.events.emit(CLEAR_CHANNEL, { id: definition.id, owner: sessionOwner });
+    else pi.events.emit(PUBLISH_CHANNEL, { ...definition, color: currentColor ?? definition.color, text: current, owner: sessionOwner });
   };
 
-  pi.events.on(REQUEST_CHANNEL, () => {
-    if (current !== undefined) send();
+  pi.events.on(REQUEST_CHANNEL, (data) => {
+    if (sessionOwner && isRecord(data) && data.owner === sessionOwner && current !== undefined) send();
   });
 
-  return (text: string | undefined, color?: SlotColor) => {
-    if (text === current && color === currentColor) return;
+  return (ctx, text, color) => {
+    const nextSessionOwner = ctx.sessionManager.getSessionId();
+    if (nextSessionOwner === sessionOwner && text === current && color === currentColor) return;
+    sessionOwner = nextSessionOwner;
     current = text;
     currentColor = color;
     send();
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

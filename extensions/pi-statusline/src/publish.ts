@@ -4,7 +4,8 @@
  * Standalone by design: it imports nothing from this package beyond types, so
  * another extension can copy this file verbatim rather than take a dependency
  * on the statusline. If the statusline is not installed, the events go nowhere
- * and the calls cost nothing.
+ * and the calls cost nothing. Messages carry the calling session's owner, and
+ * replays/options only match that owner.
  *
  *   import { publishStatuslineItem } from "./statusline-publish.ts";
  *
@@ -14,12 +15,12 @@
  *       icon: "📊",
  *       defaultPlacement: { line: 1, side: "right" },
  *     });
- *     publish("42%");        // show
- *     publish(undefined);    // hide
+ *     pi.on("session_start", (_event, ctx) => publish(ctx, "42%"));
+ *     pi.on("session_shutdown", (_event, ctx) => publish(ctx, undefined));
  *   }
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type {
   SlotFieldSpec,
   SlotItem,
@@ -33,26 +34,30 @@ export type SlotDefinition = Omit<SlotItem, "text">;
 /**
  * Returns a setter for one slot's text.
  *
- * The last published text is re-sent whenever the statusline asks, which covers
- * the case where the statusline starts after the producer has already spoken.
+ * The last value is re-sent when the owning session's statusline asks for it,
+ * recovering publications dropped before the statusline's session_start.
+ * Pass the context performing each write so unchanged text moves with sessions.
  */
 export function publishStatuslineItem(
   pi: ExtensionAPI,
   definition: SlotDefinition,
-): (text: string | undefined) => void {
+): (ctx: Pick<ExtensionContext, "sessionManager">, text: string | undefined) => void {
+  let owner: string | undefined;
   let current: string | undefined;
 
   const send = () => {
-    if (current === undefined) pi.events.emit("statusline:clear", { id: definition.id });
-    else pi.events.emit("statusline:publish", { ...definition, text: current });
+    if (current === undefined) pi.events.emit("statusline:clear", { id: definition.id, owner });
+    else pi.events.emit("statusline:publish", { ...definition, text: current, owner });
   };
 
-  pi.events.on("statusline:request", () => {
-    if (current !== undefined) send();
+  pi.events.on("statusline:request", (data) => {
+    if (owner && isRecord(data) && data.owner === owner && current !== undefined) send();
   });
 
-  return (text: string | undefined) => {
-    if (text === current) return;
+  return (ctx, text) => {
+    const nextOwner = ctx.sessionManager.getSessionId();
+    if (nextOwner === owner && text === current) return;
+    owner = nextOwner;
     current = text;
     send();
   };
@@ -71,7 +76,8 @@ export interface SlotSchemaDefinition extends SlotDefinition {
 }
 
 /**
- * Register an option schema and a renderer for one slot.
+ * Defer the schema announcement until refresh(ctx) supplies a session owner,
+ * so another session's requests and options cannot affect this slot.
  *
  * `render` is called synchronously while the statusline paints, and again while
  * the user cycles options in the layout editor — with the *pending* values, so
@@ -87,20 +93,25 @@ export interface SlotSchemaDefinition extends SlotDefinition {
  *     render: (options, env) => draw(options, env.preview),
  *     onOptions: (options) => save({ ...config, ...options }),
  *   });
+ *   pi.on("session_start", (_event, ctx) => slot.refresh(ctx));
  */
 export function registerStatuslineSlot(
   pi: ExtensionAPI,
   definition: SlotSchemaDefinition,
-): { dispose: () => void; refresh: () => void } {
+): { dispose: () => void; refresh: (ctx: Pick<ExtensionContext, "sessionManager">) => void } {
   const { defaults, onOptions, ...rest } = definition;
+  let owner: string | undefined;
 
   const announce = () => {
-    pi.events.emit("statusline:register", { ...rest, defaults: defaults?.() });
+    pi.events.emit("statusline:register", { ...rest, defaults: defaults?.(), owner });
   };
 
-  const unsubscribeRequest = pi.events.on("statusline:request", announce);
+  const unsubscribeRequest = pi.events.on("statusline:request", (data) => {
+    if (owner && isRecord(data) && data.owner === owner) announce();
+  });
   const unsubscribeOptions = pi.events.on("statusline:options", (data) => {
-    if (!onOptions || !isRecord(data) || data.id !== definition.id) return;
+    if (!owner || !isRecord(data) || data.owner !== owner) return;
+    if (!onOptions || data.id !== definition.id) return;
     const instances = Array.isArray(data.instances)
       ? data.instances
           .filter(isRecord)
@@ -112,16 +123,17 @@ export function registerStatuslineSlot(
     announce();
   });
 
-  announce();
-
   return {
     dispose: () => {
       unsubscribeRequest();
       unsubscribeOptions();
-      pi.events.emit("statusline:unregister", { id: definition.id });
+      if (owner) pi.events.emit("statusline:unregister", { id: definition.id, owner });
     },
-    /** Call when your own config changed elsewhere, so the defaults follow. */
-    refresh: announce,
+    /** Call at session start and on config changes so ownership and defaults follow. */
+    refresh: (ctx) => {
+      owner = ctx.sessionManager.getSessionId();
+      announce();
+    },
   };
 }
 

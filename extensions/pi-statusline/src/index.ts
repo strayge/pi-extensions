@@ -120,6 +120,7 @@ export default function statusline(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
+    slots.setOwner(ctx.sessionManager.getSessionId());
     activeContext = ctx;
     resetRuntime(runtime);
     // A resumed session carries a prompt cache that expired while it was closed,
@@ -137,7 +138,7 @@ export default function statusline(pi: ExtensionAPI) {
     const warnings = reloadConfig();
     for (const warning of warnings) ctx.ui.notify(`statusline: ${warning}`, "warning");
 
-    // Producers may have loaded before this extension; ask them to re-publish.
+    // Recover publications dropped before this session adopted its owner.
     slots.request();
     void runGitStatus();
   });
@@ -146,6 +147,7 @@ export default function statusline(pi: ExtensionAPI) {
     if (gitTimer) clearTimeout(gitTimer);
     gitTimer = undefined;
     slots.clear();
+    slots.setOwner(undefined);
     activeContext = undefined;
   });
 

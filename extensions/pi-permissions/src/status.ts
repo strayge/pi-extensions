@@ -20,8 +20,8 @@ export function createStatus(pi: ExtensionAPI) {
       } catch { /* Replaced authority stays unavailable, including during status rendering. */ }
     }
     const net = !error && owner?.network.snapshot().restricted === true ? "Network restricted" : undefined;
-    filesystem(truncateToWidth(label, 80), color);
-    network(net, "muted");
+    filesystem(ctx, truncateToWidth(label, 80), color);
+    network(ctx, net, "muted");
     ctx.ui.setStatus("perm", `${ctx.ui.theme.fg(color, truncateToWidth(label, 65))}${net ? ` · ${net}` : ""}`);
   };
 }

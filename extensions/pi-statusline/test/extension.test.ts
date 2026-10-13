@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import statusline from "../src/index.ts";
+import { fakeEnv, identityTheme } from "./helpers.ts";
 
 interface StubPi {
   api: ExtensionAPI;
@@ -9,16 +10,19 @@ interface StubPi {
   commands: string[];
   emit: (channel: string, data: unknown) => void;
   busChannels: () => string[];
+  dispatch: (event: string, ctx?: ExtensionContext) => void;
 }
 
 function stubPi(): StubPi {
   const events: string[] = [];
   const commands: string[] = [];
   const handlers = new Map<string, Array<(data: unknown) => void>>();
+  const lifecycle = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
 
   const api = {
-    on: (event: string) => {
+    on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => void) => {
       events.push(event);
+      lifecycle.set(event, handler);
     },
     registerCommand: (name: string) => {
       commands.push(name);
@@ -43,6 +47,7 @@ function stubPi(): StubPi {
       for (const handler of handlers.get(channel) ?? []) handler(data);
     },
     busChannels: () => [...handlers.keys()],
+    dispatch: (event, ctx = fakeEnv().ctx) => lifecycle.get(event)?.({ type: event }, ctx),
   };
 }
 
@@ -59,8 +64,8 @@ test("it subscribes to the slot bus at activation, before any session starts", (
   const pi = stubPi();
   statusline(pi.api);
 
-  // Producers may publish or register before the first session_start; if the
-  // registry only listened from then on, those would be lost until a republish.
+  // Subscription lasts across sessions; early traffic is dropped until an
+  // owner is set, then recovered by that session's request replay.
   assert.deepEqual(pi.busChannels().sort(), [
     "statusline:clear",
     "statusline:publish",
@@ -75,4 +80,67 @@ test("a publish before any session does not throw", () => {
 
   pi.emit("statusline:publish", { id: "usage", text: "42%" });
   pi.emit("statusline:clear", { id: "usage" });
+});
+
+test("session start owns replay traffic, and shutdown rejects subsequent publications", (t) => {
+  const pi = stubPi();
+  statusline(pi.api);
+  const env = fakeEnv();
+  let repaints = 0;
+  let footer: { dispose?: () => void } | undefined;
+  const ctx = {
+    ...env.ctx,
+    hasUI: true,
+    mode: "tui",
+    ui: {
+      setFooter: (factory: NonNullable<Parameters<ExtensionContext["ui"]["setFooter"]>[0]>) => {
+        footer = factory(
+          { requestRender: () => repaints++ } as never,
+          identityTheme(),
+          env.footerData,
+        );
+      },
+      notify: () => {},
+    },
+  } as unknown as ExtensionContext;
+  t.after(() => {
+    pi.dispatch("session_shutdown");
+    footer?.dispose?.();
+  });
+
+  const requests: unknown[] = [];
+  pi.api.events.on("statusline:request", (data) => {
+    requests.push(data);
+    const before = repaints;
+    pi.emit("statusline:publish", { id: "speed", text: "54.8 tok/s", owner: "test-session" });
+    assert.equal(repaints, before + 1);
+  });
+  pi.dispatch("session_start", ctx);
+  assert.deepEqual(requests, [{ owner: "test-session" }]);
+
+  pi.dispatch("session_shutdown");
+  const afterShutdown = repaints;
+  pi.emit("statusline:publish", { id: "speed", text: "159.6 tok/s", owner: "test-session" });
+  assert.equal(repaints, afterShutdown);
+});
+
+test("session start sets ownership even without a TUI", (t) => {
+  const pi = stubPi();
+  statusline(pi.api);
+  const messages: unknown[] = [];
+  pi.api.events.on("statusline:request", (data) => messages.push(data));
+  const ctx = { ...fakeEnv().ctx, hasUI: false, mode: "print" } as ExtensionContext;
+  let ownerReads = 0;
+  ctx.sessionManager = {
+    ...ctx.sessionManager,
+    getSessionId: () => {
+      ownerReads++;
+      return "test-session";
+    },
+  };
+  t.after(() => pi.dispatch("session_shutdown"));
+
+  pi.dispatch("session_start", ctx);
+  assert.equal(ownerReads, 1);
+  assert.deepEqual(messages, []);
 });

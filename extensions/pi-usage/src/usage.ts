@@ -178,7 +178,7 @@ export default function usageExtension(
   ): boolean => {
     try {
       ctx.ui.setStatus(STATUS_KEY, value);
-      publishSlot(value);
+      publishSlot(ctx, value);
       shown = { text: value, model: modelIdentity(model) };
       return true;
     } catch (error) {
@@ -478,7 +478,7 @@ export default function usageExtension(
     } catch (error) {
       ctx.ui.notify(`Could not save usage display options: ${errorMessage(error)}`, "warning");
     }
-    statuslineSlot.refresh();
+    statuslineSlot.refresh(ctx);
     if (outcome && model && modelIdentity(ctx.model) === modelIdentity(model)) {
       publishStatus(ctx, outcome, model);
     }
@@ -644,7 +644,7 @@ export default function usageExtension(
               failures.delete(`${providerId}:${expectedFingerprint}`);
             }
             latest = undefined;
-            statuslineSlot.refresh();
+            statuslineSlot.refresh(ctx);
             safeSetStatus(ctx, "checking", model);
             notifyRedemptionOutcome(ctx, result.response);
             force = true;
@@ -736,9 +736,8 @@ export default function usageExtension(
     sessionActive = true;
     snapshotWarningShown = false;
     reloadDisplayConfig();
-    // The file may have changed since the last session, and a statusline that
-    // asked for our schema before this ran would be holding the older defaults.
-    statuslineSlot.refresh();
+    // Announce with this session's owner and the freshly loaded defaults.
+    statuslineSlot.refresh(ctx);
     for (const warning of displayWarnings) {
       ctx.ui.notify(`${CONFIG_FILE_NAME}: ${warning}`, "warning");
     }

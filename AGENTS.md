@@ -98,6 +98,8 @@ Extensions publish placeable statusline items over `pi.events`
 so load order between extensions does not matter). The protocol and a copyable
 helper live in `extensions/pi-statusline/README.md` and `src/publish.ts`;
 `extensions/pi-usage/src/statusline-slot.ts` is a working producer.
+Every slot message must carry the publishing session's id as `owner` (from
+`ctx.sessionManager.getSessionId()`), otherwise the statusline drops it silently.
 
 `ctx.ui.setStatus` keeps working unchanged — publishing a slot only adds the
 ability to place the entry at an exact spot in the bar.

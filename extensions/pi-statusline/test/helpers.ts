@@ -117,20 +117,25 @@ export function fakeEnv(options: FakeOptions = {}): Omit<RenderEnv, "placedStatu
 /** Drive a registry through its real event handling rather than reaching inside. */
 export function publish(registry: SlotRegistry, slot: SlotItem): void {
   const bus = busFor(registry);
-  bus.emit("statusline:publish", slot);
+  bus.emit("statusline:publish", { ...slot, owner: "test-session" });
 }
 
 /** The same for the schema half: a producer announcing its options and renderer. */
 export function register(registry: SlotRegistry, registration: unknown): void {
-  busFor(registry).emit("statusline:register", registration);
+  busFor(registry).emit(
+    "statusline:register",
+    typeof registration === "object" && registration !== null && !Array.isArray(registration)
+      ? { ...registration, owner: "test-session" }
+      : registration,
+  );
 }
 
 export function unregister(registry: SlotRegistry, id: string): void {
-  busFor(registry).emit("statusline:unregister", { id });
+  busFor(registry).emit("statusline:unregister", { id, owner: "test-session" });
 }
 
 export function clearSlot(registry: SlotRegistry, id: string): void {
-  busFor(registry).emit("statusline:clear", { id });
+  busFor(registry).emit("statusline:clear", { id, owner: "test-session" });
 }
 
 interface FakeBus {
@@ -163,6 +168,7 @@ export function createRegistry(onChange: () => void = () => {}): SlotRegistry {
 
   const registry = new SlotRegistry({ events: bus } as never, onChange);
   registry.listen();
+  registry.setOwner("test-session");
   buses.set(registry, bus);
   return registry;
 }

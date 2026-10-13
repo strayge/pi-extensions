@@ -7,24 +7,26 @@
  * *register* an option schema plus a `render` function, which lets the user
  * configure it from the layout editor and see the result in the live preview.
  *
+ *   const owner = ctx.sessionManager.getSessionId();
  *   pi.events.emit("statusline:publish", {
- *     id: "usage", icon: "📊", text: "42%",
+ *     id: "usage", owner, icon: "📊", text: "42%",
  *     defaultPlacement: { line: 1, side: "right", order: 10 },
  *   });
- *   pi.events.emit("statusline:clear", { id: "usage" });
+ *   pi.events.emit("statusline:clear", { id: "usage", owner });
  *
  *   pi.events.emit("statusline:register", {
- *     id: "usage", version: 1,
+ *     id: "usage", owner, version: 1,
  *     fields: [{ key: "barWidth", label: "bar width", kind: "number" }],
  *     defaults: { barWidth: 8 },
  *     render: (options, env) => "▓▓░░ 42%",
  *   });
- *   pi.events.emit("statusline:unregister", { id: "usage" });
+ *   pi.events.emit("statusline:unregister", { id: "usage", owner });
  *
- * The statusline emits `statusline:request` on session start so producers that
- * loaded before it can re-publish and re-register; load order between
- * extensions is not fixed. It emits `statusline:options` when the values stored
+ * Traffic before session_start is dropped. The statusline then emits
+ * `statusline:request` with { owner } so that session's producers re-publish and
+ * re-register. It emits `statusline:options` with owner when the values stored
  * in the config change, so a producer can mirror them into its own config file.
+ * Unstamped messages and messages for another session are ignored.
  *
  * `render` is called inside the paint path, where a throw is fatal and an
  * over-wide line kills the session, so everything it returns is treated as
@@ -59,6 +61,7 @@ export const UNREGISTER_CHANNEL = "statusline:unregister";
 export const OPTIONS_CHANNEL = "statusline:options";
 
 export class SlotRegistry {
+  private owner: string | undefined;
   private items = new Map<string, SlotItem>();
   private registrations = new Map<string, SlotRegistration>();
   /**
@@ -77,9 +80,14 @@ export class SlotRegistry {
     this.onChange = onChange;
   }
 
+  setOwner(owner: string | undefined): void {
+    this.owner = owner;
+  }
+
   /** Subscribe to the bus. Safe to call once per extension activation. */
   listen(): void {
     this.pi.events.on(PUBLISH_CHANNEL, (data) => {
+      if (!this.owner || !isRecord(data) || data.owner !== this.owner) return;
       const item = parseSlotItem(data);
       if (!item) return;
       const previous = this.items.get(item.id);
@@ -90,12 +98,14 @@ export class SlotRegistry {
     });
 
     this.pi.events.on(CLEAR_CHANNEL, (data) => {
-      const id = isRecord(data) && typeof data.id === "string" ? data.id : undefined;
+      if (!this.owner || !isRecord(data) || data.owner !== this.owner) return;
+      const id = typeof data.id === "string" ? data.id : undefined;
       if (!id || !this.items.delete(id)) return;
       this.onChange();
     });
 
     this.pi.events.on(REGISTER_CHANNEL, (data) => {
+      if (!this.owner || !isRecord(data) || data.owner !== this.owner) return;
       const registration = parseRegistration(data);
       if (!registration) return;
       this.registrations.set(registration.id, registration);
@@ -106,7 +116,8 @@ export class SlotRegistry {
     });
 
     this.pi.events.on(UNREGISTER_CHANNEL, (data) => {
-      const id = isRecord(data) && typeof data.id === "string" ? data.id : undefined;
+      if (!this.owner || !isRecord(data) || data.owner !== this.owner) return;
+      const id = typeof data.id === "string" ? data.id : undefined;
       if (!id || !this.registrations.delete(id)) return;
       this.failures.delete(id);
       this.onChange();
@@ -115,7 +126,8 @@ export class SlotRegistry {
 
   /** Ask producers to re-publish and re-register; call once the footer is up. */
   request(): void {
-    this.pi.events.emit(REQUEST_CHANNEL, {});
+    if (!this.owner) return;
+    this.pi.events.emit(REQUEST_CHANNEL, { owner: this.owner });
   }
 
   get(id: string): SlotItem | undefined {
@@ -180,9 +192,11 @@ export class SlotRegistry {
    * answer. A producer that only wants one reads `instances[0]`.
    */
   pushOptions(id: string, instances: SlotOptions[]): void {
+    if (!this.owner) return;
     const registration = this.registrations.get(id);
     this.pi.events.emit(OPTIONS_CHANNEL, {
       id,
+      owner: this.owner,
       version: registration?.version ?? 1,
       instances: instances.map((options) => ({
         options: registration ? coerceOptions(options, registration) : { ...options },
