@@ -1,4 +1,4 @@
-import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
 /**
  * Cross-extension marker for UI contexts proxied into a nested agent session.
@@ -8,6 +8,32 @@ import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 export const CHILD_EXTENSION_UI_MARKER = Symbol.for("pi-subagents:child-extension-ui");
 
 type DialogOptions = Parameters<ExtensionUIContext["select"]>[2];
+
+/** UI-only state follows the live session without entering its transcript. */
+const childStatuses = new WeakMap<AgentSession, {
+  values: Map<string, string>;
+  listeners: Set<() => void>;
+}>();
+
+function statusesFor(session: AgentSession) {
+  let statuses = childStatuses.get(session);
+  if (!statuses) {
+    statuses = { values: new Map(), listeners: new Set() };
+    childStatuses.set(session, statuses);
+  }
+  return statuses;
+}
+
+export function getChildExtensionStatuses(session: AgentSession): ReadonlyMap<string, string> {
+  return statusesFor(session).values;
+}
+
+/** Status refreshes can arrive between model events, so viewers subscribe separately. */
+export function subscribeChildExtensionStatuses(session: AgentSession, listener: () => void): () => void {
+  const statuses = statusesFor(session);
+  statuses.listeners.add(listener);
+  return () => { statuses.listeners.delete(listener); };
+}
 
 class DialogQueue {
   private tail: Promise<void> = Promise.resolve();
@@ -51,8 +77,9 @@ function dialogOptions(opts: DialogOptions, agentSignal?: AbortSignal): DialogOp
  * Child sessions have no UI of their own, but a policy gate must be able to ask
  * the person supervising the parent session instead of failing closed merely
  * because the worker is headless. Only modal dialogs and prefixed notifications
- * cross the boundary; status bars, widgets, editor state, and terminal handlers
- * remain owned by the parent session.
+ * cross the boundary. Status text stays local to the child for its conversation
+ * viewer; the parent footer, widgets, editor state, and terminal handlers remain
+ * untouched.
  *
  * Dialogs share a queue per parent UI because pi's TUI supports one extension
  * modal at a time. Without serialization, concurrent background agents can
@@ -63,6 +90,7 @@ export function createChildExtensionUI(
   parent: ExtensionUIContext,
   label: string,
   agentSignal?: AbortSignal,
+  session?: AgentSession,
 ): ExtensionUIContext {
   const queue = queueFor(parent);
   const title = (value: string) => `Subagent ${label}: ${value}`;
@@ -82,7 +110,17 @@ export function createChildExtensionUI(
     },
     notify: (message, type) => parent.notify(`[Subagent ${label}] ${message}`, type),
     onTerminalInput: () => () => {},
-    setStatus: () => {},
+    setStatus: (key, text) => {
+      if (!session) return;
+      const statuses = statusesFor(session);
+      if (text === undefined) {
+        if (!statuses.values.delete(key)) return;
+      } else {
+        if (statuses.values.get(key) === text) return;
+        statuses.values.set(key, text);
+      }
+      for (const listener of statuses.listeners) listener();
+    },
     setWorkingMessage: () => {},
     setWorkingVisible: () => {},
     setWorkingIndicator: () => {},

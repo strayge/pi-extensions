@@ -1052,7 +1052,7 @@ export async function runAgent(
   // post-bind filter is needed. All ExtensionBindings fields are optional.
   await session.bindExtensions({
     ...(ctx.hasUI && {
-      uiContext: createChildExtensionUI(ctx.ui, childLabel, options.signal),
+      uiContext: createChildExtensionUI(ctx.ui, childLabel, options.signal, session),
       mode: ctx.mode,
     }),
     onError: (err) => {

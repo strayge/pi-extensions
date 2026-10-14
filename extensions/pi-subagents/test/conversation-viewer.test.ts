@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createChildExtensionUI } from "../src/child-ui.ts";
 import type { AgentRecord } from "../src/types.js";
 
 // ── Mock wrapTextWithAnsi ──────────────────────────────────────────────
@@ -141,6 +142,86 @@ describe("ConversationViewer invocation line", () => {
 
   it("renders no row at all for a record with no invocation", () => {
     expect(invocationLine(undefined)).toBe("");
+  });
+});
+
+describe("ConversationViewer child statuses", () => {
+  function fixture() {
+    const session = mockSession();
+    const tui = mockTui();
+    const ui = createChildExtensionUI({} as any, "Child", undefined, session);
+    const record = mockRecord({ invocation: { modelId: "other/child-model" } });
+    const viewer = new ConversationViewer(tui, session, record, undefined, ansiTheme(), vi.fn());
+    return { session, tui, ui, record, viewer };
+  }
+
+  it("shows existing and updated statuses above the footer controls without extra indentation", () => {
+    const { session, tui, ui, record, viewer } = fixture();
+    ui.setStatus("third-party-a", "Quota 41%");
+    ui.setStatus("third-party-b", "123.4 tok/s");
+    const lines = viewer.render(120);
+    const statusRow = lines[lines.length - 3];
+    expect(statusRow).toContain("123.4 tok/s");
+    expect(statusRow.replace(/\x1b\[[0-9;]*m/g, "")).toMatch(/^│ Quota 41%/);
+    expect(lines[lines.length - 2]).toContain("Esc close");
+
+    tui.requestRender.mockClear();
+    ui.setStatus("third-party-a", "Quota 42%");
+    expect(tui.requestRender).toHaveBeenCalledOnce();
+    expect(viewer.render(120).join("\n")).not.toContain("Quota 41%");
+    expect(viewer.render(120).join("\n")).toContain("Quota 42%");
+
+    viewer.dispose();
+    tui.requestRender.mockClear();
+    ui.setStatus("third-party-a", "Quota 43%");
+    expect(tui.requestRender).not.toHaveBeenCalled();
+    expect(session.subscribe.mock.results[0].value).toHaveBeenCalledOnce();
+
+    const reopened = new ConversationViewer(tui, session, record, undefined, ansiTheme(), vi.fn());
+    expect(reopened.render(120).join("\n")).toContain("Quota 43%");
+    reopened.dispose();
+  });
+
+  it("only reserves a row for visible statuses and restores space when cleared", () => {
+    const { ui, viewer } = fixture();
+    const originalHeight = (viewer as any).viewportHeight();
+    const originalLines = viewer.render(80).length;
+    ui.setStatus("blank", " \n\t ");
+    ui.setStatus("styles-only", "\x1b[31m\x1b[0m");
+    expect((viewer as any).viewportHeight()).toBe(originalHeight);
+
+    ui.setStatus("custom", "Visible status");
+    expect((viewer as any).viewportHeight()).toBe(originalHeight - 1);
+    expect(viewer.render(80)).toHaveLength(originalLines);
+
+    ui.setStatus("custom", undefined);
+    expect((viewer as any).viewportHeight()).toBe(originalHeight);
+    expect(viewer.render(80).join("\n")).not.toContain("Visible status");
+    viewer.dispose();
+  });
+
+  it("shrinks the transcript on short terminals to preserve statuses and navigation", () => {
+    const { tui, ui, viewer } = fixture();
+    tui.terminal.rows = 14;
+    ui.setStatus("custom", "Visible status");
+    const lines = viewer.render(80);
+    expect(lines).toHaveLength(Math.floor(tui.terminal.rows * 0.7));
+    expect(lines[lines.length - 3]).toContain("Visible status");
+    expect(lines[lines.length - 2]).toContain("Esc close");
+    viewer.dispose();
+  });
+
+  it("keeps multiline, colored and over-wide status text inside a single safe row", () => {
+    const { ui, viewer } = fixture();
+    ui.setStatus("custom", "\x1b[31mred\x1b[0m\nnext\tcell\x1b[2J\x07界".repeat(30));
+    for (const width of [6, 40, 80, 120]) {
+      const lines = viewer.render(width);
+      assertAllLinesFit(lines, width);
+      expect(lines.every(line => !/[\r\n]/.test(line))).toBe(true);
+      expect(lines.join("\n")).not.toContain("\x1b[2J");
+      expect(lines.join("\n")).not.toContain("\x07");
+    }
+    viewer.dispose();
   });
 });
 

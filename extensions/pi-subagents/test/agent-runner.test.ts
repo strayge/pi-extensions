@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getChildExtensionStatuses } from "../src/child-ui.ts";
 
 const {
   createAgentSession,
@@ -335,15 +336,19 @@ describe("agent-runner final output capture", () => {
     expect(bindOrder).toBeLessThan(promptOrder);
   });
 
-  it("bridges child extension dialogs to the parent UI", async () => {
+  it("bridges child dialogs while retaining startup statuses only on the child", async () => {
     const { session } = createSession("BOUND");
     createAgentSession.mockResolvedValue({ session });
+    session.bindExtensions.mockImplementation(async (bindings: any) => {
+      bindings.uiContext.setStatus("third-party", "Ready from session_start");
+    });
     const select = vi.fn(async () => "Allow once");
+    const setStatus = vi.fn();
     const interactiveCtx = {
       ...ctx,
       hasUI: true,
       mode: "tui",
-      ui: { select },
+      ui: { select, setStatus },
     } as any;
 
     await runAgent(interactiveCtx, "Explore", "Say BOUND", {
@@ -354,6 +359,8 @@ describe("agent-runner final output capture", () => {
 
     const bindings = session.bindExtensions.mock.calls[0][0];
     expect(bindings.mode).toBe("tui");
+    expect(getChildExtensionStatuses(session).get("third-party")).toBe("Ready from session_start");
+    expect(setStatus).not.toHaveBeenCalled();
     await expect(bindings.uiContext.select("Allow bash?", ["Allow once", "Deny"])).resolves.toBe("Allow once");
     expect(select).toHaveBeenCalledWith(
       "Subagent Explore — Find bound behavior: Allow bash?",

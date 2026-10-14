@@ -8,6 +8,7 @@
 import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
+import { getChildExtensionStatuses, subscribeChildExtensionStatuses } from "../child-ui.ts";
 import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
@@ -18,7 +19,6 @@ import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./vie
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
 const CHROME_LINES_BASE = 6;
-const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 70;
 
@@ -199,6 +199,7 @@ export class ConversationViewer implements Component {
   private scrollOffset = 0;
   private autoScroll = true;
   private unsubscribe: (() => void) | undefined;
+  private unsubscribeStatuses: (() => void) | undefined;
   private lastInnerW = 0;
   private closed = false;
   /** Two-press confirm guard for the stop key, so a stray key can't kill the agent. */
@@ -251,10 +252,12 @@ export class ConversationViewer implements Component {
   ) {
     this.markdownTheme = resolveMarkdownTheme(theme);
     this.keys = createViewerKeys(keybindings);
-    this.unsubscribe = session.subscribe(() => {
+    const refresh = () => {
       if (this.closed) return;
       this.tui.requestRender();
-    });
+    };
+    this.unsubscribe = session.subscribe(refresh);
+    this.unsubscribeStatuses = subscribeChildExtensionStatuses(session, refresh);
   }
 
   handleInput(data: string): void {
@@ -403,6 +406,8 @@ export class ConversationViewer implements Component {
 
     // Footer
     lines.push(hrMid);
+    const statusLine = this.statusLine();
+    if (statusLine) lines.push(row(statusLine));
     if (this.composer) {
       // Composer row: the Input renders its own `> ` prompt and cursor.
       lines.push(row(this.composer.render(innerW)[0] ?? ""));
@@ -559,6 +564,8 @@ export class ConversationViewer implements Component {
       this.unsubscribe();
       this.unsubscribe = undefined;
     }
+    this.unsubscribeStatuses?.();
+    this.unsubscribeStatuses = undefined;
   }
 
   // ---- Private ----
@@ -567,12 +574,20 @@ export class ConversationViewer implements Component {
     // Cap mirrors the overlay's maxHeight — otherwise the viewer would render
     // more lines than the overlay shows and clip the footer.
     const maxRows = Math.floor((this.tui.terminal.rows * VIEWPORT_HEIGHT_PCT) / 100);
-    return Math.max(MIN_VIEWPORT, maxRows - this.chromeLines());
+    return Math.max(0, maxRows - this.chromeLines());
   }
 
   private chromeLines(): number {
     // The composer adds one row above the footer hint while it's open.
-    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
+    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.statusLine() ? 1 : 0) + (this.composer ? 1 : 0);
+  }
+
+  private statusLine(): string | undefined {
+    const values = [...getChildExtensionStatuses(this.session).values()]
+      .map(value => sanitizeTranscriptText(value).replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    if (values.length === 0) return undefined;
+    return values.map(value => this.theme.fg("dim", value)).join(this.theme.fg("dim", " · "));
   }
 
   private invocationLine(): string | undefined {

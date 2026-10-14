@@ -1,6 +1,6 @@
-import type { ExtensionUIContext, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionUIContext, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
-import { CHILD_EXTENSION_UI_MARKER, createChildExtensionUI } from "../src/child-ui.js";
+import { CHILD_EXTENSION_UI_MARKER, createChildExtensionUI, getChildExtensionStatuses, subscribeChildExtensionStatuses } from "../src/child-ui.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -171,6 +171,51 @@ describe("child extension UI", () => {
     await expect(firstResult).resolves.toBe("Allow");
     await expect(secondResult).resolves.toBeUndefined();
     expect(select).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps opaque status keys local to each child, including through UI spreads", () => {
+    const parent = parentUI(vi.fn(async () => undefined));
+    const firstSession = {} as AgentSession;
+    const secondSession = {} as AgentSession;
+    const first = { ...createChildExtensionUI(parent, "First", undefined, firstSession) };
+    const second = createChildExtensionUI(parent, "Second", undefined, secondSession);
+
+    first.setStatus("custom-a", "First value");
+    first.setStatus("custom-b", "Another value");
+    first.setStatus("custom-a", "Updated value");
+    second.setStatus("custom-a", "Sibling value");
+
+    expect([...getChildExtensionStatuses(firstSession)]).toEqual([
+      ["custom-a", "Updated value"], ["custom-b", "Another value"],
+    ]);
+    expect([...getChildExtensionStatuses(secondSession)]).toEqual([["custom-a", "Sibling value"]]);
+    expect(parent.setStatus).not.toHaveBeenCalled();
+
+    first.setStatus("custom-a", undefined);
+    expect([...getChildExtensionStatuses(firstSession)]).toEqual([["custom-b", "Another value"]]);
+    expect(getChildExtensionStatuses(secondSession).get("custom-a")).toBe("Sibling value");
+  });
+
+  it("notifies viewers only when statuses change and releases their subscriptions", () => {
+    const session = {} as AgentSession;
+    const child = createChildExtensionUI(parentUI(vi.fn(async () => undefined)), "Child", undefined, session);
+    child.setStatus("custom", "Before opening");
+    const listener = vi.fn();
+    const unsubscribe = subscribeChildExtensionStatuses(session, listener);
+
+    child.setStatus("custom", "Before opening");
+    child.setStatus("missing", undefined);
+    expect(listener).not.toHaveBeenCalled();
+
+    child.setStatus("custom", "Updated");
+    child.setStatus("custom", undefined);
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect(getChildExtensionStatuses(session).size).toBe(0);
+
+    unsubscribe();
+    child.setStatus("custom", "After closing");
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect(getChildExtensionStatuses(session).get("custom")).toBe("After closing");
   });
 
   it("does not let child extensions mutate the parent session UI", () => {
