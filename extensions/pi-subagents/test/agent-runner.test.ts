@@ -3276,64 +3276,60 @@ describe("agent-runner abort signal forwarding", () => {
   });
 });
 
-// resolveDefaultModel picks the model a subagent runs on. Every failure here is
-// SILENT BY DESIGN: an unresolvable or unavailable `model:` deliberately falls
-// back to the parent's model rather than erroring, because a user's frontmatter
-// pin shouldn't hard-fail a spawn. That makes the availability filter untestable
-// through observed behavior — a broken check just means every model-pinned agent
-// quietly runs on the parent's model, costing whatever the parent costs.
-//
-// Exported for this (the file already exports normalizeMaxTurns/setGraceTurns
-// purely for test/agent-runner-settings.test.ts).
 describe("resolveDefaultModel", () => {
   const parent = { provider: "anthropic", id: "parent-model" } as any;
-  const haiku = { provider: "anthropic", id: "claude-haiku-4-5" } as any;
+  const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" } as any;
 
-  /** Registry whose `find` always succeeds; `getAvailable` is what varies. */
-  function registry(available?: any[]) {
+  /** Availability must constrain lookup even when `find` accepts arbitrary IDs. */
+  function registry(models = [haiku], available = models) {
     return {
       find: vi.fn((provider: string, id: string) => ({ provider, id }) as any),
-      getAvailable: available ? () => available : undefined,
+      getAll: () => models,
+      getAvailable: () => available,
     };
   }
 
   it("returns the configured model when the registry has it available", () => {
-    const r = registry([haiku]);
+    expect(resolveDefaultModel(parent, registry(), "anthropic/claude-haiku-4-5"))
+      .toEqual({ provider: "anthropic", id: "claude-haiku-4-5" });
+  });
+
+  it("refuses an unavailable pin instead of inheriting the parent", () => {
+    const other = { provider: "openai", id: "gpt-5", name: "GPT-5" };
+    expect(() => resolveDefaultModel(parent, registry([haiku, other], [haiku]), "openai/gpt-5"))
+      .toThrow("Model not found");
+  });
+
+  it("uses catalog enumeration when availability cannot be enumerated", () => {
+    const r = { ...registry(), getAvailable: undefined };
     expect(resolveDefaultModel(parent, r, "anthropic/claude-haiku-4-5"))
       .toEqual({ provider: "anthropic", id: "claude-haiku-4-5" });
   });
 
-  it("falls back to the parent when the model is NOT in the available set", () => {
-    // The branch with teeth: without this filter the subagent is handed a model
-    // the user has no credentials for, and the failure surfaces as a runtime
-    // auth error from deep inside createAgentSession instead of a clean fallback.
-    const r = registry([haiku]);
-    expect(resolveDefaultModel(parent, r, "openai/gpt-5")).toBe(parent);
+  it("refuses a lookup that the registry cannot materialize", () => {
+    const r = { ...registry(), find: vi.fn(() => undefined) };
+    expect(() => resolveDefaultModel(parent, r, "anthropic/claude-haiku-4-5"))
+      .toThrow("Model not found");
   });
 
-  it("trusts `find` when the registry cannot enumerate availability", () => {
-    // getAvailable absent → no filtering possible, so a found model is used.
-    const r = registry(undefined);
-    expect(resolveDefaultModel(parent, r, "anthropic/claude-haiku-4-5"))
+  it("applies guarded shorthand to configured model names", () => {
+    expect(resolveDefaultModel(parent, registry(), "haiku"))
       .toEqual({ provider: "anthropic", id: "claude-haiku-4-5" });
   });
 
-  it("falls back to the parent when the registry cannot find the model", () => {
-    const r = { find: vi.fn(() => undefined), getAvailable: undefined };
-    expect(resolveDefaultModel(parent, r as any, "anthropic/nope")).toBe(parent);
+  it("refuses ambiguous shorthand or a missing date pin", () => {
+    const other = { provider: "anthropic", id: "claude-haiku-4-6", name: "Claude Haiku 4.6" };
+    expect(() => resolveDefaultModel(parent, registry([haiku, other]), "haiku")).toThrow("ambiguous");
+    expect(() => resolveDefaultModel(parent, registry(), "anthropic/claude-haiku-4-5-20251001"))
+      .toThrow("Model not found");
   });
 
-  it("falls back to the parent for a model string with no provider prefix", () => {
-    const r = registry([haiku]);
-    expect(resolveDefaultModel(parent, r, "haiku")).toBe(parent);
-    expect(r.find).not.toHaveBeenCalled();
-  });
-
-  it("returns the parent model when no model is configured", () => {
-    expect(resolveDefaultModel(parent, registry([haiku]), undefined)).toBe(parent);
+  it("returns the parent model only when no model is configured", () => {
+    expect(resolveDefaultModel(parent, registry(), undefined)).toBe(parent);
+    expect(() => resolveDefaultModel(parent, registry(), "")).toThrow("Model not found");
   });
 
   it("returns undefined when neither a config model nor a parent model exists", () => {
-    expect(resolveDefaultModel(undefined, registry([haiku]), undefined)).toBeUndefined();
+    expect(resolveDefaultModel(undefined, registry(), undefined)).toBeUndefined();
   });
 });

@@ -25,6 +25,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createModelProgressWatchdog } from "./model-progress-watchdog.js";
+import { type ModelRegistry, resolveModel } from "./model-resolver.ts";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { attachParentPermissions, PERMISSION_EXTENSION, type PermissionAttachment } from "./permission-bridge.ts";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
@@ -372,34 +373,18 @@ export function getGraceTurns(): number { return graceTurns; }
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
 /**
- * Try to find the right model for an agent type.
- * Priority: explicit option > config.model > parent model.
+ * The parent's model is a default only when no model was configured. All spawn
+ * paths, including RPC callers, must honor configured identities or fail closed.
  */
 export function resolveDefaultModel(
   parentModel: Model<any> | undefined,
-  registry: { find(provider: string, modelId: string): Model<any> | undefined; getAvailable?(): Model<any>[] },
+  registry: ModelRegistry,
   configModel?: string,
 ): Model<any> | undefined {
-  if (configModel) {
-    const slashIdx = configModel.indexOf("/");
-    if (slashIdx !== -1) {
-      const provider = configModel.slice(0, slashIdx);
-      const modelId = configModel.slice(slashIdx + 1);
-
-      // Build a set of available model keys for fast lookup
-      const available = registry.getAvailable?.();
-      const availableKeys = available
-        ? new Set(available.map((m: any) => `${m.provider}/${m.id}`))
-        : undefined;
-      const isAvailable = (p: string, id: string) =>
-        !availableKeys || availableKeys.has(`${p}/${id}`);
-
-      const found = registry.find(provider, modelId);
-      if (found && isAvailable(provider, modelId)) return found;
-    }
-  }
-
-  return parentModel;
+  if (configModel === undefined) return parentModel;
+  const resolved = resolveModel(configModel, registry);
+  if (typeof resolved === "string") throw new Error(resolved);
+  return resolved;
 }
 
 /** Info about a tool event in the subagent. */

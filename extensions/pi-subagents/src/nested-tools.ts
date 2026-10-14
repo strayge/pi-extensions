@@ -229,13 +229,10 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         defaultRunInBackground: false,
       });
       let model = ctx.model;
-      if (invocation.modelInput) {
+      if (invocation.modelInput !== undefined) {
         const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
-        if (typeof resolvedModel === "string") {
-          if (invocation.modelFromParams) return textResult(resolvedModel, true);
-        } else {
-          model = resolvedModel;
-        }
+        if (typeof resolvedModel === "string") return textResult(resolvedModel, true);
+        model = resolvedModel;
       }
 
       // Same scopeModels policy as the top-level Agent tool — a nested spawn

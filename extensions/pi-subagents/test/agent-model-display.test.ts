@@ -229,6 +229,22 @@ describe("Agent tool result — effective model", () => {
     expect(result.details.tags).not.toContain("thinking: low (asked max)");
   });
 
+  it("refuses an unresolved frontmatter pin before creating an agent", async () => {
+    vi.mocked(runAgent).mockClear();
+    pinnedAgent("model: anthropic/missing-model\n");
+    const result = await agentTool().execute(
+      "tc-unavailable",
+      { prompt: "go", description: "d", subagent_type: "pinned", run_in_background: true },
+      undefined,
+      undefined,
+      ctx(),
+    );
+
+    expect(result.content[0].text).toContain("Model not found");
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(result.details?.agentId).toBeUndefined();
+  });
+
   it("discloses a model an agent file pinned over the caller's (#182)", async () => {
     pinnedAgent("model: anthropic/claude-haiku-4-5\n");
     const tool = agentTool();
@@ -308,7 +324,7 @@ describe("Agent tool result — effective model", () => {
 });
 
 describe("Agent tool result — resume", () => {
-  it("renders the reopened session's settings, not the resume call's", async () => {
+  it("ignores unavailable fresh-spawn models when resuming an existing session", async () => {
     // resumeAgent only prompts the existing session: model and thinking on a
     // resume call cannot take effect, so rendering them advertises a
     // configuration the run never had.
@@ -334,9 +350,9 @@ describe("Agent tool result — resume", () => {
       {
         prompt: "continue",
         description: "changed",
-        subagent_type: "general-purpose",
+        subagent_type: "Explore",
         run_in_background: false,
-        model: "anthropic/claude-opus-4-6",
+        model: "anthropic/missing-model",
         thinking: "max",
         resume: first.details.agentId,
       },
@@ -347,6 +363,7 @@ describe("Agent tool result — resume", () => {
 
     expect(resumed.details.modelName).toBe("haiku 4.5");
     expect(resumed.details.tags).toContain("thinking: low");
-    expect(render(tool, resumed)).not.toContain("opus 4.6");
+    expect(render(tool, resumed)).not.toContain("missing-model");
+    expect(resumeAgent).toHaveBeenCalled();
   });
 });

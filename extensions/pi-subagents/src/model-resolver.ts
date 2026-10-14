@@ -1,5 +1,5 @@
 /**
- * Model resolution: exact match ("provider/modelId") with fuzzy fallback.
+ * Model resolution: exact identities and unambiguous, provider-bound shorthand.
  */
 
 export interface ModelEntry {
@@ -33,86 +33,88 @@ export function describeModel(
 }
 
 /**
- * Resolve a model string to a Model instance.
- * Tries exact match first ("provider/modelId"), then fuzzy match against all available models.
- * Returns the Model on success, or an error message string on failure.
+ * Cosmetic spelling changes must not reorder version tokens or erase modifiers.
+ */
+function normalizeReference(reference: string): string {
+  return reference.trim().toLowerCase().replace(/\./g, "-").replace(/\s+/g, "-");
+}
+
+/**
+ * A shorthand must identify a model, not merely occur somewhere in its metadata.
+ * Exact IDs win; explicit providers and date pins never fall back. Unpinned
+ * references prefer an undated alias, and unresolved ambiguity is an error.
  */
 export function resolveModel(
   input: string,
   registry: ModelRegistry,
 ): any | string {
-  // Available models (those with auth configured)
   const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
-  const availableSet = new Set(all.map(m => `${m.provider}/${m.id}`.toLowerCase()));
-
-  // 1. Exact match: "provider/modelId" — only if available (has auth)
-  const slashIdx = input.indexOf("/");
-  if (slashIdx !== -1) {
-    const provider = input.slice(0, slashIdx);
-    const modelId = input.slice(slashIdx + 1);
-    if (availableSet.has(input.toLowerCase())) {
-      const found = registry.find(provider, modelId);
-      if (found) return found;
-    }
-  }
-
-  // 2. Fuzzy match against available models. Normalize separators so cosmetic
-  // punctuation differences still match — e.g. "claude-haiku-4.5" and
-  // "claude-haiku-4-5" (dot vs dash in the version) resolve to the same model.
-  const normalize = (s: string) => s.toLowerCase().replace(/\./g, "-");
-  const query = normalize(input);
-
-  // Score each model: prefer exact id match > id contains > name contains > provider+id contains
-  let bestMatch: ModelEntry | undefined;
-  let bestScore = 0;
-
-  for (const m of all) {
-    const id = normalize(m.id);
-    const name = normalize(m.name);
-    const full = normalize(`${m.provider}/${m.id}`);
-
-    let score = 0;
-    if (id === query || full === query) {
-      score = 100; // exact
-    } else if (id.includes(query) || full.includes(query)) {
-      score = 60 + (query.length / id.length) * 30; // substring, prefer tighter matches
-    } else if (name.includes(query)) {
-      score = 40 + (query.length / name.length) * 20;
-    } else if (
-      // A trailing date-stamp token (e.g. "20251001") is optional, so a
-      // date-pinned config like "claude-haiku-4-5-20251001" still matches an
-      // undated registry id like "claude-haiku-4-5".
-      query
-        .split(/[\s\-/]+/)
-        .every(part => /^\d{8}$/.test(part) || id.includes(part) || name.includes(part) || m.provider.toLowerCase().includes(part))
-    ) {
-      score = 20; // all parts present somewhere
-    }
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = m;
-    }
-  }
-
-  if (bestMatch && bestScore >= 20) {
-    const found = registry.find(bestMatch.provider, bestMatch.id);
-    if (found) return found;
-  }
-
-  // 3. Provider fallback: a "provider/modelId" query that didn't match under the
-  // named provider (exact or fuzzy above) retries against all providers. The
-  // named provider is preferred when present; this only kicks in when it isn't,
-  // so the same model from another provider beats falling back to "inherit".
-  if (slashIdx !== -1) {
-    const bare = resolveModel(input.slice(slashIdx + 1), registry);
-    if (typeof bare !== "string") return bare;
-  }
-
-  // 4. No match — list available models
-  const modelList = all
+  const modelList = (models: ModelEntry[]) => models
     .map(m => `  ${m.provider}/${m.id}`)
     .sort()
     .join("\n");
-  return `Model not found: "${input}".\n\nAvailable models:\n${modelList}`;
+  const notFound = () => `Model not found: "${input}".\n\nAvailable models:\n${modelList(all)}`;
+  const reference = input.trim();
+  if (!reference) return notFound();
+
+  let queryInput = reference;
+  let candidates = all;
+  const slashIdx = reference.indexOf("/");
+  if (slashIdx !== -1) {
+    const provider = reference.slice(0, slashIdx).trim().toLowerCase();
+    const knownProvider = (registry.getAll?.() ?? all).some(m => m.provider.toLowerCase() === provider);
+    candidates = all.filter(m => m.provider.toLowerCase() === provider);
+    if (knownProvider || candidates.length > 0) {
+      queryInput = reference.slice(slashIdx + 1).trim();
+    } else {
+      // Unknown prefixes can be literal model IDs, but only an exact raw ID
+      // establishes that interpretation. Never retry a provider query bare.
+      candidates = all.filter(m => m.id.toLowerCase() === reference.toLowerCase());
+      if (candidates.length === 0) {
+        return `Model not found: "${input}". Unknown provider: "${provider}".\n\nAvailable models:\n${modelList(all)}`;
+      }
+    }
+  }
+  if (!queryInput) return notFound();
+
+  let matches = candidates.filter(m => m.id.toLowerCase() === queryInput.toLowerCase());
+  if (matches.length === 0) {
+    const query = normalizeReference(queryInput);
+    const dateSuffix = /-\d{8}$/;
+    const pin = query.match(dateSuffix)?.[0];
+    const identities = candidates
+      .filter(m => !pin || normalizeReference(m.id).endsWith(pin))
+      .map(model => {
+        const id = normalizeReference(model.id);
+        const references = [pin ? id : id.replace(dateSuffix, ""), normalizeReference(model.name ?? model.id)]
+          .flatMap(value => [value, value.replace(/^claude-/, "")]);
+        return { model, references };
+      });
+
+    matches = identities.filter(({ references }) => references.includes(query)).map(({ model }) => model);
+    // A versioned query must name the complete identity. Family-only shorthand
+    // may omit the version, but never match inside another model's name.
+    if (matches.length === 0 && !/\d/.test(query)) {
+      matches = identities
+        .filter(({ references }) => references.some(value => value.startsWith(`${query}-`)))
+        .map(({ model }) => model);
+    }
+
+    if (!pin) {
+      const aliases = new Set(matches
+        .filter(m => !dateSuffix.test(normalizeReference(m.id)))
+        .map(m => `${m.provider.toLowerCase()}/${normalizeReference(m.id)}`));
+      matches = matches.filter(m => !dateSuffix.test(normalizeReference(m.id))
+        || !aliases.has(`${m.provider.toLowerCase()}/${normalizeReference(m.id).replace(dateSuffix, "")}`));
+    }
+  }
+
+  if (matches.length > 1) {
+    return `Model "${input}" is ambiguous. Use one of:\n${modelList(matches)}`;
+  }
+  if (matches.length === 1) {
+    const found = registry.find(matches[0].provider, matches[0].id);
+    if (found) return found;
+  }
+  return notFound();
 }

@@ -111,6 +111,23 @@ describe("child-safe nested Agent tools", () => {
     );
   });
 
+  it("refuses an unavailable model pinned in the agent's frontmatter", async () => {
+    writeAgent("reviewer", "model: anthropic/missing-model\n");
+    const [agent] = tools();
+
+    const result = await execute(agent, {
+      subagent_type: "reviewer",
+      description: "review evidence",
+      prompt: "Review it",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Model not found");
+    expect(result.content[0].text).toContain("anthropic/missing-model");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(spawnAndWait).not.toHaveBeenCalled();
+  });
+
   it("keeps agent discovery rooted in inherited config, not the working directory", async () => {
     const workCwd = mkdtempSync(join(tmpdir(), "nested-tools-work-"));
     const workAgentDir = join(workCwd, ".pi", "agents");

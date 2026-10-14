@@ -296,6 +296,27 @@ describe("SubagentScheduler — fire path", () => {
     );
   });
 
+  it("refuses an unavailable model pin at fire time", () => {
+    ctx.modelRegistry.getAll = () => [{ provider: "anthropic", id: "missing-model", name: "Missing model" }];
+    const job = scheduler.addJob({
+      name: "missing-model", description: "pinned run", schedule: "+1s",
+      subagent_type: "general-purpose", prompt: "run", model: "anthropic/missing-model",
+    });
+
+    vi.advanceTimersByTime(2_000);
+
+    expect(manager.spawn).not.toHaveBeenCalled();
+    expect(store.get(job.id)?.lastStatus).toBe("error");
+    expect(pi.events.emit).toHaveBeenCalledWith(
+      "subagents:scheduled",
+      expect.objectContaining({
+        type: "error",
+        jobId: job.id,
+        error: expect.stringContaining('Model not found: "anthropic/missing-model"'),
+      }),
+    );
+  });
+
   it("one-shot fires once and auto-disables", async () => {
     const job = scheduler.addJob({
       name: "soon", description: "once", schedule: "+1s",

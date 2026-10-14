@@ -229,17 +229,17 @@ export class SubagentScheduler {
 
     store.update(id, { lastStatus: "running" });
 
-    // Resolve model at fire time — registry contents may have changed since the
-    // job was created (auth added/removed). Fall back silently to spawn-default
-    // if resolution fails; the spawn path handles undefined model gracefully.
-    let resolvedModel: any | undefined;
-    if (job.model) {
-      const r = resolveModel(job.model, ctx.modelRegistry);
-      if (typeof r !== "string") resolvedModel = r;
-    }
-
     let agentId: string;
     try {
+      // Credentials or catalog entries may have changed since scheduling. A
+      // failed pin is a failed job, not permission to run the parent's model.
+      let resolvedModel: any | undefined;
+      if (job.model !== undefined) {
+        const resolved = resolveModel(job.model, ctx.modelRegistry);
+        if (typeof resolved === "string") throw new Error(resolved);
+        resolvedModel = resolved;
+      }
+
       // Re-resolve at fire time against the registry as it stands. This does not
       // reload from disk (the scheduler has no reason to rebuild process-global
       // state from a timer), so it catches changes that went through /agents or

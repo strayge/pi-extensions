@@ -1965,8 +1965,10 @@ Terse command-style prompts produce shallow, generic work.
 
       const displayName = getDisplayName(subagentType);
 
-      // Get agent config (if any)
-      const customConfig = getAgentConfig(subagentType);
+      // Resume reuses the existing session; its required type argument does
+      // not select a new configuration or model.
+      const resumeRecord = params.resume ? manager.getRecord(params.resume) : undefined;
+      const customConfig = params.resume ? undefined : getAgentConfig(subagentType);
 
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params, {
         worktreeAllowed: isWorktreeIsolationEnabled(),
@@ -1974,15 +1976,11 @@ Terse command-style prompts produce shallow, generic work.
       });
 
       // Resolve model from agent config first; tool-call params only fill gaps.
-      let model = ctx.model;
-      if (resolvedConfig.modelInput) {
+      let model = params.resume ? resumeRecord?.session?.model : ctx.model;
+      if (!params.resume && resolvedConfig.modelInput !== undefined) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
-        } else {
-          model = resolved;
-        }
+        if (typeof resolved === "string") return textResult(resolved);
+        model = resolved;
       }
 
       // Scope validation: the effective resolved model is checked against the
@@ -1992,9 +1990,9 @@ Terse command-style prompts produce shallow, generic work.
         model,
         cwd: ctx.cwd,
         modelRegistry: ctx.modelRegistry,
-        callerSupplied: resolvedConfig.modelFromParams,
-        agentLabel: customConfig?.displayName ?? subagentType,
-        modelInput: resolvedConfig.modelInput,
+        callerSupplied: !params.resume && resolvedConfig.modelFromParams,
+        agentLabel: resumeRecord?.type ?? customConfig?.displayName ?? subagentType,
+        modelInput: params.resume ? undefined : resolvedConfig.modelInput,
       });
       if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
@@ -2113,7 +2111,7 @@ Terse command-style prompts produce shallow, generic work.
             // at fire time, and the original is what a user edits.
             subagent_type: requestedType,
             prompt: params.prompt as string,
-            model: params.model as string | undefined,
+            model: resolvedConfig.modelInput,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
@@ -2132,7 +2130,7 @@ Terse command-style prompts produce shallow, generic work.
 
       // Resume existing agent
       if (params.resume) {
-        const existing = manager.getRecord(params.resume);
+        const existing = resumeRecord;
         if (!existing || !isTopLevelAgent(existing)) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
@@ -3094,12 +3092,10 @@ Terse command-style prompts produce shallow, generic work.
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
     const resolved = resolveModel(cfg.model, registry);
-    // Configured but unresolvable: the runtime silently falls back to the parent
-    // model, so flag it (and the fallback) rather than hiding the config.
-    if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
-    // Surface what it actually resolved to when that differs from the config —
-    // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
-    // differences are normalized away so an effectively-identical match stays quiet.
+    // Configured but unresolvable: spawning is refused, not silently inherited.
+    if (typeof resolved === "string") return `${label} (unresolved)`;
+    // Surface the target of shorthand; cosmetic spelling differences and an
+    // unpinned request resolving to a dated snapshot need not change the label.
     const resolvedFull = `${resolved.provider}/${resolved.id}`;
     const norm = (s: string) => s.toLowerCase().replace(/\./g, "-").replace(/-\d{8}$/, "");
     if (norm(cfg.model) === norm(resolvedFull)) return label;

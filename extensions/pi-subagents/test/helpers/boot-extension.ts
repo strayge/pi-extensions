@@ -77,6 +77,7 @@ export function makePi(flags: Record<string, boolean | string> = {}): BootedPi {
 
 /** A mock ExtensionContext — the second half of what a tool's `execute` receives. */
 export function ctx(overrides: Record<string, unknown> = {}) {
+  const model = { provider: "openai-codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna" };
   return {
     // The interactive mode extensions normally run in. Set explicitly because
     // the `@handle` input hook is TUI-only, so an absent mode would make every
@@ -86,7 +87,11 @@ export function ctx(overrides: Record<string, unknown> = {}) {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn(), addAutocompleteProvider: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined),
+      getAll: vi.fn(() => [model]),
+      getAvailable: vi.fn(() => [model]),
+    },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
     ...overrides,

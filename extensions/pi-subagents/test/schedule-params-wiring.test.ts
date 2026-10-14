@@ -40,8 +40,9 @@ function bootedCtx() {
  */
 async function scheduleAndReadBack(
   params: Record<string, unknown>,
+  agentFiles?: Record<string, string>,
 ): Promise<{ job: ScheduledSubagent; reply: string; restore: () => void }> {
-  const hermetic = hermeticDir();
+  const hermetic = hermeticDir({ agentFiles });
   const { pi, tools, lifecycle } = makePi();
   subagentsExtension(pi);
 
@@ -79,6 +80,19 @@ describe("Agent tool → persisted scheduled job", () => {
       expect(job.isolation).toBe("worktree");
       expect(job.prompt).toBe("do the thing");
       expect(job.enabled).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("persists the configured model instead of an overridden caller argument", async () => {
+    const pin = "openai-codex/gpt-5.6-luna";
+    const { job, restore } = await scheduleAndReadBack(
+      { subagent_type: "pinned", model: "anthropic/missing-model" },
+      { pinned: `---\ndescription: pinned agent\nmodel: ${pin}\n---\nPinned.\n` },
+    );
+    try {
+      expect(job.model).toBe(pin);
     } finally {
       restore();
     }

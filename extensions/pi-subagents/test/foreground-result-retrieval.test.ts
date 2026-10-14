@@ -49,12 +49,17 @@ function makePi() {
 }
 
 function ctx() {
+  const model = { provider: "openai-codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna" };
   return {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined),
+      getAll: vi.fn(() => [model]),
+      getAvailable: vi.fn(() => [model]),
+    },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;

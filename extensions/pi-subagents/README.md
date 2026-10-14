@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Session resume** — pick up where an agent left off, preserving full conversation context. Resumes detached by default and notifies you on completion, just like a fresh spawn; pass `run_in_background: false` to block and get the result inline
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. A type that doesn't resolve to exactly one *enabled* agent — unknown, disabled, or ambiguous between two agents differing only by case — falls back to general-purpose with a note, or is refused outright under [`fallbackSubagent: none`](#persistent-settings)
-- **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
+- **Guarded model shorthand** — use names such as `"haiku"` or `"anthropic/opus-5.5"` when they identify one available model. Explicit providers and date pins are binding; ambiguous requests return candidate IDs instead of choosing silently
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
 - **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
@@ -316,7 +316,7 @@ All fields are optional — sensible defaults for everything.
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
 | `isolation` | — | Set to `worktree` to run in an isolated git worktree, or `off` to refuse one even when the caller passes `isolation: "worktree"` (frontmatter is authoritative). `none`, `no`, and `false` are accepted spellings of `off` |
-| `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
+| `model` | inherit parent | Model — `provider/modelId`, display name, or unambiguous shorthand (`"haiku"`, `"anthropic/opus-5.5"`). Explicit providers and date pins are binding; failed resolution refuses the spawn |
 | `thinking` | inherit | Default thinking level: off, minimal, low, medium, high, xhigh, max. An explicit `Agent` call parameter overrides it; actual availability depends on your pi version and model, and pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `subagents.json` `rememberAgents` (default `true`) | Persist this subagent as a normal pi session instead of keeping the session in memory only; overrides the `rememberAgents` project default in both directions. It records its spawning session as parent, so it nests under it in `/resume`. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
@@ -331,7 +331,7 @@ All fields are optional — sensible defaults for everything.
 
 Frontmatter is authoritative for `model`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, and `isolation`; if an agent file sets one of those fields, the value is locked for that agent. `thinking` is a default instead: an explicit `Agent` tool parameter overrides it for that invocation.
 
-**Forgiving `model:` resolution.** A `model:` pin is matched against pi's model registry tolerantly, so cosmetic id variations don't silently drop the agent back to the parent's model: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**, so an exact match always wins and dated snapshots aren't conflated. If nothing resolves, the pin can't run and the agent inherits the parent model — `/agents → Agent types` flags this case as `(unavailable, fallback: inherit)` and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
+**Guarded `model:` resolution.** Exact IDs win. Case, whitespace, and `.`/`-` spelling differences are normalized; Claude's `claude-` prefix may be omitted. Family shorthand such as `haiku` must match the beginning of the identity, not an incidental word inside another model's name. Versioned shorthand must name the complete identity: `anthropic/opus-5.5` selects Opus 5.5, not 4.5 or 5.50, and modifiers such as `mini` remain meaningful. Ambiguous requests list canonical candidate IDs. An explicit provider never falls back to another provider, and a missing `-YYYYMMDD` pin is an error. Unpinned requests prefer an undated alias over dated variants of the same identity; without an alias, multiple snapshots are ambiguous. These rules apply to tool arguments, agent files, workflows, RPC strings, and scheduled runs. Failed resolution refuses the run instead of inheriting the parent; `/agents → Agent types` marks the pin `(unresolved)`. Omit `model` to inherit intentionally. (This is distinct from [Model Scope](#model-scope) enforcement.)
 
 ### Nested subagents
 
@@ -418,7 +418,7 @@ Launch a sub-agent.
 | `description` | string | yes | Short 3-5 word summary (shown in UI) |
 | `name` | string | no | Memorable name for this agent (`auth-audit`), addressable as `@name` and accepted by `steer_subagent`/`get_subagent_result`. Additive — the type-derived handle is still assigned |
 | `subagent_type` | string | yes | Agent type (built-in or custom) |
-| `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
+| `model` | string | no | Model — `provider/modelId`, display name, or unambiguous shorthand. Providers and date pins are binding; ambiguous or unavailable requests are refused |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the full result inline together with its resumable agent ID |
@@ -974,7 +974,7 @@ src/
 
   # Invocation surface
   invocation-config.ts # Shared tool-parameter schemas (isolation, join, thinking, ...)
-  model-resolver.ts   # Model resolution: exact provider/modelId with fuzzy fallback
+  model-resolver.ts   # Model resolution: exact identities and guarded shorthand
   enabled-models.ts   # Read pi's enabledModels settings (project over global)
   model-scope.ts      # scopeModels allowlist policy, shared by top-level and nested tools
   mention.ts          # `@handle message` grammar: suggestion triggers and send parsing

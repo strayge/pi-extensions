@@ -197,20 +197,15 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       const dispatch = resolveSpawnType(request.agentType);
       if (!dispatch.ok) return { ok: false, error: dispatch.message };
 
-      // Same precedence as the Agent tool: the caller's model wins, the agent
-      // definition's is next, and the parent's is the floor. A model the script
-      // named and we cannot resolve is an error; one the definition named falls
-      // back to the parent silently, because the script never asked for it.
+      // The script's model wins over the agent definition; the parent is used
+      // only when neither named a model. Failed pins must never change identity.
       let model = ctx.model;
       const config = getAgentConfig(dispatch.type);
       const modelInput = request.model ?? config?.model;
       if (modelInput !== undefined) {
         const resolved = resolveModel(modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (request.model !== undefined) return { ok: false, error: resolved };
-        } else {
-          model = resolved;
-        }
+        if (typeof resolved === "string") return { ok: false, error: resolved };
+        model = resolved;
       }
 
       // Same scopeModels policy as the Agent tool and the nested delegation

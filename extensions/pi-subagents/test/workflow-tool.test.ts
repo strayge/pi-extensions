@@ -177,6 +177,59 @@ describe("createWorkflowHost — spawn mapping", () => {
     expect(stub.spawnAndWait).not.toHaveBeenCalled();
   });
 
+  it("refuses an unavailable model pinned in the agent's config", async () => {
+    registerAgents(new Map([["pinned", {
+      name: "pinned",
+      displayName: "Pinned",
+      description: "an agent whose file pins a model",
+      model: "anthropic/missing-model",
+      systemPrompt: "pinned",
+      promptMode: "replace",
+    } as any]]));
+    const stub = stubManager();
+    const host = createWorkflowHost({
+      pi: {} as any,
+      ctx: ctx({
+        modelRegistry: {
+          find: () => undefined,
+          getAll: () => [{ provider: "anthropic", id: "missing-model", name: "Missing model" }],
+          getAvailable: () => [],
+        },
+      }),
+      manager: stub.manager,
+    });
+
+    const result = await host.spawnAgent(request({ agentType: "pinned" }));
+
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining("Model not found") });
+    expect(result.error).toContain("anthropic/missing-model");
+    expect(stub.spawnAndWait).not.toHaveBeenCalled();
+  });
+
+  it("refuses ambiguous shorthand across authenticated model versions", async () => {
+    const models = [
+      { id: "claude-opus-4-5", name: "Claude Opus 4.5", provider: "anthropic" },
+      { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+    ];
+    const stub = stubManager();
+    const host = createWorkflowHost({
+      pi: {} as any,
+      ctx: ctx({
+        modelRegistry: {
+          find: (provider: string, id: string) => models.find(m => m.provider === provider && m.id === id),
+          getAvailable: () => models,
+          getAll: () => models,
+        },
+      }),
+      manager: stub.manager,
+    });
+
+    const result = await host.spawnAgent(request({ model: "opus" }));
+
+    expect(result).toMatchObject({ ok: false, error: expect.stringMatching(/ambiguous/i) });
+    expect(stub.spawnAndWait).not.toHaveBeenCalled();
+  });
+
   it("resolves a model the script named through the session's registry", async () => {
     const stub = stubManager();
     const model = { id: "claude-haiku-4-5", name: "Haiku", provider: "anthropic" };
