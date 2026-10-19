@@ -56,6 +56,14 @@ branch deletion happens only after successful worktree removal:
 Deleting a branch removes its reflog (recovery history). Review any data-loss warning,
 even for a merged branch. Ignored files to be deleted are listed in the dialog.
 
+For an approved **merge and cleanup**, prefer a single `finish` call over `switch`
+followed by `finish` when intended changes are committed, the worktree is clean,
+and its checkout is no longer needed. Keep the branch in the finish dialog, wait
+for completion in main, then merge and validate. Delete the branch afterward with
+`git branch -d` only after successful integration. Keep the checkout and use
+`switch` then `finish` when cleanup is blocked or retaining it is necessary; never
+delete an unmerged branch just to reduce approvals. The tool itself never merges.
+
 To retry cleanup of a retained worktree from main, pass its registered path:
 `{"action":"finish","path":"/path/to/worktree"}`. Without `path`, the most recent
 failed finish in the active conversation supplies it.

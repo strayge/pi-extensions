@@ -612,6 +612,7 @@ export function registerWorktreeLifecycle(
     executionMode: "sequential",
     promptGuidelines: [
       "Call worktree alone, never alongside other tools or in background children. A pending transition terminates the turn; await its factual completion in the new workspace before any edits. The agent owns implementation and merge decisions; this tool only manages workspaces.",
+      "For an approved merge-and-cleanup request, prefer one finish call instead of switch followed by finish when intended changes are committed, the worktree is clean, and its checkout is no longer needed. Keep the branch in the finish dialog until merged; after factual completion in main, merge and validate, then delete the merged branch with git branch -d. Use switch then finish only when cleanup is blocked or retaining the checkout is necessary. Never delete an unmerged branch just to reduce approvals.",
     ],
     parameters: Type.Object({
       action: Type.Union([
