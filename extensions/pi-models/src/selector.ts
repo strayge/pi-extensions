@@ -7,6 +7,7 @@ import {
   type Component,
   Input,
   Key,
+  type KeyId,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -15,6 +16,7 @@ import { type ModelLike, type ModelState, modelKey, rankModels } from "./sort.ts
 
 export interface SelectorResult {
   model?: ModelLike;
+  setDefault?: boolean;
   favorites?: Record<string, boolean>;
   hidden?: Record<string, boolean>;
 }
@@ -22,6 +24,7 @@ export interface SelectorOptions {
   models: readonly ModelLike[];
   states: Record<string, ModelState>;
   current?: string;
+  saveKeys?: readonly KeyId[];
   annotations?: Record<string, string>;
   refreshAnnotations?: () => Promise<Record<string, string>>;
   onUpdate?: () => void;
@@ -83,6 +86,7 @@ export class ModelSelector implements Component {
     const selectedModel = this.models[this.selected];
     const visibilityAction =
       selectedModel && this.options.states[modelKey(selectedModel)]?.hidden ? "unhide" : "hide";
+    const saveHint = (this.options.saveKeys ?? ["Ctrl+S"]).join("/");
     const lines = [
       `Models · ${this.showHidden ? "All" : "Visible"} · ${hiddenCount} hidden`,
       `${label}${this.input.render(inputWidth)[0] ?? ""}`,
@@ -94,7 +98,7 @@ export class ModelSelector implements Component {
           : "  No matching visible models. Tab shows all.",
       position,
       `Ctrl+F favorite | Ctrl+D ${visibilityAction} | Tab ${this.showHidden ? "show visible" : "show all"}`,
-      "Enter select | Esc close",
+      `Enter select${saveHint ? ` | ${saveHint} set default` : ""} | Esc close`,
     ];
     return lines.map((line) => truncateToWidth(line, safe, ""));
   }
@@ -110,7 +114,21 @@ export class ModelSelector implements Component {
       this.options.done?.({ favorites: this.favorites, hidden: this.hidden });
       return;
     }
-    if (matchesKey(data, Key.ctrl("f")) || matchesKey(data, Key.ctrl("d"))) {
+    const setDefault = (this.options.saveKeys ?? [Key.ctrl("s")]).some((key) =>
+      matchesKey(data, key),
+    );
+    if (matchesKey(data, Key.enter) || setDefault) {
+      const model = this.models[this.selected];
+      if (model) {
+        this.options.done?.({
+          model,
+          ...(setDefault ? { setDefault: true } : {}),
+          favorites: this.favorites,
+          hidden: this.hidden,
+        });
+        return;
+      }
+    } else if (matchesKey(data, Key.ctrl("f")) || matchesKey(data, Key.ctrl("d"))) {
       const model = this.models[this.selected];
       if (model) {
         const key = modelKey(model);
@@ -128,13 +146,7 @@ export class ModelSelector implements Component {
     } else if (matchesKey(data, Key.up)) this.selected = Math.max(0, this.selected - 1);
     else if (matchesKey(data, Key.down))
       this.selected = Math.min(Math.max(0, this.models.length - 1), this.selected + 1);
-    else if (matchesKey(data, Key.enter)) {
-      const model = this.models[this.selected];
-      if (model) {
-        this.options.done?.({ model, favorites: this.favorites, hidden: this.hidden });
-        return;
-      }
-    } else {
+    else {
       const before = this.input.getValue();
       this.input.handleInput(data);
       this.query = this.input.getValue();
@@ -164,10 +176,11 @@ export async function chooseModel(
   options: SelectorOptions,
 ): Promise<SelectorResult> {
   if (ctx.mode === "tui")
-    return ctx.ui.custom((tui, theme, _keys, done) => {
+    return ctx.ui.custom((tui, theme, keys, done) => {
       const selector = new ModelSelector({
         ...options,
         theme,
+        saveKeys: keys.getKeys("app.models.save"),
         done,
         onUpdate: () => tui.requestRender(),
       });

@@ -8,8 +8,10 @@ being left and restores the level previously used with the selected model.
 For partial command input such as `/m` or `/mo`, `/models` is suggested before the built-in `/model`.
 
 Rows display `[provider] Model Name`, falling back to the model ID when no name is available.
-Use Up/Down and Enter to select, Ctrl+F to toggle a favorite, Ctrl+D to hide/unhide, and Escape to
-close. Favorite and visibility changes are saved even when closing without selecting a model.
+Use Up/Down and Enter to select, Ctrl+S to select and save the global default, Ctrl+F to toggle a
+favorite, Ctrl+D to hide/unhide, and Escape to close. The default shortcut follows pi's
+`app.models.save` keybinding and leaves thinking-level settings unchanged.
+Favorite and visibility changes are saved even when closing without selecting a model.
 Typing filters the current view by provider, model ID, provider/model ID, or model name.
 
 OpenCode Go rows show dim monthly allowances and recalculated request estimates, for example
@@ -26,7 +28,7 @@ models without a safe catalog match have no suffix.
 Hiding affects only `/models`, not the active model, built-in `/model`, or model cycling. Hidden models
 remain selectable in All without being unhidden. Other preferences are preserved, and new models
 are visible by default. Non-terminal dialogs retain `[hidden]` badges and provide Show all/visible
-models and Hide/Unhide actions.
+models, Set as default, and Hide/Unhide actions.
 
 llama.cpp models are omitted from both views when their cached catalogue is confirmed older than
 24 hours. Opening `/models` does not refresh it; models return after a successful refresh in pi.

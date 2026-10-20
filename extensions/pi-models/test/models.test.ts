@@ -150,6 +150,59 @@ test("favorite toggle retains the highlighted model after resorting", () => {
   });
 });
 
+test("saving a default selects the highlighted model and retains preference changes", () => {
+  let result: SelectorResult | undefined;
+  const selector = new ModelSelector({
+    models: [
+      { provider: "p", id: "a" },
+      { provider: "p", id: "b" },
+    ],
+    states: {},
+    done: (value) => {
+      result = value;
+    },
+  });
+  selector.handleInput("\x1b[B");
+  selector.handleInput("\x06");
+  selector.handleInput("\t");
+  selector.handleInput("\x04");
+  selector.handleInput("\x13");
+  assert.deepEqual(result, {
+    model: { provider: "p", id: "b" },
+    setDefault: true,
+    favorites: { "p/b": true },
+    hidden: { "p/b": true },
+  });
+});
+
+test("the default shortcut honors remapped and disabled bindings and ignores empty results", () => {
+  for (const saveKeys of [["ctrl+x"], []] as const) {
+    const results: SelectorResult[] = [];
+    const selector = new ModelSelector({
+      models: [{ provider: "p", id: "a" }],
+      states: {},
+      saveKeys,
+      done: (value) => {
+        results.push(value);
+      },
+    });
+    selector.handleInput("\x13");
+    assert.equal(results.length, 0);
+    selector.handleInput("\x18");
+    assert.equal(results[0]?.setDefault, saveKeys.length ? true : undefined);
+    assert.equal(
+      selector.render(100).some((line) => line.includes("set default")),
+      saveKeys.length > 0,
+    );
+  }
+  const empty = new ModelSelector({
+    models: [],
+    states: {},
+    done: () => assert.fail("An empty picker must not select a default"),
+  });
+  empty.handleInput("\x13");
+});
+
 test("hidden favorites are excluded unless All is requested", () => {
   const states = { "z/old": { favorite: true, hidden: true } };
   assert.deepEqual(rankModels(models, states).map(modelKey), ["a/never", "a/new"]);
@@ -289,7 +342,7 @@ test("the picker opens before annotations arrive and does not render after dispo
               },
             },
             { fg: (_color: string, text: string) => text },
-            {},
+            { getKeys: () => ["ctrl+s"] },
             resolve,
           );
         });

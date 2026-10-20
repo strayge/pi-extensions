@@ -1,4 +1,8 @@
-import type { ExtensionAPI, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
+import {
+  type ExtensionAPI,
+  type ExtensionUIDialogOptions,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { prioritizeModelsCommand } from "./autocomplete.ts";
 import { GoCatalogCache } from "./opencode-go-cache.ts";
 import { chooseModel } from "./selector.ts";
@@ -120,12 +124,13 @@ export default function (pi: ExtensionAPI): void {
         }
       }
       if (!result.model) return;
+      let setDefault = result.setDefault === true;
       if (ctx.mode !== "tui") {
         const key = modelKey(result.model);
         const visibilityAction = states[key]?.hidden ? "Unhide model" : "Hide model";
         const action = await ctx.ui.select(
           "Model action",
-          ["Select", "Toggle favorite", visibilityAction, "Cancel"],
+          ["Select", "Set as default", "Toggle favorite", visibilityAction, "Cancel"],
           Object.assign({} as ExtensionUIDialogOptions, {
             [Symbol.for("pi-extensions:input-dialog")]: false,
           }),
@@ -147,10 +152,26 @@ export default function (pi: ExtensionAPI): void {
           }
           return;
         }
-        if (action !== "Select") return;
+        setDefault = action === "Set as default";
+        if (action !== "Select" && !setDefault) return;
       }
       const selected = await pi.setModel(result.model as Parameters<typeof pi.setModel>[0]);
-      if (!selected) ctx.ui.notify("Unable to select that model", "error");
+      if (!selected) {
+        ctx.ui.notify("Unable to select that model", "error");
+        return;
+      }
+      if (setDefault) {
+        try {
+          const settings = SettingsManager.create(ctx.cwd);
+          settings.setDefaultModelAndProvider(result.model.provider, result.model.id);
+          await settings.flush();
+          const [error] = settings.drainErrors();
+          if (error) throw error.error;
+          ctx.ui.notify(`Default model: ${modelKey(result.model)}`, "info");
+        } catch (error) {
+          ctx.ui.notify(`Could not save default model: ${String(error)}`, "error");
+        }
+      }
     },
   });
 }
