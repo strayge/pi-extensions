@@ -2,12 +2,16 @@
 
 A repository-managed replacement for cmux's generated Pi extension. Keeps the
 existing lifecycle, tool Feed, workspace metadata, notifications, and session
-resume behavior, with two additions:
+resume behavior, with these changes:
 
 - **Background agents stay busy:** finishing the main turn does not publish Idle
   while agents are running/queued or a background result is waiting for the
   parent's automatic follow-up to finish. Child sessions cannot overwrite the
   parent workspace's status or resume binding.
+- **No snapshot refs in your repository:** cmux normally stores a
+  `git stash create` snapshot of modified tracked files under
+  `refs/cmux/last-turn/` on every Pi turn. This bridge blocks that, so
+  `cmux diff --last-turn` compares against `HEAD` instead.
 - **Input dialogs request attention:** questions, agent permission approvals,
   and agent worktree confirmations send cmux's semantic “needs input” notification.
   Answering or cancelling resolves the wait; overlapping dialogs keep it active

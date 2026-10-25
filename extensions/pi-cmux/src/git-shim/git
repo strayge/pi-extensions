@@ -1,0 +1,24 @@
+#!/bin/sh
+# Placed first on PATH for cmux hook subprocesses only. cmux records each
+# agent turn's diff baseline with `git stash create` plus a ref under
+# refs/cmux/last-turn/, which stores snapshots of modified tracked files, of
+# any size, in the user's repository. Empty successful output makes cmux fall
+# back to HEAD without writing a ref; every other command reaches real git.
+if [ "$#" -eq 5 ] && [ "$1" = -C ] && [ "$3" = stash ] && [ "$4" = create ] &&
+  [ "$5" = "cmux last turn baseline" ]; then
+  exit 0
+fi
+
+shim_dir=${0%/*}
+real_path=
+old_ifs=$IFS
+IFS=:
+set -f
+for dir in $PATH; do
+  [ "$dir" = "$shim_dir" ] || real_path=${real_path:+$real_path:}$dir
+done
+set +f
+IFS=$old_ifs
+PATH=$real_path
+export PATH
+exec git "$@"

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -277,6 +279,32 @@ test("cmux subprocess environments strip suppression but retain routing and sock
   assert.equal(cmuxEnvironment.CMUX_SOCKET_PASSWORD, "test-socket-password");
   assert.equal(gitEnvironment.CMUX_SOCKET_PASSWORD, undefined);
   assert.equal(process.env.CMUX_PI_HOOKS_DISABLED, "1");
+});
+
+test("cmux hook subprocesses cannot write last-turn baseline refs into the repository", () => {
+  setup();
+  const env = hookEnvironment(directory, true);
+  assert.match(env.PATH ?? "", /git-shim/);
+  assert.doesNotMatch(hookEnvironment(directory).PATH ?? "", /git-shim/);
+  const git = (...args: string[]) =>
+    execFileSync("/usr/bin/env", ["git", "-C", directory, ...args], {
+      env: {
+        ...env,
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@example.invalid",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@example.invalid",
+      },
+      encoding: "utf8",
+    }).trim();
+  git("init", "-q");
+  writeFileSync(path.join(directory, "tracked.txt"), "one");
+  git("add", "tracked.txt");
+  git("commit", "-qm", "base");
+  writeFileSync(path.join(directory, "tracked.txt"), "two");
+  // cmux falls back to HEAD on empty output and writes no ref.
+  assert.equal(git("stash", "create", "cmux last turn baseline"), "");
+  assert.match(git("stash", "create", "other message"), /^[0-9a-f]{40,64}$/);
 });
 
 test("ordinary turns notify only after final settlement and never twice", async () => {

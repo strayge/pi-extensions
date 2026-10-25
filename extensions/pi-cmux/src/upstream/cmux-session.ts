@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type HookExtra = Record<string, unknown>;
@@ -332,6 +333,8 @@ function shouldPreserveEnvKey(key: string): boolean {
   return false;
 }
 
+const gitShimDirectory = fileURLToPath(new URL("../git-shim", import.meta.url));
+
 export function hookEnvironment(cwd: string, includeSocketPassword = false): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -344,6 +347,8 @@ export function hookEnvironment(cwd: string, includeSocketPassword = false): Nod
   if (includeSocketPassword) {
     const socketPassword = process.env.CMUX_SOCKET_PASSWORD;
     if (socketPassword) env.CMUX_SOCKET_PASSWORD = socketPassword;
+    // The shim stops cmux from writing last-turn baseline refs into the repository.
+    env.PATH = env.PATH ? `${gitShimDirectory}${path.delimiter}${env.PATH}` : gitShimDirectory;
   }
   if (!env.CMUX_AGENT_LAUNCH_ARGV_B64) {
     const argv = normalizedLaunchArgv();

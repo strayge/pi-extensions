@@ -12,4 +12,5 @@ Baseline: installed cmux Pi extension, managed template marker v4,
 Local modifications (2026-10-07): repository-owned entry point and stock-hook
 suppression; a separate opt-out; stripped stock-disable environment for cmux
 commands; top-level session ownership; deferred completion while subagents run;
-pi-ask started/completed notification integration.
+pi-ask started/completed notification integration; a git shim on cmux hook
+subprocess PATH that suppresses last-turn baseline refs.
