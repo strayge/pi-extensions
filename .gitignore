@@ -14,6 +14,9 @@ build/
 out/
 *.tsbuildinfo
 
+# Package archives
+*.tgz
+
 # Logs
 logs/
 *.log
