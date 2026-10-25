@@ -1,7 +1,7 @@
 /**
- * The slot schema pi-statusline edits, generated from `/usage`'s own settings.
+ * Provider selection is slot-local; visual settings share `/usage`'s menu.
  *
- * Both editors read one list, so they cannot disagree about what a setting is
+ * Both editors read one display list, so they cannot disagree about what a setting is
  * called, what it may be set to, or how far a change reaches: toggling "reset
  * time" from the statusline moves the `/usage` report exactly as toggling it in
  * `/usage` does, because it is the same `apply`.
@@ -24,7 +24,40 @@ const BOOLEAN_SETTINGS = new Set(["reset-time", "pace-marker", "projection"]);
 /** A width is a number, not a list: the menu's steps are a convenience there. */
 const NUMBER_SETTINGS = new Set(["bar-width"]);
 
+export const USAGE_SLOT_PROVIDERS = [
+  "current",
+  "codex",
+  "anthropic",
+  "openrouter",
+  "opencode-go",
+] as const;
+
+export type UsageSlotProvider = (typeof USAGE_SLOT_PROVIDERS)[number];
+
+export function usageSlotProvider(options: SlotOptions): UsageSlotProvider {
+  return USAGE_SLOT_PROVIDERS.find((provider) => provider === options.provider) ?? "current";
+}
+
 export function usageSlotFields(): SlotFieldSpec[] {
+  return [
+    {
+      key: "provider",
+      label: "provider",
+      kind: "enum",
+      options: [...USAGE_SLOT_PROVIDERS],
+      description: "Follow the current model or watch a fixed provider",
+    },
+    {
+      key: "hide-when-current",
+      label: "hide when current",
+      kind: "boolean",
+      description: "Hide a fixed provider while the current model uses it",
+    },
+    ...displaySlotFields(),
+  ];
+}
+
+function displaySlotFields(): SlotFieldSpec[] {
   return buildSettings().map((setting) => {
     const field: SlotFieldSpec = {
       key: setting.id,
@@ -45,7 +78,7 @@ export function usageSlotFields(): SlotFieldSpec[] {
 
 /** The producer's current values, so an unset field reads as `usage.json` does. */
 export function usageSlotDefaults(config: UsageDisplayConfig): SlotOptions {
-  const defaults: SlotOptions = {};
+  const defaults: SlotOptions = { provider: "current", "hide-when-current": false };
   for (const setting of buildSettings()) {
     const current = setting.current(config);
     if (BOOLEAN_SETTINGS.has(setting.id)) defaults[setting.id] = current === "on";

@@ -184,14 +184,50 @@ test("only own-session options update config and re-announce its defaults", () =
   assert.equal(registered.length, 2);
 });
 
-test("the schema offers one field per display setting, in the same order", () => {
+test("layout demand is owner-scoped and never treated as a saved option change", () => {
+  const mock = createMockPi();
+  const { ctx } = createMockContext();
+  const received: unknown[] = [];
+  let saves = 0;
+  const slot = registerStatuslineSlot(mock.pi, {
+    id: "usage",
+    version: 1,
+    fields: [],
+    onInstances: (instances) => received.push(instances),
+    onOptions: () => {
+      saves += 1;
+    },
+  });
+  const message = {
+    owner: "test-session",
+    id: "usage",
+    instances: [{ options: { provider: "anthropic" } }],
+  };
+  mock.eventBus.emit("statusline:instances", message);
+  slot.refresh(ctx);
+  mock.eventBus.emit("statusline:instances", { ...message, owner: "other-session" });
+  mock.eventBus.emit("statusline:instances", { ...message, id: "other-slot" });
+  assert.deepEqual(received, []);
+  mock.eventBus.emit("statusline:instances", message);
+  mock.eventBus.emit("statusline:instances", { ...message, instances: [] });
+  assert.deepEqual(received, [[{ provider: "anthropic" }], []]);
+  assert.equal(saves, 0);
+  slot.dispose();
+  mock.eventBus.emit("statusline:instances", message);
+  assert.equal(received.length, 2);
+});
+
+test("provider selection precedes the existing display settings without changing their order", () => {
   const fields = usageSlotFields();
   assert.deepEqual(
-    fields.map((field) => field.key),
+    fields.slice(0, 2).map((field) => field.key),
+    ["provider", "hide-when-current"],
+  );
+  assert.deepEqual(
+    fields.slice(2).map((field) => field.key),
     buildSettings().map((setting) => setting.id),
   );
-  // `preset` first matters: it rewrites every other value when applied.
-  assert.equal(fields[0]?.key, "preset");
+  assert.equal(fields[2]?.key, "preset");
 });
 
 test("every field is a kind the statusline editor can actually edit", () => {
@@ -207,6 +243,8 @@ test("every field is a kind the statusline editor can actually edit", () => {
 
 test("declared defaults are the producer's own current values", () => {
   const defaults = usageSlotDefaults(presetConfig("full"));
+  assert.equal(defaults.provider, "current");
+  assert.equal(defaults["hide-when-current"], false);
   assert.equal(defaults.preset, "full");
   assert.equal(defaults.buckets, "all");
   assert.equal(defaults["bar-width"], 8);

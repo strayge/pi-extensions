@@ -20,7 +20,7 @@ import { configPath, loadConfig } from "./config.ts";
 import { runEditor } from "./editor.ts";
 import { createFooterFactory } from "./footer.ts";
 import { type GitStatus, gitStatusEqual, readGitStatus } from "./git-status.ts";
-import { changedSlotOptions } from "./options-sync.ts";
+import { changedSlotOptions, slotOptionsById } from "./options-sync.ts";
 import { createRuntime, resetRuntime, toolEnded, toolStarted } from "./runtime.ts";
 import { SlotRegistry } from "./slots.ts";
 import type { StatuslineConfig } from "./types.ts";
@@ -35,7 +35,15 @@ export default function statusline(pi: ExtensionAPI) {
   let footerData: ReadonlyFooterDataProvider | undefined;
 
   const refresh = () => requestRender?.();
-  const slots = new SlotRegistry(pi, refresh);
+  const slots = new SlotRegistry(
+    pi,
+    refresh,
+    (id) =>
+      slotOptionsById({
+        ...config,
+        lines: config.lines.map((line) => line.filter((item) => item.hidden !== true)),
+      }).get(id) ?? [],
+  );
   slots.listen();
 
   // Git status is the one item that costs a subprocess, so it is only kept up
@@ -96,6 +104,7 @@ export default function statusline(pi: ExtensionAPI) {
     const changed = changedSlotOptions(config, next);
     config = next;
     for (const [id, instances] of changed) slots.pushOptions(id, instances);
+    slots.syncInstances();
     refresh();
     scheduleGitStatus();
   };

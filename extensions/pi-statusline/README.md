@@ -280,7 +280,7 @@ bus. A producer publishes an item and may suggest where it belongs; the
 suggestion is only a default — if your config names the id, your placement wins.
 
 Every slot message (`publish`, `clear`, `register`, `unregister`, `request`,
-`options` on `statusline:*`) carries a non-empty `owner`: the sending session's id
+`options`, `instances` on `statusline:*`) carries a non-empty `owner`: the sending session's id
 from `ctx.sessionManager.getSessionId()`. The statusline and helpers ignore
 messages for another session and unstamped messages; `ctx.ui.setStatus` works
 as before. The registry drops traffic and emits nothing until session start;
@@ -360,6 +360,7 @@ Values live in the item, so two placements of the same slot can differ:
 | `defaults` | Your current values. An untouched field reads `(8)` and follows them |
 | `render` | Called on every paint, and per keypress while editing. Must be pure |
 | `onOptions` | The saved values, so your own config can mirror them |
+| `onInstances` | Read-only saved placements, for deciding what data to refresh |
 | `version` | Bump when a key changes meaning |
 
 `render` returns a string, a list of `{ text, color }` segments, or
@@ -382,6 +383,21 @@ actually change: a reload that read the same file back rewrites nothing.
 
 A slot in the `extensions` catch-all has nowhere to carry options, so it renders
 with the extension's own defaults.
+
+Producers that need background data for individual placements can use the
+helper's `onInstances` callback, backed by read-only `statusline:instances`
+notifications:
+
+```typescript
+{ id: "usage", owner, instances: [{ options: { provider: "anthropic" } }] }
+```
+
+The statusline sends the saved, non-hidden placements when a producer registers
+or re-registers, and whenever a layout is adopted. Removing the last placement
+sends `instances: []`. Unlike `statusline:options`, this is demand information,
+not permission to persist settings; startup and unchanged reloads never imply a
+settings save. Unsaved previews do not change demand. `pi-usage` uses this to
+refresh explicitly watched providers while keeping its render callback pure.
 
 The layout editor offers every slot published at least once this session, so one
 that only appears under some condition — a warning, a lifted restriction — can

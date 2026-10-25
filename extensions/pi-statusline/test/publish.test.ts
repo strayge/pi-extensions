@@ -108,6 +108,38 @@ test("registration waits for refresh and follows its owner through replay and di
   assert.equal(registered.length, 3);
 });
 
+test("read-only layout demand reaches only its owning producer without saving options", () => {
+  const bus = busFor(createRegistry());
+  const received: unknown[] = [];
+  let saves = 0;
+  const slot = registerStatuslineSlot({ events: bus } as never, {
+    id: "usage",
+    version: 1,
+    fields: [],
+    onInstances: (instances) => received.push(instances),
+    onOptions: () => {
+      saves++;
+    },
+  });
+  const message = {
+    id: "usage",
+    owner: "test-session",
+    instances: [{ options: { provider: "anthropic" } }],
+  };
+  bus.emit("statusline:instances", message);
+  slot.refresh(fakeEnv().ctx);
+  assert.deepEqual(received, [[]]);
+  bus.emit("statusline:instances", { ...message, owner: "other-session" });
+  bus.emit("statusline:instances", { ...message, id: "other-slot" });
+  bus.emit("statusline:instances", message);
+  bus.emit("statusline:instances", { ...message, instances: [] });
+  assert.deepEqual(received, [[], [{ provider: "anthropic" }], []]);
+  assert.equal(saves, 0);
+  slot.dispose();
+  bus.emit("statusline:instances", message);
+  assert.equal(received.length, 3);
+});
+
 test("only own-session options reach the template producer and re-announce defaults", () => {
   const registry = createRegistry();
   const bus = busFor(registry);

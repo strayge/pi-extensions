@@ -1,11 +1,10 @@
 /**
- * `/usage` and the `usage` status: how much of the current account's quota is
- * left, for the provider the active model belongs to.
+ * `/usage` and the stock status follow the current model; statusline placements
+ * may also watch fixed providers without switching the model.
  *
- * Scoped deliberately to the *current* account. Auth is resolved before every
- * query and its fingerprint keys the cache, so a credential change is a cache
- * miss rather than a stale reading, and no report can be served across
- * accounts. A query that finishes after the model has moved on is discarded.
+ * Each provider remains scoped to Pi's runtime account. Freshly resolved auth
+ * fingerprints key the cache, so credential changes miss rather than crossing
+ * accounts. Cancelled session, model, and layout work cannot publish readings.
  */
 
 import { randomUUID } from "node:crypto";
@@ -42,7 +41,13 @@ import {
   deriveUsageSnapshotIdentity,
   SNAPSHOT_ENTRY_TYPE,
 } from "./snapshot.ts";
-import { applyUsageSlotOptions, usageSlotDefaults, usageSlotFields } from "./statusline-schema.ts";
+import {
+  applyUsageSlotOptions,
+  type UsageSlotProvider,
+  usageSlotDefaults,
+  usageSlotFields,
+  usageSlotProvider,
+} from "./statusline-schema.ts";
 import { publishStatuslineItem, registerStatuslineSlot } from "./statusline-slot.ts";
 import type {
   CodexResetCreditRedemption,
@@ -91,6 +96,8 @@ export default function usageExtension(
   // a user who wants it elsewhere names it in their statusline config.
   const publishSlot = publishStatuslineItem(pi, { id: STATUS_KEY });
   const cache = new UsageCache(CACHE_TTL_MS);
+  // A pin's cached reading has no history snapshot; fetch afresh when it becomes current.
+  const pinOnlyReports = new WeakSet<UsageReport>();
   const failures = new Map<string, { until: number; message: string }>();
   const pendingRedemptions = new PendingRedemptionStore();
 
@@ -121,6 +128,11 @@ export default function usageExtension(
   /** The last reading, kept so the statusline can re-render it under different
    *  options without a query — `render` is called on every paint. */
   let latest: { report: UsageReport; model: PiModel | undefined } | undefined;
+  let activeContext: ExtensionContext | undefined;
+  let pinnedProviders = new Set<UsageSlotProvider>();
+  const pinnedReadings = new Map<UsageSlotProvider, QueryOutcome>();
+  const pinnedQueries = new Map<UsageSlotProvider, AbortController>();
+  let pinnedTimer: ReturnType<typeof setInterval> | undefined;
 
   /**
    * Offer the display options to a statusline that can edit them.
@@ -137,18 +149,50 @@ export default function usageExtension(
     fields: usageSlotFields(),
     defaults: () => usageSlotDefaults(display),
     render: (options, env) => {
-      const report = latest?.report ?? (env.preview ? sampleUsageReport() : undefined);
-      if (!report) return undefined;
-      return formatUsageSegments(
-        report,
-        latest?.model,
-        applyUsageSlotOptions(display, options),
-        Date.now(),
-      );
+      const provider = usageSlotProvider(options);
+      const current = slotProviderFor(activeContext?.model?.provider);
+      if (provider !== "current" && options["hide-when-current"] === true && provider === current) {
+        return undefined;
+      }
+      const config = applyUsageSlotOptions(display, options);
+      const currentReading =
+        latest && modelIdentity(latest.model) === modelIdentity(activeContext?.model)
+          ? latest
+          : undefined;
+      if (provider === "current") {
+        const report = currentReading?.report ?? (env.preview ? sampleUsageReport() : undefined);
+        return report ? formatUsageSegments(report, currentReading?.model, config) : shown.text;
+      }
+      const outcome = pinnedReadings.get(provider);
+      const report =
+        provider === current
+          ? currentReading?.report
+          : outcome?.state.status === "ready"
+            ? outcome.state.report
+            : undefined;
+      if (report) return formatUsageSegments(report, undefined, config);
+      if (env.preview) {
+        const sample = sampleUsageReport(
+          Date.now(),
+          provider === "codex" ? "openai-codex" : provider,
+        );
+        return formatUsageSegments(sample, undefined, config);
+      }
+      const status =
+        provider === current
+          ? shown.text
+          : outcome?.state.status === "auth-unavailable"
+            ? "auth unavailable"
+            : outcome?.state.status === "query-failed"
+              ? "usage error"
+              : "checking";
+      return `${provider} ${status ?? "checking"}`;
     },
     // The statusline owns the values; this keeps `usage.json` in step so the
     // `/usage` report and a stock pi footer agree with what the bar shows.
-    onOptions: (options) => {
+    onOptions: (_options, instances) => {
+      const options = instances.find((instance) => usageSlotProvider(instance) === "current");
+      if (!options) return;
       const next = applyUsageSlotOptions(display, options);
       display = next;
       try {
@@ -157,6 +201,18 @@ export default function usageExtension(
         // A read-only config directory costs the persistence, not the session:
         // the values are still live, and the statusline holds its own copy.
       }
+    },
+    onInstances: (instances) => {
+      const next = new Set(
+        instances.map(usageSlotProvider).filter((provider) => provider !== "current"),
+      );
+      if (
+        next.size === pinnedProviders.size &&
+        [...next].every((provider) => pinnedProviders.has(provider))
+      )
+        return;
+      pinnedProviders = next;
+      if (activeContext && sessionActive) refreshPinnedProviders(activeContext);
     },
   });
   /** Monotonic: only the newest refresh may publish its result. */
@@ -264,6 +320,7 @@ export default function usageExtension(
     model: PiModel | undefined,
     force: boolean,
     signal: AbortSignal,
+    recordSnapshot = true,
   ): Promise<QueryOutcome> => {
     const adapter = adapterForProvider(model?.provider);
     if (!adapter) {
@@ -325,7 +382,7 @@ export default function usageExtension(
 
     if (!force) {
       const cached = cache.get(adapter.id, auth.fingerprint);
-      if (cached) return ready(cached);
+      if (cached && (!recordSnapshot || !pinOnlyReports.has(cached))) return ready(cached);
 
       const failed = recentFailure(`${adapter.id}:${auth.fingerprint}`);
       if (failed) {
@@ -352,8 +409,9 @@ export default function usageExtension(
 
     signal.throwIfAborted();
     cache.set(adapter.id, auth.fingerprint, report);
+    if (!recordSnapshot) pinOnlyReports.add(report);
     failures.delete(`${adapter.id}:${auth.fingerprint}`);
-    if (modelIdentity(ctx.model) === modelIdentity(model)) {
+    if (recordSnapshot && modelIdentity(ctx.model) === modelIdentity(model)) {
       try {
         pi.appendEntry(SNAPSHOT_ENTRY_TYPE, createUsageSnapshot(report, auth));
       } catch (error) {
@@ -376,6 +434,7 @@ export default function usageExtension(
       return false;
     }
     if (outcome.state.status !== "ready") {
+      latest = undefined;
       const label =
         outcome.state.status === "auth-unavailable" ? "auth unavailable" : "usage error";
       return safeSetStatus(ctx, label, model);
@@ -393,6 +452,7 @@ export default function usageExtension(
   ) => {
     if (!model || !adapterForProvider(model.provider)) {
       cancelRefresh();
+      latest = undefined;
       safeSetStatus(ctx, undefined);
       return;
     }
@@ -417,10 +477,90 @@ export default function usageExtension(
   };
 
   const startRefresh = (ctx: ExtensionContext, model: PiModel | undefined, force: boolean) => {
+    activeContext = ctx;
+    // Pinned providers own their timer; only lifecycle refreshes recheck both.
+    if (sessionActive && !force) refreshPinnedProviders(ctx);
     void refreshStatus(ctx, model, force).catch((error) => {
       if (isStaleExtensionContextError(error) || isAbortError(error)) return;
       safeSetStatus(ctx, "usage error");
     });
+  };
+
+  /**
+   * Fixed slots share one query per provider, never one per placement. Restart
+   * pending work on refresh so a credential change cannot publish an old reply.
+   */
+  const refreshPinnedProviders = (ctx: ExtensionContext, force = false) => {
+    const current = slotProviderFor(ctx.model?.provider);
+    for (const controller of pinnedQueries.values()) controller.abort();
+    pinnedQueries.clear();
+    for (const provider of pinnedReadings.keys()) {
+      if (!pinnedProviders.has(provider) || provider === current) pinnedReadings.delete(provider);
+    }
+    if (pinnedTimer && pinnedProviders.size === 0) {
+      clearInterval(pinnedTimer);
+      pinnedTimer = undefined;
+    }
+    if (!pinnedTimer && pinnedProviders.size > 0) {
+      pinnedTimer = setInterval(() => {
+        if (sessionActive && activeContext) refreshPinnedProviders(activeContext, true);
+      }, CACHE_TTL_MS);
+      pinnedTimer.unref?.();
+    }
+    for (const provider of pinnedProviders) {
+      if (provider === current) continue;
+      const controller = new AbortController();
+      pinnedQueries.set(provider, controller);
+      void (async () => {
+        const models = [...ctx.modelRegistry.getAvailable(), ...ctx.modelRegistry.getAll()];
+        const ids = provider === "codex" ? ["openai", "openai-codex"] : [provider];
+        let outcome: QueryOutcome | undefined;
+        for (const id of ids) {
+          const model = models.find((candidate) => candidate.provider === id);
+          if (!model) continue;
+          outcome = await queryUsage(ctx, model, force, controller.signal, false);
+          if (outcome.state.status !== "auth-unavailable") break;
+        }
+        outcome ??= {
+          state: {
+            providerId: provider,
+            providerName: provider,
+            displayState: "configured",
+            status: "auth-unavailable",
+            message: `No runtime model is configured for ${provider}.`,
+          },
+        };
+        if (
+          controller.signal.aborted ||
+          !sessionActive ||
+          pinnedQueries.get(provider) !== controller
+        )
+          return;
+        pinnedReadings.set(provider, outcome);
+        statuslineSlot.refresh(ctx);
+      })()
+        .catch((error) => {
+          if (
+            isStaleExtensionContextError(error) ||
+            isAbortError(error) ||
+            controller.signal.aborted
+          )
+            return;
+          pinnedReadings.set(provider, {
+            state: {
+              providerId: provider,
+              providerName: provider,
+              displayState: "configured",
+              status: "query-failed",
+              message: errorMessage(error),
+            },
+          });
+          statuslineSlot.refresh(ctx);
+        })
+        .finally(() => {
+          if (pinnedQueries.get(provider) === controller) pinnedQueries.delete(provider);
+        });
+    }
   };
 
   /** Runs one query behind an abortable loader so Escape cancels it. */
@@ -734,6 +874,7 @@ export default function usageExtension(
 
   pi.on("session_start", (_event, ctx) => {
     sessionActive = true;
+    activeContext = ctx;
     snapshotWarningShown = false;
     reloadDisplayConfig();
     // Announce with this session's owner and the freshly loaded defaults.
@@ -761,6 +902,14 @@ export default function usageExtension(
   });
   pi.on("session_shutdown", (_event, ctx) => {
     sessionActive = false;
+    activeContext = undefined;
+    latest = undefined;
+    for (const controller of pinnedQueries.values()) controller.abort();
+    pinnedQueries.clear();
+    pinnedReadings.clear();
+    pinnedProviders.clear();
+    if (pinnedTimer) clearInterval(pinnedTimer);
+    pinnedTimer = undefined;
     cancelRefresh();
     // Leaves an open /usage dialog waiting on a session that is gone.
     menuController?.abort();
@@ -814,6 +963,10 @@ function providerDisplayName(ctx: ExtensionContext, providerId: string): string 
   } catch {
     return sanitizeDisplayText(providerId, 80);
   }
+}
+
+function slotProviderFor(provider: string | undefined): string | undefined {
+  return isCodexProvider(provider ?? "") ? "codex" : provider;
 }
 
 function modelIdentity(model: PiModel | undefined): string | undefined {

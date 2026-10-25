@@ -97,8 +97,8 @@ test("a throwing render costs the slot, not the session, and is reported once", 
   });
   const env = fakeEnv({ registry });
 
-  // Falls back to the published text rather than disappearing or throwing.
-  assert.equal(value({ type: "slot", id: "usage" }, env)?.text, "published");
+  // A renderer owns visibility even when it fails; stale text must not return.
+  assert.equal(value({ type: "slot", id: "usage" }, env), undefined);
   value({ type: "slot", id: "usage" }, env);
 
   const failures = registry.takeRenderFailures();
@@ -140,6 +140,54 @@ test("a render with nothing to say leaves the item empty", () => {
 
   const blank = envWith({ id: "usage", version: 1, fields: [], render: () => "   " });
   assert.equal(value({ type: "slot", id: "usage" }, blank), undefined);
+});
+
+test("empty registered renders hide stale fallbacks and their layout decorations", () => {
+  for (const render of [() => undefined, () => "   "]) {
+    const registry = createRegistry();
+    register(registry, { id: "usage", version: 1, fields: [], render });
+    const env = fakeEnv({ registry, statuses: { usage: "stale status" } });
+    assert.equal(value({ type: "slot", id: "usage" }, env), undefined);
+    assert.equal(value({ type: "extensions" }, env)?.text, "");
+
+    publish(registry, { id: "usage", text: "stale published", icon: "producer" });
+    assert.equal(value({ type: "slot", id: "usage" }, env), undefined);
+    assert.equal(value({ type: "extensions" }, env)?.text, "");
+
+    for (const item of [{ type: "slot", id: "usage" }, { type: "extensions" }] as const) {
+      const layout = config([
+        [
+          { type: "cwd" },
+          { type: "sep", text: " | " },
+          { ...item, icon: "icon", prefix: "[", suffix: "]" },
+          { type: "sep", text: " | " },
+        ],
+      ]);
+      assert.deepEqual(renderStatusline(80, layout, markupTheme(), env), ["<dim>/work/proj</dim>"]);
+    }
+
+    const withOtherStatus = fakeEnv({
+      registry,
+      statuses: { usage: "stale status", other: "ready" },
+    });
+    assert.equal(value({ type: "extensions" }, withOtherStatus)?.text, "ready");
+    busFor(registry).emit("statusline:clear", { id: "usage", owner: "test-session" });
+    assert.equal(registry.get("usage"), undefined);
+    assert.equal(value({ type: "slot", id: "usage" }, env), undefined);
+    assert.equal(value({ type: "extensions" }, withOtherStatus)?.text, "ready");
+  }
+});
+
+test("registrations without a renderer retain published and status fallbacks", () => {
+  const registry = createRegistry();
+  register(registry, { id: "usage", version: 1, fields: [] });
+  const env = fakeEnv({ registry, statuses: { usage: "status fallback" } });
+  assert.equal(value({ type: "slot", id: "usage" }, env)?.text, "status fallback");
+  assert.equal(value({ type: "extensions" }, env)?.text, "status fallback");
+
+  publish(registry, { id: "usage", text: "published fallback" });
+  assert.equal(value({ type: "slot", id: "usage" }, env)?.text, "published fallback");
+  assert.equal(value({ type: "extensions" }, env)?.text, "published fallback");
 });
 
 test("only declared options reach the producer, in the shape declared", () => {

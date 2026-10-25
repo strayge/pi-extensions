@@ -59,6 +59,7 @@ export const REQUEST_CHANNEL = "statusline:request";
 export const REGISTER_CHANNEL = "statusline:register";
 export const UNREGISTER_CHANNEL = "statusline:unregister";
 export const OPTIONS_CHANNEL = "statusline:options";
+export const INSTANCES_CHANNEL = "statusline:instances";
 
 export class SlotRegistry {
   private owner: string | undefined;
@@ -74,10 +75,16 @@ export class SlotRegistry {
   private failures = new Map<string, string>();
   private pi: ExtensionAPI;
   private onChange: () => void;
+  private getInstances: (id: string) => SlotOptions[];
 
-  constructor(pi: ExtensionAPI, onChange: () => void) {
+  constructor(
+    pi: ExtensionAPI,
+    onChange: () => void,
+    getInstances: (id: string) => SlotOptions[] = () => [],
+  ) {
     this.pi = pi;
     this.onChange = onChange;
+    this.getInstances = getInstances;
   }
 
   setOwner(owner: string | undefined): void {
@@ -109,6 +116,7 @@ export class SlotRegistry {
       const registration = parseRegistration(data);
       if (!registration) return;
       this.registrations.set(registration.id, registration);
+      this.sendInstances(registration.id);
       // A re-announce may carry fresh defaults, and those are what the editor
       // shows for an unset field, so a repaint is due either way.
       this.failures.delete(registration.id);
@@ -200,6 +208,24 @@ export class SlotRegistry {
       version: registration?.version ?? 1,
       instances: instances.map((options) => ({
         options: registration ? coerceOptions(options, registration) : { ...options },
+      })),
+    });
+  }
+
+  /** Report saved demand without granting authority to persist producer settings. */
+  syncInstances(): void {
+    for (const id of this.registrations.keys()) this.sendInstances(id);
+  }
+
+  private sendInstances(id: string): void {
+    if (!this.owner) return;
+    const registration = this.registrations.get(id);
+    if (!registration) return;
+    this.pi.events.emit(INSTANCES_CHANNEL, {
+      id,
+      owner: this.owner,
+      instances: this.getInstances(id).map((options) => ({
+        options: coerceOptions(options, registration),
       })),
     });
   }

@@ -124,7 +124,7 @@ Pi's runtime auth.
 
 ## Statusline
 
-The `usage` status covers the selected model's provider only. It refreshes when
+By default, the `usage` status covers the selected model's provider only. It refreshes when
 the session starts, when the model changes, on each turn, and every five minutes
 while the answer stays cached. It clears when the model moves to a provider with
 no usage source.
@@ -151,13 +151,48 @@ of them can be set from `/statusline` with a live preview, per placement:
 ```
 
 An option you do not set follows `usage.json`, so an untouched slot shows
-whatever `/usage` is set to. One you do set wins for that item and is written
-back into `usage.json` when you save, keeping the `/usage` report and a stock pi
-footer in step with the bar — a change reaches exactly as far as making the same
-change in `/usage` does, because it runs the same code.
+whatever `/usage` is set to. One you do set wins for that item. When you save,
+the first **Current** item's display options are also written back into
+`usage.json`, keeping `/usage` and the stock footer in step. Fixed-provider
+items never overwrite those defaults.
 
 The quota itself is tinted past 70% and 90% spent, which a statusline that
 understands per-segment colors will show; the countdown beside it is left alone.
+
+### Watching several providers
+
+In `/statusline`, add the `usage` slot more than once and set each item's
+**provider**: `current` (the default), `codex`, `anthropic`, `openrouter`, or
+`opencode-go`. Existing presets and display options apply independently to each
+item. Provider selection and visibility are separate from presets.
+
+Enable **hide when current** on a fixed-provider item to keep the active
+provider at a consistent position without duplicates:
+
+```jsonc
+[
+  { "type": "slot", "id": "usage", "options": { "provider": "current", "preset": "compact" } },
+  { "type": "sep", "text": " │ " },
+  { "type": "slot", "id": "usage", "options": { "provider": "codex", "preset": "minimal", "hide-when-current": true } },
+  { "type": "sep", "text": " │ " },
+  { "type": "slot", "id": "usage", "options": { "provider": "anthropic", "preset": "minimal", "hide-when-current": true } }
+]
+```
+
+This is one line inside `statusline.json`'s `lines` array. A Codex session shows
+Codex + Anthropic; an Anthropic session shows Anthropic + Codex; an OpenCode Go
+session shows OpenCode Go + Codex + Anthropic. The active provider uses the
+Current item's formatting. `codex` covers both `openai` ChatGPT login and legacy
+`openai-codex`, preferring the current route or otherwise the available ChatGPT
+OAuth route.
+
+Only explicitly placed, non-hidden fixed providers are monitored. Duplicate
+placements share cached queries; providers refresh independently, so a failure
+or slow request does not block the others. Auth failures and query errors are
+labelled per provider. Unsaved layout previews use sample data rather than
+starting requests. Requires a `pi-statusline` version supporting read-only slot
+instance notifications. `/usage`, snapshots, and the stock footer remain scoped
+to the current provider.
 
 ### Speed moved to pi-speed
 
@@ -271,8 +306,10 @@ before every query, and a salted fingerprint of that credential keys the cache,
 so a report can never be served across accounts: a credential change is a cache
 miss, not a stale reading.
 
-Reports are cached for five minutes per provider and credential. The enriched
-reset-credit count and expiration detail are part of that same snapshot, not a
+Reports are cached for five minutes per provider and credential. A provider
+first observed only as a fixed statusline item is fetched afresh when it becomes
+current, so its first current-provider history snapshot is not lost to a cache
+hit. The enriched reset-credit count and expiration detail are part of that same snapshot, not a
 separate cache. Returning to an account within that window reuses its own recent
 reading rather than re-querying. A failed query backs off for 30 seconds so a
 broken endpoint is not retried on every turn.

@@ -10,11 +10,27 @@ import type { UsageReport } from "./types.ts";
 
 const MINUTE_SECONDS = 60;
 
-export function sampleUsageReport(now: number = Date.now()): UsageReport {
+export function sampleUsageReport(
+  now: number = Date.now(),
+  providerId = "openai-codex",
+): UsageReport {
   const epoch = Math.floor(now / 1000);
+  if (providerId === "openrouter") {
+    return {
+      providerId,
+      providerName: "OpenRouter",
+      capturedAt: now,
+      source: "sample",
+      semantics: { kind: "api-key", label: "API-key spend limits" },
+      buckets: [
+        { id: "key-limit", label: "Key limit", used: 25, remaining: 75, limit: 100, unit: "usd" },
+      ],
+      metrics: [],
+    };
+  }
   return {
-    providerId: "openai-codex",
-    providerName: "OpenAI Codex",
+    providerId,
+    providerName: providerId === "openai-codex" ? "OpenAI Codex" : providerId,
     capturedAt: now,
     source: "sample",
     semantics: { kind: "consumer-subscription", label: "ChatGPT subscription limits" },

@@ -266,7 +266,8 @@ function buildTools(env: RenderEnv): string {
  * Keyed by id rather than appended: an extension that both publishes a slot and
  * calls `setStatus` under the same name — the recommended way to stay readable
  * on a stock pi footer — is one extension speaking twice, not two entries. The
- * slot wins, since it carries the icon and color.
+ * slot wins, since it carries the icon and color. A registered renderer also
+ * owns hiding: an empty result removes stale published and status text.
  */
 function buildExtensions(item: ExtensionsItemConfig, env: RenderEnv): string {
   const include = item.include ? new Set(item.include) : undefined;
@@ -284,19 +285,29 @@ function buildExtensions(item: ExtensionsItemConfig, env: RenderEnv): string {
     entries.set(key, icons[key] ? `${icons[key]} ${clean}` : clean);
   }
 
-  for (const slot of env.slots.all()) {
-    if (!wanted(slot.id)) continue;
+  const ids = new Set([...entries.keys(), ...env.slots.all().map((slot) => slot.id)]);
+  for (const id of ids) {
+    if (!wanted(id)) continue;
+    const slot = env.slots.get(id);
+    const registration = env.slots.registration(id);
+    if (!slot && !registration?.render) continue;
     // No per-item options exist down here, so a producer that registered one is
     // asked for its own defaults — which is what its own config file says.
     // Segment colors are lost either way: the catch-all is one item.
-    const rendered = env.slots.render(slot.id, {}, { preview: env.preview });
-    const text = rendered ? rendered.segments.map((segment) => segment.text).join("") : slot.text;
-    if (text.length === 0) {
-      entries.delete(slot.id);
+    const rendered = env.slots.render(id, {}, { preview: env.preview });
+    if (!rendered && registration?.render) {
+      entries.delete(id);
       continue;
     }
-    const icon = rendered?.icon ?? slot.icon ?? icons[slot.id];
-    entries.set(slot.id, icon ? `${icon} ${text}` : text);
+    const text = rendered
+      ? rendered.segments.map((segment) => segment.text).join("")
+      : (slot?.text ?? "");
+    if (text.length === 0) {
+      entries.delete(id);
+      continue;
+    }
+    const icon = rendered?.icon ?? registration?.icon ?? slot?.icon ?? icons[id];
+    entries.set(id, icon ? `${icon} ${text}` : text);
   }
 
   return [...entries]
@@ -306,9 +317,9 @@ function buildExtensions(item: ExtensionsItemConfig, env: RenderEnv): string {
 }
 
 /**
- * Resolve a named slot, in three descending steps: the producer's own `render`
- * with this item's options, then the text it last published, then a
- * `ctx.ui.setStatus` key of the same name.
+ * A producer's registered `render` owns the result, including hiding the item
+ * when empty. Only producers without a renderer fall back to their last
+ * published text, then a `ctx.ui.setStatus` key of the same name.
  *
  * The last of those is what lets any existing extension — one that knows
  * nothing about this statusline — be placed at an exact spot by the user. The
@@ -331,6 +342,8 @@ function buildSlot(item: SlotItemConfig, env: RenderEnv): ItemValue | undefined 
       color: registration?.color ?? slot?.color,
     };
   }
+
+  if (registration?.render) return undefined;
 
   if (!slot) {
     const status = env.footerData.getExtensionStatuses().get(item.id);

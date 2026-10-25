@@ -17,6 +17,7 @@ const REQUEST_CHANNEL = "statusline:request";
 const REGISTER_CHANNEL = "statusline:register";
 const UNREGISTER_CHANNEL = "statusline:unregister";
 const OPTIONS_CHANNEL = "statusline:options";
+const INSTANCES_CHANNEL = "statusline:instances";
 
 export interface SlotDefinition {
   id: string;
@@ -74,6 +75,8 @@ export interface SlotSchemaDefinition extends SlotDefinition {
   /** The layout's values for this slot, sent when the user changes them.
    *  `instances` holds every placement; the first is the conventional one. */
   onOptions?: (options: SlotOptions, instances: SlotOptions[]) => void;
+  /** Read-only saved layout demand, including startup and removal. */
+  onInstances?: (instances: SlotOptions[]) => void;
 }
 
 /**
@@ -124,7 +127,7 @@ export function registerStatuslineSlot(
   pi: ExtensionAPI,
   definition: SlotSchemaDefinition,
 ): { dispose: () => void; refresh: (ctx: Pick<ExtensionContext, "sessionManager">) => void } {
-  const { defaults, onOptions, ...rest } = definition;
+  const { defaults, onOptions, onInstances, ...rest } = definition;
   let owner: string | undefined;
 
   const announce = () => {
@@ -133,6 +136,15 @@ export function registerStatuslineSlot(
 
   const unsubscribeRequest = pi.events.on(REQUEST_CHANNEL, (data) => {
     if (owner && isRecord(data) && data.owner === owner) announce();
+  });
+  const unsubscribeInstances = pi.events.on(INSTANCES_CHANNEL, (data) => {
+    if (!owner || !isRecord(data) || data.owner !== owner || data.id !== definition.id) return;
+    if (!Array.isArray(data.instances)) return;
+    onInstances?.(
+      data.instances
+        .filter(isRecord)
+        .map((entry) => (isRecord(entry.options) ? (entry.options as SlotOptions) : {})),
+    );
   });
   const unsubscribeOptions = pi.events.on(OPTIONS_CHANNEL, (data) => {
     if (!owner || !isRecord(data) || data.owner !== owner) return;
@@ -152,6 +164,7 @@ export function registerStatuslineSlot(
     dispose: () => {
       unsubscribeRequest();
       unsubscribeOptions();
+      unsubscribeInstances();
       if (owner) pi.events.emit(UNREGISTER_CHANNEL, { id: definition.id, owner });
     },
     /** Call at session start and on config changes so ownership and defaults follow. */
