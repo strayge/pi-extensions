@@ -63,7 +63,7 @@ test("Gitfile/common-dir exclusions and anchored global rules respect nested rep
     const actual = text(await grep.execute("search", { pattern: "needle" }, undefined, undefined, f.ctx))
       .split("\n").filter((line) => line.endsWith(":1: needle")).map((line) => line.slice(0, -10)).sort();
     const rg = process.platform === "darwin" ? macRipgrep() : "/usr/bin/rg";
-    const native = spawnSync(rg, ["--no-config", "--hidden", "-l", "needle", f.project], { encoding: "utf8", cwd: f.project });
+    const native = spawnSync(rg, ["--no-config", "--hidden", "-l", "needle", "."], { encoding: "utf8", cwd: f.project });
     assert.equal(native.status, 0, native.stderr);
     const expected = native.stdout.trim().split("\n").map((file) => path.relative(f.project, file)).sort();
     assert.deepEqual(actual, expected);
