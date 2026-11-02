@@ -1,12 +1,12 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AskApproval } from "./approvals.ts";
+import type { AskApproval, PermissionOwner } from "./approvals.ts";
 import { editDirectoryScope } from "./directory-scope.ts";
 import { approvalDialogOptions } from "./input-dialog.ts";
 import { bindPath } from "./paths.ts";
 import type { NetAsk } from "./network.ts";
 
 /** Only the root UI can approve authority; a headless child never silently grants it. */
-export function approvalUI(context: () => ExtensionContext): AskApproval {
+export function approvalUI(context: () => ExtensionContext, owner?: () => PermissionOwner): AskApproval {
   return async (request, signal) => {
     const ctx = context();
     if (!ctx.hasUI) throw new Error(`Approval needs the parent UI: ${request.access} ${request.path}`);
@@ -18,6 +18,7 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
       const edited = request.kind === "directory" && directory !== request.path;
       const field = (label: string, value: string) => label.padEnd(edited ? 11 : 8) + value;
       const scope = request.kind === "file" || (request.kind === "exception" && request.scope === "file") ? "This file only" : "Directory and all descendants";
+      const warning = request.kind !== "exception" ? owner?.().grantWarning(binding, request.kind === "file" ? "file" : "tree", request.access) : undefined;
       const blocking = request.access === "read" ? "Blocking read access also blocks writes." : "Blocking write access does not block reads.\n      Reads still require permission.";
       const title = [
         `${request.kind === "exception" ? "Path-rule exception" : request.kind === "file" ? "File access" : "Directory access"} · ${request.access === "read" ? "Read-only" : "Read/write"}`,
@@ -31,7 +32,8 @@ export function approvalUI(context: () => ExtensionContext): AskApproval {
         request.reason,
         "",
         request.kind === "exception" ? `Note: This requires separate approval under a path rule.\n      ${blocking}` : `Note: ${blocking}`,
-        ...(request.kind !== "exception" ? ["", "Save globally", "Applies to all scoped profiles and projects.", "More-specific restrictions remain protected."] : []),
+        ...(request.kind !== "exception" ? ["", "Save globally", "Applies to all scoped profiles and projects.", warning?.limited ? "More-specific restrictions on 9p are best-effort only." : "More-specific restrictions remain protected."] : []),
+        ...(warning?.message ? ["", "Warning", warning.message] : []),
         ...(request.kind === "directory" && binding.missing.length ? [
           "",
           "On approval",

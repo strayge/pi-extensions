@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmdirSync } from "node:fs";
 import path from "node:path";
 import { ApprovalQueue, type ApprovalTask } from "./approval-queue.ts";
+import { grantLimitations, positiveTarget } from "./evaluation.ts";
 import { NetworkSession, type NetAsk } from "./network.ts";
 import { assertBinding, bindFile, bindPath, resolvePermissionBinding, revalidate, within } from "./paths.ts";
 import { decide, freeze, resolveCatalog, type ResolutionContext } from "./policy.ts";
@@ -18,6 +19,8 @@ import type {
   ResolvedRule,
   RuleException,
 } from "./schema.ts";
+
+const NINE_P_WARNING = "Nested protections on 9p cannot be reliably enforced.\nAlternate paths may bypass deny/ask or nested read-only rules.\nThe affected directory may be accessible at the granted level.";
 
 export class StaleAuthorityError extends Error {}
 export interface ApprovalRequest {
@@ -66,6 +69,8 @@ export class PermissionOwner {
   private cacheStale = false;
   confirmGlobal?: (preview: GlobalPreview, signal?: AbortSignal, agentWait?: boolean) => Promise<boolean>;
   warn?: (message: string) => void;
+  interactive?: () => boolean;
+  private limitationWarnings = new Set<string>();
   readonly network: NetworkSession;
   ask: AskApproval;
   askNetwork?: NetAsk;
@@ -77,6 +82,7 @@ export class PermissionOwner {
       policyWriter?: GlobalPolicyWriter;
       confirmGlobal?: (preview: GlobalPreview, signal?: AbortSignal, agentWait?: boolean) => Promise<boolean>;
       warn?: (message: string) => void;
+      interactive?: () => boolean;
       restored?: SavedState;
       grants?: AccessGrant[];
       exceptions?: RuleException[];
@@ -89,6 +95,7 @@ export class PermissionOwner {
     this.policyWriter = options.policyWriter;
     this.confirmGlobal = options.confirmGlobal;
     this.warn = options.warn;
+    this.interactive = options.interactive;
     this.mode = options.restored?.mode ?? catalog.config.defaultMode;
     this.grants = options.grants ?? options.restored?.grants ?? [];
     this.exceptions = (options.exceptions ?? options.restored?.exceptions ?? []).filter((e) =>
@@ -181,6 +188,7 @@ export class PermissionOwner {
     this.persist(mode, this.grants, this.exceptions);
     this.mode = mode;
     this.revision++;
+    this.warnFilesystemLimitations();
   }
 
   revoke(id?: string): void {
@@ -197,6 +205,45 @@ export class PermissionOwner {
       if (!id) this.blocks = [];
     }
     this.revision++;
+    this.warnFilesystemLimitations();
+  }
+
+  /** Approval uses the displayed scope, including edits, rather than the original request. */
+  grantWarning(binding: PathBinding, scope: "file" | "tree", access: Access): { limited: boolean; message?: string } {
+    const limitations = grantLimitations(this.snapshot(), binding, scope, access);
+    if (limitations.protections.length) this.limitationWarnings.add(JSON.stringify([binding.canonical, scope, access, limitations.protections]));
+    return { limited: limitations.limited, message: limitations.protections.length ? NINE_P_WARNING : undefined };
+  }
+
+  /** Only root UI publication points deliver notices; operations and child attachment stay silent. */
+  warnFilesystemLimitations(): void {
+    if (!this.warn || !this.interactive?.() || this.unavailable) return;
+    const snapshot = this.snapshot();
+    if (snapshot.profile.kind === "unrestricted") return;
+    const sources = [
+      ...snapshot.profile.grants,
+      ...snapshot.grants.map((grant) => ({ ...grant, scope: "parent" in grant.binding ? "file" as const : "tree" as const })),
+      ...snapshot.rules.flatMap((rule) => {
+        const approved = (access: Access) => snapshot.exceptions.some((e) => e.ruleId === rule.id && e.access === access);
+        const write = rule.write === "allow" || (rule.write === "ask" && approved("write"));
+        const read = rule.read === "allow" || (rule.read === "ask" && approved("read"));
+        return rule.binding && (read || write) ? [{ binding: rule.binding, scope: rule.scope, access: write ? "write" as const : "read" as const }] : [];
+      }),
+    ];
+    for (const source of sources) {
+      const positive = positiveTarget(source.binding, source.scope);
+      if (!positive.binding) continue;
+      try {
+        const limitations = grantLimitations(snapshot, positive.binding, source.scope, source.access);
+        if (!limitations.protections.length) continue;
+        const key = JSON.stringify([positive.binding.canonical, source.scope, source.access, limitations.protections]);
+        if (this.limitationWarnings.has(key)) continue;
+        this.limitationWarnings.add(key);
+        this.warning(`${positive.binding.canonical}\n${NINE_P_WARNING}`);
+      } catch {
+        // Advisory scans cannot undo committed authority; ordinary validation still handles stale/invalid targets.
+      }
+    }
   }
 
   private warning(message: string): void {
@@ -229,6 +276,7 @@ export class PermissionOwner {
       this.cacheStale = true;
       this.warning(`Global policy committed and active; private cache refresh failed: ${String(error)}. Restart Pi before further authority changes.`);
     }
+    this.warnFilesystemLimitations();
   }
 
   attachChild(cancel: () => void): () => void {
@@ -267,6 +315,7 @@ export class PermissionOwner {
       this.approvalCancellation = new AbortController();
       this.unavailable = undefined;
       this.revision++;
+      this.warnFilesystemLimitations();
     } catch (error) {
       this.unavailable = String(error);
       throw error;
@@ -370,6 +419,7 @@ export class PermissionOwner {
           };
           this.blocks = [...this.blocks, freeze(block)];
           this.revision++;
+          this.warnFilesystemLimitations();
           throw new Error(`Access denied; blocked for this session: ${request.path}`);
         }
         if (answer.lifetime !== "session" && answer.lifetime !== "project" && (answer.lifetime !== "global" || request.kind === "exception"))
@@ -431,6 +481,7 @@ export class PermissionOwner {
           this.exceptions = exceptions;
         }
         this.revision++;
+        this.warnFilesystemLimitations();
         return created;
         } catch (error) {
           if (created) {

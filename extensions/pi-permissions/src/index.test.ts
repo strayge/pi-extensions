@@ -9,7 +9,7 @@ import test from "node:test";
 import { createEventBus, SessionManager, type BashOperations, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defaultConfig } from "./config-load.ts";
 import permissionExtension from "./index.ts";
-import { bindPath } from "./paths.ts";
+import { bindPath, within } from "./paths.ts";
 import { STATE_FILE } from "./permission-state.ts";
 
 type Hook = (event: never, context: ExtensionContext) => unknown;
@@ -111,6 +111,68 @@ test("macOS startup and state restoration share dependency inspection while relo
     const awareness = await f.awareness();
     assert.ok(awareness.includes(second)); assert.ok(!awareness.includes(first));
     assert.match(awareness, /other \(tree, project, id /);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
+});
+
+test("simulated 9p activation is terminal-UI-only, retained across reload, and silent in headless/JSON/RPC modes", { skip: process.platform !== "linux" }, async (t) => {
+  for (const [mode, hasUI, expected] of [["tui", true, 1], ["tui", false, 0], ["print", false, 0], ["json", false, 0], ["rpc", true, 0]] as const) {
+    const f = fixture(); const statfs = fs.statfsSync;
+    try {
+      Object.assign(f.ctx, { mode, hasUI });
+      const protectedPath = path.join(f.project, "private"); mkdirSync(protectedPath);
+      const config = JSON.parse(readFileSync(f.global, "utf8"));
+      config.pathRules = [{ path: protectedPath, scope: "tree", read: "deny" }];
+      writeFileSync(f.global, JSON.stringify(config));
+      t.mock.method(fs, "statfsSync", (file: fs.PathLike) => {
+        const result = statfs(file);
+        if (within(f.project, String(file))) result.type = 0x01021997;
+        return result;
+      });
+      syncBuiltinESMExports();
+      const stdout = t.mock.method(process.stdout, "write", () => assert.fail("activation wrote to stdout"));
+      const stderr = t.mock.method(process.stderr, "write", () => assert.fail("activation wrote to stderr"));
+      await f.start();
+      assert.equal(f.governed(), true);
+      assert.equal(f.notifications.filter((message) => message.includes("Nested protections on 9p")).length, expected);
+      await f.reloadExtension();
+      assert.equal(f.governed(), true);
+      assert.equal(f.notifications.filter((message) => message.includes("Nested protections on 9p")).length, expected);
+      assert.doesNotMatch(await f.awareness(), /Nested protections on 9p|More-specific restrictions on 9p/);
+      await assert.rejects(f.execute("read", { path: path.join(protectedPath, "secret") }), /access denied/);
+      assert.equal(f.notifications.length, expected);
+      assert.equal(stdout.mock.callCount(), 0); assert.equal(stderr.mock.callCount(), 0);
+    } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
+  }
+});
+
+test("simulated 9p project-grant restoration warns after root UI binding, without duplicating the approval warning", { skip: process.platform !== "linux" }, async (t) => {
+  const f = fixture(); const statfs = fs.statfsSync;
+  try {
+    Object.assign(f.ctx, { mode: "tui" });
+    const protectedPath = path.join(f.other, "private"); mkdirSync(protectedPath);
+    const file = path.join(f.other, "note"); writeFileSync(file, "NOTE");
+    const config = JSON.parse(readFileSync(f.global, "utf8"));
+    config.pathRules = [{ path: protectedPath, scope: "tree", write: "ask" }];
+    writeFileSync(f.global, JSON.stringify(config));
+    t.mock.method(fs, "statfsSync", (target: fs.PathLike) => {
+      const result = statfs(target);
+      if (within(f.other, String(target))) result.type = 0x01021997;
+      return result;
+    });
+    syncBuiltinESMExports();
+    await f.start(); assert.equal(f.notifications.length, 0);
+    f.ctx.ui.select = async (title) => {
+      assert.match(title, /Warning\nNested protections on 9p/);
+      assert.doesNotMatch(title, /More-specific restrictions remain protected/);
+      return "Remember for this project";
+    };
+    await f.perm(`grant write ${f.other}`);
+    assert.equal(f.notifications.length, 0);
+    await f.start("switch");
+    assert.equal(f.governed(), true);
+    assert.equal(f.notifications.length, 1);
+    assert.match(f.notifications[0]!, /Nested protections on 9p/);
+    assert.match(JSON.stringify(await f.execute("read", { path: file })), /NOTE/);
   } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
 });
 

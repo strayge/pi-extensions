@@ -447,7 +447,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
       const loaded = loadConfig(agentDir, homedir());
       if (prior && !prior.resetPending) {
         owner = prior;
-        prior.ask = approvalUI(context);
+        prior.ask = approvalUI(context, getOwner);
         prior.askNetwork = networkUI(context, () => prior.approvalSignal);
         prior.confirmGlobal = async (preview, signal, agentWait) => {
           if (!ctx.hasUI) throw new Error("Global permission changes require the parent UI");
@@ -455,6 +455,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
           return ctx.ui.confirm(preview.title, preview.message, approvalDialogOptions(agentWait, { signal }));
         };
         prior.warn = (message) => ctx.ui.notify(message, "warning");
+        prior.interactive = () => ctx.hasUI && ctx.mode === "tui";
         await prior.reload(loaded.global, undefined, resolution);
       } else {
         const rootPath = startingRoot;
@@ -491,15 +492,17 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
             return ctx.ui.confirm(preview.title, preview.message, approvalDialogOptions(agentWait, { signal }));
           },
           warn: (message) => ctx.ui.notify(message, "warning"),
+          interactive: () => ctx.hasUI && ctx.mode === "tui",
           restored: restored.session,
           grants,
           exceptions,
-          ask: approvalUI(context),
+          ask: approvalUI(context, getOwner),
           askNetwork: networkUI(context, () => owner?.approvalSignal),
         });
       }
       const flag = pi.getFlag("perm");
       if (typeof flag === "string" && flag) getOwner().select(flag);
+      owner.warnFilesystemLimitations();
       startupError = undefined;
       retainedKey = key();
       retained.set(retainedKey, owner);

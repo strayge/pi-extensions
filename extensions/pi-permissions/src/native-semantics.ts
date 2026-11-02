@@ -5,8 +5,14 @@ import type { PathBinding } from "./schema.ts";
 
 const verified = new Map<string, string>();
 const apfsDevices = new Set<string>();
+const LINUX_9P = 0x01021997;
 
-/** Unknown filesystems fail closed; Darwin aliases are resolved by the filesystem and Seatbelt. */
+/** Missing targets inherit the semantics of their nearest existing prefix. */
+export function isLinux9p(binding: PathBinding): boolean {
+  return process.platform === "linux" && statfsSync(binding.prefix).type === LINUX_9P;
+}
+
+/** Unknown filesystems fail closed; Linux 9p retains only best-effort nested protection. */
 export function assertNativeSemantics(binding: PathBinding): void {
   const directory = binding.identity.type === "directory" ? binding.prefix : path.dirname(binding.prefix);
   let current = directory;
@@ -35,7 +41,7 @@ function verifyDirectory(directory: string): void {
     );
   const type = statfsSync(directory).type;
   // Linux tmpfs has byte-sensitive names and no per-directory casefold flag.
-  if (type === 0x01021994) return;
+  if (type === 0x01021994 || type === LINUX_9P) return;
   if (type !== 0xef53)
     throw new Error(`Native path enforcement is unavailable for filesystem type ${type.toString(16)} at ${directory}`);
   const stat = lstatSync(directory, { bigint: true });

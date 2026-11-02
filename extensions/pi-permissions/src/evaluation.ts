@@ -1,5 +1,5 @@
 import { assertBinding, bindFile, contains, resolvePermissionBinding, within } from "./paths.ts";
-import { assertNativeSemantics } from "./native-semantics.ts";
+import { assertNativeSemantics, isLinux9p } from "./native-semantics.ts";
 import type { Access, FilesystemSnapshot, PathBinding, PermissionBinding, ResolvedRule, RuleAction } from "./schema.ts";
 
 export interface Decision {
@@ -37,6 +37,26 @@ function winner(candidates: Candidate[], baseline: boolean): Outcome {
   if (winning.some((c) => c.action === "deny")) return { action: "deny", exceptions: [] };
   const exceptions = winning.filter((c) => c.action === "ask").map((c) => ({ rule: c.rule!, access: c.receipt! }));
   return { action: exceptions.length ? "ask" : "allow", exceptions };
+}
+
+/** Alias comparisons here are deliberately conservative and never authorize an operation. */
+export function grantLimitations(snapshot: FilesystemSnapshot, binding: PathBinding, scope: "file" | "tree", access: Access): { limited: boolean; protections: string[] } {
+  const ninep = isLinux9p(binding);
+  const protections: string[] = [];
+  const aliases = (value: PermissionBinding) => [value.canonical, value.lexical].map((name) => name.normalize("NFC").toLowerCase());
+  const roots = aliases(binding);
+  for (const rule of snapshot.rules) {
+    const restrictsRead = rule.read === "deny" || rule.read === "ask";
+    const restrictsWrite = rule.write === "deny" || rule.write === "ask";
+    if (!rule.binding || (!restrictsRead && !(access === "write" && restrictsWrite))) continue;
+    const targets = aliases(rule.binding);
+    if (!roots.some((root) => targets.some((target) => scope === "file" ? root === target : within(root, target)))) continue;
+    const target = resolvePermissionBinding(rule.binding, true);
+    if (!ninep && !isLinux9p(target)) continue;
+    // A strict ancestor may include a protected 9p submount. Do not infer anything about other descendants.
+    protections.push(JSON.stringify([rule.binding.canonical, rule.scope, rule.read, access === "write" ? rule.write : undefined]));
+  }
+  return { limited: ninep || protections.length > 0, protections: [...new Set(protections)].sort() };
 }
 
 /** Read-only exceptions cannot revive baseline writes suppressed by broader read restrictions. */
