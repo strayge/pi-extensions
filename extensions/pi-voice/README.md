@@ -38,7 +38,12 @@ they register the same commands, shortcut, and transcription tool. Existing
 `~/.pi/agent/pi-voice.json` settings and downloaded models are reused.
 
 Use `/voice` or your configured shortcut to start/stop dictation. While recording,
-Space stops and transcribes; Escape discards. `/voice-settings` configures the
+Space stops and transcribes; Escape discards. Compatible native streaming models
+automatically show the latest three wrapped transcript lines beneath the meter,
+without changing the editor. Text can revise as you speak and may take time to
+appear; other models still transcribe only after Stop. Stop clears the preview
+and pastes the complete cleaned result at the current editor cursor; Escape
+clears it without inserting anything. `/voice-settings` configures the
 model, languages, microphone, and shortcut. The `transcribe_file` tool requires
 FFmpeg on `PATH` (or `PI_VOICE_FFMPEG_PATH`). See the
 [upstream usage guide](https://github.com/earendil-works/pi-voice#usage) for details.
@@ -51,13 +56,13 @@ Changes apply to the next dictation without reloading. Existing configurations
 default to `uh, um, erm`; custom lists replace those defaults and are saved as
 `fillerWords` in `~/.pi/agent/pi-voice.json`.
 
-Before voice dictation reaches the editor, the fork removes the listed words or
-phrases (also with an initial capital) and their filler commas.
+For live dictation previews and final editor insertion, the fork removes the
+listed words or phrases (also with an initial capital) and their filler commas.
 For example, `Um, can you uh check the tests?` becomes `can you check the tests?`.
 Filler-only dictation inserts nothing.
 
-Cleanup does not rewrite grammar or modify file transcription or the model
-preview. Ambiguous words such as `like` or `well` are kept unless you add them
+Cleanup does not rewrite grammar or modify file transcription or separate setup/model
+previews. Ambiguous words such as `like` or `well` are kept unless you add them
 to the list. Entries are trimmed, lowercased, and deduplicated; they are literal
 text, not regular expressions.
 Quoted tokens, identifiers, compounds, and all-uppercase acronyms are preserved.
@@ -83,8 +88,9 @@ the exact capitalization you enter. Longer phrases take priority. Each match is
 replaced once, so replacement text cannot trigger another rule. Quoted terms are
 also corrected, but substrings inside larger words or identifiers are not.
 
-Corrections run after filler removal, only before dictation is inserted into the
-editor. They do not affect typed/pasted text, file transcription, or model previews.
+Corrections run after filler removal on each complete live dictation hypothesis
+before the preview is clipped, and again on the final transcript before insertion.
+They do not affect typed/pasted text, file transcription, or separate model previews.
 Changes apply to the next dictation and are stored in the `corrections` object in
 `~/.pi/agent/pi-voice.json`, alongside the existing global voice preferences.
 

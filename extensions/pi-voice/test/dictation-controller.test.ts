@@ -22,6 +22,62 @@ function harness() {
   return { controller, service, mic, captures: mic.captures, states, time: (value: number) => { now = value; } };
 }
 
+test("partial updates belong only to the recording take and Stop clears before capture teardown", async () => {
+  const service = fakeDictationService();
+  const mic = new FakeMicrophone();
+  const partials: string[] = [];
+  const controller = new DictationController(service, {
+    openCapture: mic.open,
+    onPartial: (text) => partials.push(text),
+  });
+  await controller.start(settings);
+  const first = service.reservations[0]!;
+  first.onPartial?.("live");
+  mic.captures[0]!.stopGate = new Deferred();
+  const submission = controller.stop();
+  first.onPartial?.("while stopping");
+  assert.deepEqual(partials, ["live", ""]);
+  mic.captures[0]!.stopGate.resolve({ pcm: new Float32Array(16000) });
+  await nextTurn();
+  first.onPartial?.("after submit");
+  first.result.resolve("final");
+  assert.equal((await submission)?.text, "final");
+  await controller.start(settings);
+  first.onPartial?.("old take");
+  const second = service.reservations[1]!;
+  second.onPartial?.("new take");
+  await controller.cancel();
+  second.onPartial?.("cancelled");
+  assert.deepEqual(partials, ["live", "", "new take", ""]);
+  await controller.start(settings);
+  const third = service.reservations[2]!;
+  third.onPartial?.("last take");
+  await controller.dispose();
+  const count = partials.length;
+  third.onPartial?.("disposed");
+  assert.equal(partials.at(-1), "");
+  assert.equal(partials.length, count);
+});
+
+test("partials from early audio can arrive before start resolves", async () => {
+  const mic = new FakeMicrophone();
+  mic.audioDuringOpen = [new Float32Array(8000)];
+  const partials: string[] = [];
+  let notifyPartial: ((text: string) => void) | undefined;
+  const service = fakeDictationService();
+  const controller = new DictationController({
+    reserveDictation(configured, onPartial) {
+      notifyPartial = onPartial;
+      const reservation = service.reserveDictation(configured, onPartial);
+      reservation.feed = () => notifyPartial?.("early hypothesis");
+      return reservation;
+    },
+  }, { openCapture: mic.open, onPartial: (text) => partials.push(text) });
+  await controller.start(settings);
+  assert.deepEqual(partials, ["early hypothesis"]);
+  await controller.dispose();
+});
+
 test("prewarming, streaming chunks, final tail and timing have one lifecycle", async () => {
   const h = harness();
   h.controller.prepare(settings);
@@ -198,10 +254,12 @@ test("display failures do not interrupt feeding, submission, or cleanup", async 
     openCapture: mic.open,
     onChange: () => { throw new Error("render failed"); },
     onAudio: () => { throw new Error("meter failed"); },
+    onPartial: () => { throw new Error("preview failed"); },
   });
   await controller.start(settings);
   mic.captures[0]!.feed(new Float32Array(8000));
   assert.equal(service.reservations[0]!.chunks.length, 1);
+  assert.doesNotThrow(() => service.reservations[0]!.onPartial?.("live text"));
   const submission = controller.stop();
   service.reservations[0]!.result.resolve("still works");
   assert.equal((await submission)?.text, "still works");

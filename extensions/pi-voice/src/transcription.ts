@@ -12,6 +12,8 @@ import type { ChineseOutput } from "./settings.ts";
 
 export type TranscriptionOptions = {
   signal?: AbortSignal;
+  /** Complete raw native hypothesis; observers must not affect inference. */
+  onPartial?: (text: string) => void;
   language?: string;
   chineseOutput?: ChineseOutput;
   /** Chinese is a preferred or chosen language: convert any Chinese text. */
@@ -56,6 +58,7 @@ async function finishTranscript(
 
 class TranscribeCppDictationStream implements DictationStream {
   private closed = false;
+  private partialText = "";
 
   private readonly session: Session;
   private readonly stream: Stream;
@@ -74,6 +77,11 @@ class TranscribeCppDictationStream implements DictationStream {
   async feed(chunk: Float32Array): Promise<void> {
     if (this.closed) throw new Error("Dictation stream is closed");
     await this.stream.feed(chunk);
+    if (this.closed || this.options.signal?.aborted || !this.options.onPartial) return;
+    const text = this.stream.text.full;
+    if (text === this.partialText) return;
+    this.partialText = text;
+    try { this.options.onPartial(text); } catch { /* Preview delivery is observational. */ }
   }
 
   async finalize(): Promise<string> {

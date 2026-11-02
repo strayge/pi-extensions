@@ -48,6 +48,7 @@ type TranscriptionJob = {
 };
 
 type ReservationState = {
+  onPartial?: (text: string) => void;
   settings: TranscribeSettings;
   policy: AutoLanguagePolicy;
   accepting: boolean;
@@ -156,12 +157,16 @@ export class TranscriptionService {
     this.scoreClip = scoreClip;
   }
 
-  reserveDictation(settings: TranscribeSettings): DictationReservation {
+  reserveDictation(
+    settings: TranscribeSettings,
+    onPartial?: (text: string) => void,
+  ): DictationReservation {
     if (this.shuttingDown) throw new Error("Pi Voice is shutting down");
     if (this.reservation) throw new Error("A dictation reservation is already active");
 
     const policy = settingsLanguagePolicy(settings);
     const state: ReservationState = {
+      onPartial,
       settings,
       policy,
       accepting: true,
@@ -311,6 +316,15 @@ export class TranscriptionService {
     state.drain = draining;
   }
 
+  /** Old or completed reservations cannot publish into a newer recording. */
+  private publishPartial(state: ReservationState, text: string): void {
+    if (
+      this.shuttingDown || this.reservation !== state || !state.accepting ||
+      state.cancelled || state.streamUnavailable || state.streamError !== undefined
+    ) return;
+    try { state.onPartial?.(text); } catch { /* Presentation cannot fail decoding. */ }
+  }
+
   private async drainStream(state: ReservationState): Promise<void> {
     const stream = state.stream!;
     while (
@@ -322,6 +336,7 @@ export class TranscriptionService {
       try {
         await stream.feed(chunk.pcm, chunk.probs);
       } catch (error) {
+        this.publishPartial(state, "");
         state.streamError = error;
         state.chunks.length = 0;
         // A batch fallback may only start after reset has been issued.
@@ -445,7 +460,10 @@ export class TranscriptionService {
       // stream and use the batch path.
       try {
         const stream = await backend.startStream(
-          transcriptionOptions(state.settings, fixedLanguage(state.policy)),
+          {
+            ...transcriptionOptions(state.settings, fixedLanguage(state.policy)),
+            onPartial: state.onPartial ? (text) => this.publishPartial(state, text) : undefined,
+          },
         );
         if (stream && state.submitted) {
           stream.reset();
@@ -458,6 +476,7 @@ export class TranscriptionService {
         }
       } catch (error) {
         // Stream setup is an optimization; preserve dictation via batch fallback.
+        this.publishPartial(state, "");
         state.streamError = error;
         state.chunks.length = 0;
       }

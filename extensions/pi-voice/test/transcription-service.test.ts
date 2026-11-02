@@ -105,6 +105,116 @@ function createHarness(blockedIds: readonly number[] = []): {
   };
 }
 
+test("live native updates are reservation-owned and failures clear before batch fallback", async () => {
+  const partials: string[] = [];
+  let options: TranscriptionOptions | undefined;
+  let feeds = 0;
+  const service = createTestService({
+    async startStream(supplied) {
+      options = supplied;
+      return createTestStream({
+        async feed() {
+          if (++feeds === 1) options?.onPartial?.("raw hypothesis");
+          else throw new Error("native feed failed");
+        },
+      });
+    },
+  });
+  const reservation = service.reserveDictation(settings("model-a"), (text) => partials.push(text));
+  await reservation.ready;
+  reservation.feed(pcm(1));
+  await nextTurn();
+  assert.deepEqual(partials, ["raw hypothesis"]);
+  reservation.feed(pcm(2));
+  await nextTurn();
+  assert.deepEqual(partials, ["raw hypothesis", ""]);
+  options?.onPartial?.("late failed stream");
+  assert.equal(await text(reservation.submit(pcm(9))), "9");
+  assert.deepEqual(partials, ["raw hypothesis", ""]);
+  await service.shutdown();
+});
+
+for (const end of ["submit", "cancel", "shutdown"] as const) {
+  test(`${end} suppresses late native observers, including after a replacement reservation`, async () => {
+    const partials: string[] = [];
+    const callbacks: Array<NonNullable<TranscriptionOptions["onPartial"]>> = [];
+    const gate = deferred();
+    const service = createTestService({
+      async startStream(options) {
+        const publish = options!.onPartial!;
+        callbacks.push(publish);
+        return createTestStream({
+          async feed() { await gate.promise; publish("late feed"); },
+        });
+      },
+    });
+    const reservation = service.reserveDictation(settings("model-a"), (text) => partials.push(text));
+    await reservation.ready;
+    callbacks[0]!("live");
+    reservation.feed(pcm(1));
+    let ending: Promise<unknown> | undefined;
+    if (end === "submit") ending = reservation.submit(pcm(9));
+    else if (end === "cancel") reservation.cancel();
+    else ending = service.shutdown();
+    callbacks[0]!("after end");
+    if (end !== "shutdown") {
+      const replacement = service.reserveDictation(settings("model-a"), (text) => partials.push(`new:${text}`));
+      gate.resolve();
+      await replacement.ready;
+      callbacks[0]!("old take");
+      callbacks[1]!("new take");
+      replacement.cancel();
+    } else gate.resolve();
+    await ending;
+    await nextTurn();
+    assert.deepEqual(partials, end === "shutdown" ? ["live"] : ["live", "new:new take"]);
+    await service.shutdown();
+  });
+}
+
+test("stream setup failure clears any published preview and preserves final fallback", async () => {
+  const partials: string[] = [];
+  const service = createTestService({
+    async startStream(options) {
+      options?.onPartial?.("opening hypothesis");
+      throw new Error("stream setup failed");
+    },
+  });
+  const reservation = service.reserveDictation(settings("model-a"), (value) => partials.push(value));
+  await reservation.ready;
+  assert.deepEqual(partials, ["opening hypothesis", ""]);
+  assert.equal(await text(reservation.submit(pcm(9))), "9");
+  await service.shutdown();
+});
+
+test("reservation observer failures do not force batch fallback", async () => {
+  let batchRuns = 0;
+  const service = createTestService({
+    async startStream(options) {
+      return createTestStream({ async feed() { options?.onPartial?.("live"); } });
+    },
+    async transcribe() { batchRuns++; return "batch"; },
+  });
+  const reservation = service.reserveDictation(settings("model-a"), () => { throw new Error("UI failed"); });
+  await reservation.ready;
+  reservation.feed(pcm(1));
+  await nextTurn();
+  assert.equal(await text(reservation.submit(pcm(9))), "streamed");
+  assert.equal(batchRuns, 0);
+  await service.shutdown();
+});
+
+test("non-streaming dictation remains final-only", async () => {
+  const partials: string[] = [];
+  const service = createTestService({ async startStream() { return undefined; } });
+  const reservation = service.reserveDictation(settings("model-a"), (text) => partials.push(text));
+  await reservation.ready;
+  reservation.feed(pcm(1));
+  assert.equal(await text(reservation.submit(pcm(9))), "9");
+  assert.deepEqual(partials, []);
+  await service.shutdown();
+});
+
 test("queued jobs sharing a model load it once", async () => {
   const harness = createHarness([1]);
   const first = text(harness.service.transcribeFile(settings("model-a"), pcm(1)));

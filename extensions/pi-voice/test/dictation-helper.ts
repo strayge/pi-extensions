@@ -1,5 +1,6 @@
 import { Deferred } from "../src/deferred.ts";
 import type { Capture, CapturedAudio, CaptureSinks, OpenCapture } from "../src/dictation-controller.ts";
+import type { TranscribeSettings } from "../src/settings.ts";
 import type { DictationReservation, Transcript } from "../src/transcription-service.ts";
 
 /** One recording on a FakeMicrophone. */
@@ -46,6 +47,7 @@ export class FakeReservation implements DictationReservation {
   submissions = 0;
   pcm: Float32Array | undefined;
   signal: AbortSignal | undefined;
+  onPartial: ((text: string) => void) | undefined;
   feed(chunk: Float32Array): void { this.chunks.push(chunk); }
   submit(pcm: Float32Array, signal?: AbortSignal): Promise<Transcript> {
     this.submissions++;
@@ -60,8 +62,9 @@ export function fakeDictationService() {
   const reservations: FakeReservation[] = [];
   return {
     reservations,
-    reserveDictation() {
+    reserveDictation(_settings: TranscribeSettings, onPartial?: (text: string) => void) {
       const reservation = new FakeReservation();
+      reservation.onPartial = onPartial;
       reservations.push(reservation);
       return reservation;
     },

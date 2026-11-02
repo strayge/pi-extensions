@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { BackendInfo, ModelOptions, TranscribeModel } from "transcribe-cpp";
 import { TranscribeCppBackend } from "../src/transcription.ts";
+import { deferred, nextTurn } from "./helpers.ts";
 
 type RuntimeLoader = NonNullable<ConstructorParameters<typeof TranscribeCppBackend>[1]>;
 type TestRuntime = Awaited<ReturnType<RuntimeLoader>>;
@@ -45,6 +46,92 @@ function runtime(options: {
     setLogHandler: () => {},
   } as unknown as TestRuntime;
 }
+
+/** Native text may only be inspected once feed has finished computing. */
+function streamingBackend() {
+  const gate = deferred();
+  let hypothesis = "";
+  let feeding = false;
+  let resets = 0;
+  let disposals = 0;
+  const model = {
+    capabilities: { supportsStreaming: true, languages: ["en"] },
+    createSession() {
+      return {
+        async stream() {
+          return {
+            async feed() { feeding = true; await gate.promise; feeding = false; },
+            get text() {
+              assert.equal(feeding, false);
+              return { full: hypothesis };
+            },
+            async finalize() {},
+            get snapshot() { return { text: " final result ", language: "en" }; },
+            reset() { resets++; },
+          };
+        },
+        dispose() { disposals++; },
+      };
+    },
+    dispose() {},
+  } as unknown as TranscribeModel;
+  const backend = new TranscribeCppBackend("model.gguf", async () => runtime({ async load() { return model; } }));
+  return {
+    backend, gate,
+    hypothesis(text: string) { hypothesis = text; },
+    get resets() { return resets; },
+    get disposals() { return disposals; },
+  };
+}
+
+test("native feeds publish changed full hypotheses after awaiting compute, including revisions and empty text", async () => {
+  const h = streamingBackend();
+  const partials: string[] = [];
+  const stream = (await h.backend.startStream({ onPartial: (text) => partials.push(text) }))!;
+  h.hypothesis("a tentative phrase");
+  const feed = stream.feed(Float32Array.of(1));
+  await nextTurn();
+  assert.deepEqual(partials, []);
+  h.gate.resolve();
+  await feed;
+  await stream.feed(Float32Array.of(2));
+  h.hypothesis("a revision");
+  await stream.feed(Float32Array.of(3));
+  h.hypothesis("");
+  await stream.feed(Float32Array.of(4));
+  assert.deepEqual(partials, ["a tentative phrase", "a revision", ""]);
+  assert.equal(await stream.finalize(), "final result");
+  assert.equal(h.resets, 1);
+  assert.equal(h.disposals, 1);
+  await h.backend.dispose();
+});
+
+test("a partial observer failure cannot fail inference or final disposal", async () => {
+  const h = streamingBackend();
+  h.gate.resolve();
+  h.hypothesis("hello");
+  const stream = (await h.backend.startStream({ onPartial() { throw new Error("observer failed"); } }))!;
+  await stream.feed(Float32Array.of(1));
+  assert.equal(await stream.finalize(), "final result");
+  stream.reset();
+  assert.equal(h.resets, 1);
+  assert.equal(h.disposals, 1);
+  await h.backend.dispose();
+});
+
+test("reset during native feed suppresses a late hypothesis", async () => {
+  const h = streamingBackend();
+  const partials: string[] = [];
+  const stream = (await h.backend.startStream({ onPartial: (text) => partials.push(text) }))!;
+  h.hypothesis("late");
+  const feed = stream.feed(Float32Array.of(1));
+  stream.reset();
+  h.gate.resolve();
+  await feed;
+  assert.deepEqual(partials, []);
+  assert.equal(h.disposals, 1);
+  await h.backend.dispose();
+});
 
 test("an accelerator out-of-memory load retries on the exact CPU device", async () => {
   const calls: Array<{ path: string; options?: ModelOptions }> = [];

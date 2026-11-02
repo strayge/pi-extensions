@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.ts";
 import { STATUS_WIDGET_KEY } from "./shortcut-core.ts";
 
@@ -205,7 +206,7 @@ export function renderMeterLine(
   return parts.join("  ");
 }
 
-/** Left-to-right FFT meter shown above the editor while recording. */
+/** Left-to-right FFT meter and passive transcript tail shown above the editor. */
 export class RecordingMeter {
   private readonly analyzer = new SpectrumAnalyzer();
   private startedAt = 0;
@@ -215,8 +216,10 @@ export class RecordingMeter {
   private modelState: MeterModelState = "loading";
   private microphoneStopped = false;
   private hints: string | undefined;
+  private previewText = "";
+  private requestRender: (() => void) | undefined;
 
-  start(ctx: ExtensionContext, hints: string): void {
+  start(ctx: ExtensionContext, hints: string, previewText = ""): void {
     if (!ctx.hasUI) return;
     this.ctx = ctx;
     this.hints = hints;
@@ -226,7 +229,38 @@ export class RecordingMeter {
     this.lastLine = undefined;
     this.modelState = "loading";
     this.microphoneStopped = false;
+    this.previewText = previewText;
+    if (ctx.mode === "tui") {
+      ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => {
+        this.requestRender = () => tui.requestRender();
+        let cachedWidth: number | undefined;
+        let cachedText: string | undefined;
+        let tail: string[] = [];
+        return {
+          render: (width: number): string[] => {
+            if (cachedWidth !== width || cachedText !== this.previewText) {
+              cachedWidth = width;
+              cachedText = this.previewText;
+              tail = width > 0 && this.previewText
+                ? wrapTextWithAnsi(this.previewText, width).slice(-3)
+                : [];
+            }
+            return [
+              this.renderLine(theme),
+              ...tail.map((line) => theme.fg("muted", line)),
+            ].map((line) => truncateToWidth(line, Math.max(0, width)));
+          },
+          invalidate: () => { cachedWidth = undefined; },
+        };
+      });
+    }
     this.paint();
+  }
+
+  setPreview(text: string): void {
+    if (!this.ctx || this.ctx.mode !== "tui" || text === this.previewText) return;
+    this.previewText = text;
+    this.requestRender?.();
   }
 
   update(state: { modelState: MeterModelState; microphoneStopped: boolean }): void {
@@ -251,21 +285,27 @@ export class RecordingMeter {
     this.ctx = undefined;
     this.lastLine = undefined;
     this.hints = undefined;
+    this.previewText = "";
+    this.requestRender = undefined;
   }
 
-  private paint(): void {
-    const ctx = this.ctx;
-    if (!ctx) return;
-
-    const line = renderMeterLine(ctx.ui.theme, {
+  private renderLine(theme: UiTheme): string {
+    return renderMeterLine(theme, {
       bands: this.analyzer.bands,
       elapsedMs: Date.now() - this.startedAt,
       modelState: this.modelState,
       microphoneStopped: this.microphoneStopped,
       hints: this.hints,
     });
+  }
+
+  private paint(): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const line = this.renderLine(ctx.ui.theme);
     if (line === this.lastLine) return;
     this.lastLine = line;
-    ctx.ui.setWidget(WIDGET_KEY, [line]);
+    if (ctx.mode === "tui") this.requestRender?.();
+    else ctx.ui.setWidget(WIDGET_KEY, [line]);
   }
 }

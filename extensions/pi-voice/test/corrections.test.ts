@@ -5,7 +5,7 @@ import {
   normalizeCorrections,
   parseCorrectionDictionary,
 } from "../src/corrections.ts";
-import { cleanDictationFillers } from "../src/filler-cleanup.ts";
+import { cleanDictationTranscript } from "../src/filler-cleanup.ts";
 
 test("corrections ignore source case and keep exact replacement capitalization", () => {
   assert.equal(
@@ -39,7 +39,13 @@ test("sources are literal and replacement dollar syntax is not expanded", () => 
 test("empty dictionaries preserve transcripts verbatim and cleanup runs before corrections", () => {
   const text = "  Um, see mux.\n";
   assert.equal(applyCorrections(text, {}), text);
-  assert.equal(applyCorrections(cleanDictationFillers("Um, see mux."), { "see mux": "um" }), "um.");
+  assert.equal(
+    cleanDictationTranscript("Um, see mux.", {
+      fillerWords: ["um"],
+      corrections: { "see mux": "um" },
+    }),
+    "um.",
+  );
 });
 
 test("editor format normalizes sources while preserving replacement text", () => {

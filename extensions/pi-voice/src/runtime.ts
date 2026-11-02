@@ -8,8 +8,7 @@ import { getKeybindings } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.ts";
 import { isMacOSPermissionDenied } from "./audio-errors.ts";
-import { cleanDictationFillers } from "./filler-cleanup.ts";
-import { applyCorrections } from "./corrections.ts";
+import { cleanDictationTranscript } from "./filler-cleanup.ts";
 import { logStep, watchEventLoop } from "./log.ts";
 import { DictationController } from "./dictation-controller.ts";
 import { VoiceKeys } from "./keybindings.ts";
@@ -23,6 +22,7 @@ import type { RecordingMeter } from "./visualizer.ts";
 type ActiveRecording = {
   dictation: DictationController;
   meter: RecordingMeter;
+  settings: TranscribeSettings;
   /** Ends the event-loop watch held for the whole recording. */
   unwatch: () => void;
 };
@@ -308,10 +308,7 @@ export function createPiVoiceRuntime(
       if (!result) {
         await reportDictationError(ctx, active.dictation);
       } else if (result.text) {
-        const text = applyCorrections(
-          cleanDictationFillers(result.text, settings?.fillerWords),
-          settings?.corrections,
-        );
+        const text = cleanDictationTranscript(result.text, active.settings);
         if (text) ctx.ui.pasteToEditor(text);
         showTranscribeStatus(
           ctx,
@@ -363,10 +360,15 @@ export function createPiVoiceRuntime(
     const { RecordingMeter } = await loadVisualizer();
     if (shuttingDown) return;
     const meter = new RecordingMeter();
+    let previewText = "";
     const controller = new DictationController(transcriptionService, {
       openCapture: openMicrophone,
       onAudio: (chunk) => meter.push(chunk),
       onChange: updateMeter,
+      onPartial: ctx.mode === "tui" ? (raw) => {
+        previewText = cleanDictationTranscript(raw, configured);
+        meter.setPreview(previewText);
+      } : undefined,
       createSpeechFilter: (settings, onSpeech) => voiceActivity.createFilter(settings, onSpeech),
     });
     function updateMeter(): void {
@@ -387,9 +389,10 @@ export function createPiVoiceRuntime(
       meter.start(
         ctx,
         `${rawKeyHint(stopKeys, "to transcribe")}  ${keys.hint("voice.dictation.cancel", "to discard")}`,
+        previewText,
       );
       updateMeter();
-      recording = { dictation: controller, meter, unwatch: watchEventLoop() };
+      recording = { dictation: controller, meter, settings: configured, unwatch: watchEventLoop() };
       listenForKeys(ctx);
     } catch (error) {
       recording?.unwatch();

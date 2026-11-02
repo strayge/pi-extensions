@@ -1,4 +1,15 @@
+import { applyCorrections } from "./corrections.ts";
+import type { TranscribeSettings } from "./settings.ts";
+
 export const DEFAULT_FILLER_WORDS: readonly string[] = ["uh", "um", "erm"];
+
+/** Recompute from raw snapshots so replacements never cascade between preview updates. */
+export function cleanDictationTranscript(
+  text: string,
+  settings: Pick<TranscribeSettings, "fillerWords" | "corrections">,
+): string {
+  return applyCorrections(cleanDictationFillers(text, settings.fillerWords), settings.corrections);
+}
 
 /** Keep comma-separated edits and persisted lists consistent without mutating defaults. */
 export function normalizeFillerWords(words: readonly string[]): string[] {

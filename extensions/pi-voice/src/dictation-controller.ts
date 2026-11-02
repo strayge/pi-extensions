@@ -48,6 +48,7 @@ export type DictationControllerOptions = {
   now?: () => number;
   onChange?: (state: DictationState) => void;
   onAudio?: (chunk: Float32Array) => void;
+  onPartial?: (text: string) => void;
   /** Without a filter, every chunk is transcribed. */
   createSpeechFilter?: CreateSpeechFilter;
 };
@@ -100,9 +101,13 @@ export class DictationController {
     // Presentation must not strand the reservation or drop recorded audio.
     try { this.options.onChange?.(this.current); } catch { /* UI owns rendering errors. */ }
   }
+  private publishPartial(text: string): void {
+    try { this.options.onPartial?.(text); } catch { /* Presentation cannot strand a take. */ }
+  }
   private setState(state: DictationState): void {
     if (this.disposed) return;
     this.current = state;
+    if (["transcribing", "cancelling", "error"].includes(state.phase)) this.publishPartial("");
     if (state.phase === "error") {
       log.error(`${state.stage} failed: ${describeError(state.cause)}`);
       logStep("idle");
@@ -117,7 +122,14 @@ export class DictationController {
     const reservedAt = this.now();
     let reservation: DictationReservation;
     try {
-      reservation = this.service.reserveDictation(settings);
+      reservation = this.service.reserveDictation(settings, this.options.onPartial ? (text) => {
+        const take = this.take;
+        if (
+          !take || this.disposed || take.reservation !== reservation || take.abort.signal.aborted ||
+          !["starting", "listening"].includes(this.current.phase)
+        ) return;
+        this.publishPartial(text);
+      } : undefined);
     } catch (cause) {
       this.readiness = "failed";
       this.setState({ phase: "error", stage: "model", cause });
@@ -356,6 +368,7 @@ export class DictationController {
   }
 
   dispose(): Promise<void> {
+    if (!this.disposed) this.publishPartial("");
     this.disposed = true;
     this.current = { phase: "disposed" };
     return this.cancel();
