@@ -7,6 +7,7 @@ import {
 } from "./catalog.ts";
 import { autoLanguagePolicy } from "./language-detection-policy.ts";
 import { DEFAULT_FILLER_WORDS, normalizeFillerWords } from "./filler-cleanup.ts";
+import { normalizeCorrections, type CorrectionDictionary } from "./corrections.ts";
 import { normalizeShortcut } from "./shortcut-core.ts";
 import { legacySettingsPath, settingsPath } from "./settings-path.ts";
 
@@ -44,6 +45,7 @@ export type TranscribeSettings = {
   /** Hidden, settings.json only: false decodes long audio in one piece, without voice activity cuts. */
   longformChunking: boolean;
   fillerWords: string[];
+  corrections: CorrectionDictionary;
   model: {
     source: "catalog";
     id: string;
@@ -89,6 +91,17 @@ function validateMicrophone(value: unknown): MicrophoneSetting | undefined {
     return undefined;
   }
   return { type: "device", name: value.name, occurrence: value.occurrence as number };
+}
+
+function storedCorrections(value: unknown): CorrectionDictionary {
+  if (!isObject(value) || !Object.values(value).every((target) => typeof target === "string")) {
+    return {};
+  }
+  try {
+    return normalizeCorrections(value as CorrectionDictionary);
+  } catch {
+    return {};
+  }
 }
 
 function defaultTranscriptionLanguage(
@@ -156,6 +169,7 @@ function validateSettings(value: unknown): TranscribeSettings | undefined {
         ? value.fillerWords
         : DEFAULT_FILLER_WORDS,
     ),
+    corrections: storedCorrections(value.corrections),
     model: {
       source: "catalog",
       id: value.model.id,
@@ -208,6 +222,7 @@ export async function writeSettings(settings: TranscribeSettings): Promise<void>
   const content = `${JSON.stringify({
     ...settings,
     fillerWords: normalizeFillerWords(settings.fillerWords),
+    corrections: normalizeCorrections(settings.corrections),
   }, null, 2)}\n`;
 
   try {
@@ -228,6 +243,7 @@ type ModelSettingsOptions = {
   voiceActivityDetection?: boolean;
   longformChunking?: boolean;
   fillerWords?: readonly string[];
+  corrections?: Readonly<CorrectionDictionary>;
 };
 
 export function settingsForModel(
@@ -255,6 +271,7 @@ export function settingsForModel(
     voiceActivityDetection: options.voiceActivityDetection ?? true,
     longformChunking: options.longformChunking ?? true,
     fillerWords: normalizeFillerWords(options.fillerWords ?? DEFAULT_FILLER_WORDS),
+    corrections: normalizeCorrections(options.corrections ?? {}),
     model: { source: "catalog", id: modelId, path: modelPath },
   };
 }

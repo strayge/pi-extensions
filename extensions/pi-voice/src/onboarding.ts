@@ -13,6 +13,7 @@ import {
   hasRecommendedAlternatives,
 } from "./recommendation-picker.ts";
 import { CATALOG_MODELS } from "./catalog.ts";
+import type { CorrectionDictionary } from "./corrections.ts";
 import { recommendModels } from "./recommendations.ts";
 import { createShortcutPicker } from "./shortcuts.ts";
 import { tryVoice } from "./try-it.ts";
@@ -58,6 +59,7 @@ type ModelSelectionOptions = {
   voiceActivityDetection?: boolean;
   longformChunking?: boolean;
   fillerWords?: readonly string[];
+  corrections?: Readonly<CorrectionDictionary>;
   /** Persists language changes made before this flow activates a model. */
   onPreferredLanguagesChange?: (languages: string[]) => Promise<void>;
   postActivation?: CatalogModelPostActivation;
@@ -85,6 +87,7 @@ export async function runModelSelection(
       voiceActivityDetection: configured?.voiceActivityDetection ?? options.voiceActivityDetection,
       longformChunking: configured?.longformChunking ?? options.longformChunking,
       fillerWords: configured?.fillerWords ?? options.fillerWords,
+      corrections: configured?.corrections ?? options.corrections,
     }),
     (settings) => {
       configured = settings;
@@ -216,6 +219,7 @@ export async function changeOnboardingModel(
       voiceActivityDetection: current.voiceActivityDetection,
       longformChunking: current.longformChunking,
       fillerWords: current.fillerWords,
+      corrections: current.corrections,
     }),
     (settings) => {
       chosen = settings;
@@ -284,7 +288,12 @@ export async function runOnboarding(
     // the real wait on this machine.
     const picks = recommendModels(CATALOG_MODELS, languages);
     const { activate, waitForCommits } = createSettingsActivation(
-      () => ({ shortcut, preferredLanguages: languages, fillerWords: configured?.fillerWords }),
+      () => ({
+        shortcut,
+        preferredLanguages: languages,
+        fillerWords: configured?.fillerWords,
+        corrections: configured?.corrections,
+      }),
       (settings) => {
         configured = settings;
       },

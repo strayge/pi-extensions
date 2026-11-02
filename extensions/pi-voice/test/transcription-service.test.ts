@@ -23,6 +23,7 @@ function settings(modelPath: string, modelId = "nemotron-3.5-asr-streaming-0.6b"
     voiceActivityDetection: true,
     longformChunking: true,
     fillerWords: ["uh", "um", "erm"],
+    corrections: {},
     model: { source: "catalog", id: modelId, path: modelPath },
   };
 }

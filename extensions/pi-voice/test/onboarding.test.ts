@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { initTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { Deferred } from "../src/deferred.ts";
+import type { CorrectionDictionary } from "../src/corrections.ts";
 import { CatalogModelPicker, LanguagePicker } from "../src/model-picker.ts";
 import { changeOnboardingModel, runModelSelection, runOnboarding } from "../src/onboarding.ts";
 import { RecommendedModelPicker } from "../src/recommendation-picker.ts";
@@ -64,6 +65,7 @@ function initialSettings(languages = ["en"]) {
     chineseOutput: "traditional-taiwan",
     longformChunking: false,
     fillerWords: ["mm", "ah"],
+    corrections: { "pie voice": "Pi Voice" },
   });
 }
 
@@ -82,7 +84,10 @@ for (const entry of ["recommended", "other-models", "single-pick"] as const) {
     const cache = isolatedModelCache(t);
     cacheCatalogModel(cache, LANGUAGE_DETECTION_MODEL);
     const current = initialSettings(entry === "single-pick" ? ["en", "bs"] : ["en"]);
-    if (entry === "other-models") current.fillerWords = [];
+    if (entry === "other-models") {
+      current.fillerWords = [];
+      current.corrections = {};
+    }
     await writeSettings(current);
     const picks = recommendModels(CATALOG_MODELS, ["en", "zh"]);
     for (const pick of picks) cacheCatalogModel(cache, pick.model);
@@ -118,6 +123,7 @@ for (const entry of ["recommended", "other-models", "single-pick"] as const) {
     assert.equal(result.chineseOutput, current.chineseOutput);
     assert.equal(result.longformChunking, false, "the hidden setting survives a model change");
     assert.deepEqual(result.fillerWords, current.fillerWords);
+    assert.deepEqual(result.corrections, current.corrections);
     assert.deepEqual((await readSettings()).settings, result);
 
     // A later visit uses the newly saved languages, not the first-run closure.
@@ -156,7 +162,7 @@ test("a root catalog stays root when another cached model appears while it is op
 });
 
 for (const fillerWords of [["mm", "ah"], []]) {
-  test(`model selection retains ${fillerWords.length ? "custom" : "disabled"} fillers after language edits`, async (t) => {
+  test(`model selection retains ${fillerWords.length ? "custom" : "disabled"} fillers and corrections after language edits`, async (t) => {
     isolatedSettings(t);
     const cache = isolatedModelCache(t);
     cacheCatalogModel(cache, LANGUAGE_DETECTION_MODEL);
@@ -171,16 +177,19 @@ for (const fillerWords of [["mm", "ah"], []]) {
         pane.handleInput("\r");
       },
     ]);
+    const corrections: CorrectionDictionary = fillerWords.length ? { "pie voice": "Pi Voice" } : {};
     const result = await runModelSelection(script.ctx, {
       shortcut: "ctrl+alt+z",
       preferredLanguages: ["en"],
       fillerWords,
+      corrections,
       postActivation: "advance",
     });
     script.assertFinished();
     assert.ok(result);
     assert.deepEqual(result.preferredLanguages, ["en", "zh"]);
     assert.deepEqual(result.fillerWords, fillerWords);
+    assert.deepEqual(result.corrections, corrections);
     assert.deepEqual((await readSettings()).settings, result);
   });
 }

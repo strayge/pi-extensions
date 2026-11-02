@@ -1,6 +1,6 @@
 # pi-voice
 
-Local speech-to-text for Pi, with conservative filler removal from voice dictation.
+Local speech-to-text for Pi, with editable filler removal and a correction dictionary for voice dictation.
 Requires Pi >=1.4.0 and Node >=22.19.0.
 
 ## Why this fork exists
@@ -16,7 +16,8 @@ extensibility API. This fork does not implement or promise that proposed API.
 
 **Retire this fork** when a released upstream version provides a supported
 before-insert hook (or equivalent voice-only cleanup). Move the filler filter
-into a companion extension if needed, reinstall upstream, and remove this copy.
+and correction dictionary into a companion extension if needed, reinstall upstream,
+and remove this copy.
 Merging the PR alone is not sufficient: verify that the released API supports
 the same behavior first.
 
@@ -63,6 +64,30 @@ Quoted tokens, identifiers, compounds, and all-uppercase acronyms are preserved.
 The default list is English-oriented; the filter does not detect language.
 An unquoted literal use of one of the configured words can also be removed.
 
+## Correction dictionary
+
+In `/voice-settings`, choose **Correction dictionary** to edit one rule per line:
+
+```text
+see mux = cmux
+double u mux = wmux
+```
+
+These are examples, not built-in rules: the dictionary starts empty. Use the
+actual text your speech model produces on the left and the desired spelling on
+the right. Clear the editor and save to disable corrections; cancelling keeps
+the saved dictionary. Invalid or duplicate sources are rejected without saving.
+
+Rules match literal whole words or phrases, ignoring case; replacements retain
+the exact capitalization you enter. Longer phrases take priority. Each match is
+replaced once, so replacement text cannot trigger another rule. Quoted terms are
+also corrected, but substrings inside larger words or identifiers are not.
+
+Corrections run after filler removal, only before dictation is inserted into the
+editor. They do not affect typed/pasted text, file transcription, or model previews.
+Changes apply to the next dictation and are stored in the `corrections` object in
+`~/.pi/agent/pi-voice.json`, alongside the existing global voice preferences.
+
 ## Development and updates
 
 ```sh
@@ -78,6 +103,6 @@ Typechecking covers all source and tests; Biome checks fork-owned files listed
 in `biome.json`, leaving upstream formatting intact to limit merge churn.
 
 When updating, compare against the pinned upstream commit, retain the narrow
-runtime insertion change and filler tests, rerun all checks, and smoke-test a
+dictation cleanup settings and tests, rerun all checks, and smoke-test a
 real Pi load. Preserve upstream copyright and bundled model attribution in
 `LICENSE` and `models/README.md`.

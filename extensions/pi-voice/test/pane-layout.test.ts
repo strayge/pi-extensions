@@ -30,6 +30,7 @@ const settings: TranscribeSettings = {
   voiceActivityDetection: true,
   longformChunking: true,
   fillerWords: ["uh", "um", "erm"],
+  corrections: {},
   model: {
     source: "catalog",
     id: "parakeet-unified-en-0.6b",

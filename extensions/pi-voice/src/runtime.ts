@@ -9,6 +9,7 @@ import { existsSync } from "node:fs";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.ts";
 import { isMacOSPermissionDenied } from "./audio-errors.ts";
 import { cleanDictationFillers } from "./filler-cleanup.ts";
+import { applyCorrections } from "./corrections.ts";
 import { logStep, watchEventLoop } from "./log.ts";
 import { DictationController } from "./dictation-controller.ts";
 import { VoiceKeys } from "./keybindings.ts";
@@ -154,6 +155,7 @@ export function createPiVoiceRuntime(
       voiceActivityDetection: previous.voiceActivityDetection,
       longformChunking: previous.longformChunking,
       fillerWords: previous.fillerWords,
+      corrections: previous.corrections,
       postActivation: "advance",
     });
     if (configured) rememberSettings(configured);
@@ -306,7 +308,10 @@ export function createPiVoiceRuntime(
       if (!result) {
         await reportDictationError(ctx, active.dictation);
       } else if (result.text) {
-        const text = cleanDictationFillers(result.text, settings?.fillerWords);
+        const text = applyCorrections(
+          cleanDictationFillers(result.text, settings?.fillerWords),
+          settings?.corrections,
+        );
         if (text) ctx.ui.pasteToEditor(text);
         showTranscribeStatus(
           ctx,

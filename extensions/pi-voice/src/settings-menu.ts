@@ -9,6 +9,7 @@ import { microphonePermission, type Permission } from "./audio.ts";
 import { displayLanguage, getCatalogModel, LANGUAGE_DETECTION_MODEL } from "./catalog.ts";
 import { autoLanguagePolicy } from "./language-detection-policy.ts";
 import { normalizeFillerWords } from "./filler-cleanup.ts";
+import { parseCorrectionDictionary } from "./corrections.ts";
 import { chineseOutputSummary, isChineseLanguage } from "./chinese.ts";
 import {
   chooseLanguages,
@@ -50,6 +51,7 @@ type SettingsAction =
   | "chinese-output"
   | "microphone"
   | "filler-words"
+  | "corrections"
   | "shortcut";
 
 type SettingsHomeChoice = SingleSelectChoice<SettingsAction> & {
@@ -155,6 +157,14 @@ function settingsHomeChoices(
       label: "Filler words",
       summary: configured.fillerWords.length ? configured.fillerWords.join(", ") : "Disabled",
       description: "Words removed from microphone dictation; an empty list disables cleanup",
+    },
+    {
+      value: "corrections",
+      label: "Correction dictionary",
+      summary: Object.keys(configured.corrections).length
+        ? `${Object.keys(configured.corrections).length} entries`
+        : "Disabled",
+      description: "Literal word and phrase replacements for microphone dictation",
     },
     {
       value: "microphone",
@@ -362,6 +372,7 @@ export async function showSettingsMenu(
         voiceActivityDetection: configured.voiceActivityDetection,
         longformChunking: configured.longformChunking,
         fillerWords: configured.fillerWords,
+        corrections: configured.corrections,
         postActivation: "stay",
         onPreferredLanguagesChange: async (preferredLanguages) => {
           if (languagesEqual(preferredLanguages, configured.preferredLanguages)) return;
@@ -427,6 +438,30 @@ export async function showSettingsMenu(
       const fillerWords = normalizeFillerWords(value.split(","));
       if (languagesEqual(fillerWords, configured.fillerWords)) continue;
       await saveUpdatedSettings(ctx, configured, { ...configured, fillerWords }, "Filler words saved");
+      continue;
+    }
+
+    if (action === "corrections") {
+      let draft = Object.entries(configured.corrections)
+        .map(([from, to]) => `${from} = ${to}`)
+        .join("\n");
+      while (true) {
+        const value = await ctx.ui.editor(
+          "Correction dictionary: source = replacement per line; empty disables",
+          draft,
+        );
+        if (value === undefined) break;
+        draft = value;
+        let corrections: TranscribeSettings["corrections"];
+        try {
+          corrections = parseCorrectionDictionary(value);
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          continue;
+        }
+        await saveUpdatedSettings(ctx, configured, { ...configured, corrections }, "Corrections saved");
+        break;
+      }
       continue;
     }
 

@@ -6,6 +6,8 @@
       "biome.json",
       "tsconfig.json",
       "src/filler-cleanup.ts",
+      "src/corrections.ts",
+      "test/corrections.test.ts",
       "test/filler-cleanup.test.ts",
       "test/settings.test.ts"
     ]
