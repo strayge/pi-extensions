@@ -11,14 +11,25 @@ import { defaultConfig } from "./config-load.ts";
 import permissionExtension from "./index.ts";
 import { bindPath, within } from "./paths.ts";
 import { STATE_FILE } from "./permission-state.ts";
+import { runtime } from "./sandbox.ts";
+import { assertWindowsPrivate, createWindowsPrivateDirectory, windowsSystemDirectory } from "./windows-platform.ts";
 
 type Hook = (event: never, context: ExtensionContext) => unknown;
-function fixture() {
+function fixture(prepareRuntime?: typeof runtime.prepareWindows) {
+  const originalPrepare = runtime.prepareWindows;
+  if (process.platform === "win32") runtime.prepareWindows = prepareRuntime ?? (async () => {});
   const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-reset-"))).canonical;
   const project = path.join(dir, "project"); const agentDir = path.join(dir, "agent"); const other = path.join(dir, "other");
-  for (const folder of [project, agentDir, other, path.join(project, ".pi"), path.join(other, ".pi"), path.join(agentDir, "permissions")]) mkdirSync(folder, { mode: 0o700 });
-  const oldHome = process.env.HOME; const oldAgent = process.env.PI_CODING_AGENT_DIR;
+  for (const folder of [project, agentDir, other, path.join(project, ".pi"), path.join(other, ".pi")]) mkdirSync(folder, { mode: 0o700 });
+  if (process.platform === "win32") createWindowsPrivateDirectory(path.join(agentDir, "permissions"));
+  else mkdirSync(path.join(agentDir, "permissions"), { mode: 0o700 });
+  const oldHome = process.env.HOME; const oldProfile = process.env.USERPROFILE; const oldAgent = process.env.PI_CODING_AGENT_DIR;
   process.env.HOME = dir; process.env.PI_CODING_AGENT_DIR = agentDir;
+  if (process.platform === "win32") {
+    process.env.USERPROFILE = dir;
+    const conventional = path.join(dir, ".pi", "agent"); mkdirSync(conventional, { recursive: true });
+    for (const directory of [agentDir, conventional]) writeFileSync(path.join(directory, "auth.json"), "{}");
+  }
   const config = defaultConfig(); config.pathRules = [];
   config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: [] };
   config.modes.subproject = config.modes.project!;
@@ -64,17 +75,111 @@ function fixture() {
     },
     blocked: async () => (await emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "probe", input: { path: "file" } })).some((r) => (r as { block?: boolean } | undefined)?.block),
     perm: (args: string) => commands.get("perm")!.handler(args, ctx),
+    net: (args: string) => commands.get("net")!.handler(args, ctx),
     reset: () => commands.get("perm")!.handler("reset", ctx),
     confirm: (value: boolean) => { confirm = value; },
     awareness: async () => JSON.stringify(await emit("before_agent_start", { type: "before_agent_start" })),
     close: async () => {
       await emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
       if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+      if (oldProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldProfile;
       if (oldAgent === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = oldAgent;
       rmSync(dir, { recursive: true, force: true });
+      runtime.prepareWindows = originalPrepare;
     },
   };
 }
+
+test("Windows terminal startup warns once while inspection and reload do not duplicate limitation notices", { skip: process.platform !== "win32" }, async () => {
+  const f = fixture();
+  try {
+    Object.assign(f.ctx, { mode: "tui" }); await f.start();
+    const warnings = () => f.notifications.filter((message) => message.includes("Windows case-equivalent pathnames"));
+    assert.equal(warnings().length, 1); assert.match(warnings()[0]!, /0xC0000142/);
+    await f.perm("status"); await f.perm("inspect"); await f.reloadExtension();
+    assert.equal(f.notifications.filter((message) => message.startsWith("Windows case-equivalent pathnames")).length, 1);
+    await f.perm("yolo"); await f.net("restricted");
+    assert.equal(f.notifications.filter((message) => message.startsWith("Known Windows compatibility gate:")).length, 1);
+  } finally { await f.close(); }
+});
+
+test("Windows nonterminal startup stays notification-quiet while model awareness preserves limitations", { skip: process.platform !== "win32" }, async () => {
+  const f = fixture();
+  try {
+    Object.assign(f.ctx, { mode: "json", hasUI: false }); await f.start();
+    assert.deepEqual(f.notifications, []); assert.match(await f.awareness(), /case-equivalent pathnames/); assert.match(await f.awareness(), /0xC0000142/);
+  } finally { await f.close(); }
+});
+
+test("Windows reload clears stale execution diagnostics only after backend preparation succeeds", { skip: process.platform !== "win32" }, async () => {
+  let report: ((error?: string) => void) | undefined; let fail = false;
+  const f = fixture(async (family) => {
+    report = family.reportEnforcement;
+    if (fail) { assert.match(await f.awareness(), /Synthetic execution-layer failure/); throw new Error("Synthetic backend repair failed"); }
+  });
+  try {
+    await f.start(); report!("Synthetic execution-layer failure"); assert.match(await f.awareness(), /Execution diagnostics: Synthetic execution-layer failure/);
+    await f.reloadExtension(); assert.doesNotMatch(await f.awareness(), /Execution diagnostics:|Synthetic execution-layer failure/);
+    report!("Synthetic execution-layer failure"); fail = true; await f.reloadExtension();
+    assert.equal(f.governed(), false); assert.match(await f.awareness(), /Synthetic backend repair failed/);
+    fail = false; await f.reloadExtension(); assert.equal(f.governed(), true); assert.doesNotMatch(await f.awareness(), /Execution diagnostics:|Synthetic execution-layer failure/);
+  } finally { await f.close(); }
+});
+
+test("Windows startup rejects an unsafe configuration file beneath a private directory without repairing its ACL", { skip: process.platform !== "win32" }, async () => {
+  let preparations = 0; const f = fixture(async () => { preparations++; });
+  const acl = (args: string[]) => {
+    const result = childProcess.spawnSync(path.join(windowsSystemDirectory(), "icacls.exe"), [f.global, ...args], { encoding: "utf8", windowsHide: true, timeout: 3000 });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  try {
+    const bytes = readFileSync(f.global, "utf8"); assertWindowsPrivate(path.dirname(f.global), true);
+    acl(["/grant", "*S-1-1-0:M"]);
+    await f.start(); assert.equal(preparations, 0); assert.equal(f.governed(), false);
+    assert.match(f.notifications.join("\n"), /Unsafe Windows authority DACL/); assert.match(await f.awareness(), /unrestricted/);
+    assertWindowsPrivate(path.dirname(f.global), true); assert.throws(() => assertWindowsPrivate(f.global, false), /DACL/);
+    assert.equal(readFileSync(f.global, "utf8"), bytes);
+    acl(["/remove:g", "*S-1-1-0"]); await f.reloadExtension(); assert.equal(preparations, 1); assert.equal(f.governed(), true);
+  } finally { await f.close(); }
+});
+
+test("Windows root startup owns queued consent and refusal recovers only on explicit reload", { skip: process.platform !== "win32" }, async () => {
+  let preparations = 0; let approvals = 0;
+  const f = fixture(async (_family, options) => {
+    preparations++;
+    if (!await options.approveDownload?.({ title: "Synthetic download", message: "No download occurs in this test" }, options.signal)) throw new Error("Synthetic acquisition declined");
+    approvals++;
+  });
+  try {
+    assert.equal(preparations, 0, "registration must not prepare a runtime");
+    f.confirm(false); await f.start(); assert.equal(preparations, 1); assert.equal(f.governed(), false);
+    assert.match(await f.awareness(), /unrestricted/);
+    f.confirm(true); await f.reloadExtension(); assert.equal(preparations, 2); assert.equal(approvals, 1); assert.equal(f.governed(), true);
+  } finally { await f.close(); }
+});
+
+test("Windows headless startup cannot offer acquisition and unrepresentable policy is rejected before preparation", { skip: process.platform !== "win32" }, async () => {
+  let preparations = 0;
+  const f = fixture(async (_family, options) => { preparations++; assert.equal(options.approveDownload, undefined); throw new Error("Synthetic missing executor"); });
+  try {
+    Object.assign(f.ctx, { hasUI: false }); await f.start(); assert.equal(preparations, 1); assert.equal(f.governed(), false);
+    const config = JSON.parse(readFileSync(f.global, "utf8")); config.pathRules = [{ path: "future", scope: "tree", write: "deny" }]; writeFileSync(f.global, JSON.stringify(config));
+    await f.reloadExtension(); assert.equal(preparations, 1); assert.match(await f.awareness(), /before its target exists/);
+  } finally { await f.close(); }
+});
+
+test("Windows unrestricted startup does not acquire an executor and failed transitions preserve the selected policy", { skip: process.platform !== "win32" }, async () => {
+  let preparations = 0; let fail = true;
+  const f = fixture(async () => { preparations++; if (fail) throw new Error("Synthetic preparation failed"); });
+  try {
+    const config = JSON.parse(readFileSync(f.global, "utf8")); config.defaultMode = "yolo"; writeFileSync(f.global, JSON.stringify(config));
+    await f.start(); assert.equal(preparations, 0);
+    await assert.rejects(f.perm("project"), /Synthetic preparation failed/); assert.match(await f.awareness(), /Filesystem profile: yolo/); assert.equal(f.governed(), true);
+    await assert.rejects(f.net("restricted"), /Synthetic preparation failed/); assert.match(await f.awareness(), /Network: open/);
+    fail = false; await f.perm("project"); assert.match(await f.awareness(), /Filesystem profile: project/);
+    await f.net("restricted"); assert.match(await f.awareness(), /Network: restricted/);
+  } finally { await f.close(); }
+});
 
 test("macOS startup and state restoration share dependency inspection while reload discovers changes", { skip: process.platform !== "darwin" }, async (t) => {
   const f = fixture(); const spawn = childProcess.spawnSync;
@@ -395,7 +500,7 @@ test("user shells opt out discovered filesystem accesses and working-directory a
   } finally { await f.close(); }
 });
 
-test("both shell initialization orders keep shared-runtime network waits tracked with distinct-host prompts and same-host dedup", async (t) => {
+test("both shell initialization orders keep shared-runtime network waits tracked with distinct-host prompts and same-host dedup", { skip: process.platform === "win32" }, async (t) => {
   const { SandboxManager } = await import("@anthropic-ai/sandbox-runtime");
   const marker = Symbol.for("pi-extensions:input-dialog");
   for (const manualFirst of [true, false]) {
@@ -489,7 +594,7 @@ test("failed startup freezes reset and reload to the original project even acros
       const backup = readdirSync(path.dirname(f.global)).find((name) => name.startsWith("config.json.backup-"));
       assert.equal(readFileSync(path.join(path.dirname(f.global), backup!), "utf8"), malformed);
       assert.equal(await f.blocked(), false);
-      assert.match(await f.awareness(), new RegExp(f.project));
+      assert.ok((await f.awareness()).includes(JSON.stringify(f.project).slice(1, -1)), f.notifications.join("\n"));
     } finally { await f.close(); }
   }
 });
@@ -615,7 +720,7 @@ test("reset leaves unrelated files beside policy and state untouched", async () 
     assert.equal(readFileSync(unrelated, "utf8"), "unrelated data");
     assert.ok(!readdirSync(path.dirname(unrelated)).some((name) => name.startsWith("unrelated.json.backup-")));
     await f.reloadExtension();
-    assert.equal(f.governed(), true);
+    assert.equal(f.governed(), true, f.notifications.join("\n"));
     assert.equal(readFileSync(unrelated, "utf8"), "unrelated data");
   } finally { await f.close(); }
 });
@@ -690,6 +795,6 @@ test("reset respects state locking and retains the original project root across 
     assert.equal(readFileSync(f.projectFile, "utf8"), '{"version":3,"defaultMode":"yolo"}');
     assert.ok(!readdirSync(path.dirname(f.projectFile)).some((name) => name.includes("backup")));
     assert.equal(await f.blocked(), false);
-    assert.match(await f.awareness(), new RegExp(f.project));
+    assert.ok((await f.awareness()).includes(JSON.stringify(f.project).slice(1, -1)), f.notifications.join("\n"));
   } finally { await f.close(); }
 });

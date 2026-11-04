@@ -7,8 +7,10 @@ import { initTheme, type ExtensionContext } from "@earendil-works/pi-coding-agen
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { editDirectoryScope } from "./directory-scope.ts";
 import { bindPath } from "./paths.ts";
+import { prepareWindowsComparison } from "./windows-platform.ts";
 
 function fixture(t: { after: (cleanup: () => void) => void }) {
+  prepareWindowsComparison();
   const root = bindPath(mkdtempSync(path.join(tmpdir(), "permission-scope-ui-"))).canonical;
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const parent = path.join(root, "configuration-設定\u00a0native");
@@ -80,7 +82,7 @@ test("the scope picker highlights the current scope and wraps complete native pa
 
 test("manual entry is prefilled with the current scope and still permits explicit filesystem-root access", async (t) => {
   const f = fixture(t);
-  for (const current of [f.requested, "/"]) {
+  for (const current of [f.requested, path.parse(f.root).root]) {
     const ctx = tuiContext(f.root, (component, index) => {
       if (index === 0) {
         if (current === f.requested) component.handleInput?.("\u001b[A");

@@ -10,6 +10,9 @@ import { assertNativeSemantics } from "./native-semantics.ts";
 import { decide, positiveTarget } from "./evaluation.ts";
 import { isHostAllowed, normalizeDomain } from "./network.ts";
 import type { FileIdentity, FilesystemSnapshot, NetworkSnapshot, PathBinding, ProcessMode } from "./schema.ts";
+import { prepareWindowsExecutor, type WindowsExecutorOptions } from "./windows-executor.ts";
+import { directWindowsShellOperations, discoverWindowsShell, WindowsRuntime, type WindowsShellKind } from "./windows-runtime.ts";
+import type { NetworkVerdict } from "./network.ts";
 
 type Manager = typeof import("@anthropic-ai/sandbox-runtime").SandboxManager;
 export interface RuntimePolicy {
@@ -199,6 +202,7 @@ export interface RuntimeFamily {
   id: string;
   network(): NetworkSnapshot;
   decideHost(host: string, port?: number): Promise<boolean>;
+  decideHostWithRevision?(host: string, port: number, signal: AbortSignal): Promise<NetworkVerdict>;
   reportEnforcement?(error?: string): void;
 }
 
@@ -251,12 +255,34 @@ async function reportSandboxDiagnostics(
 
 /** One coordinator owns the process-global manager, including incompatible-family serialization. */
 export class RuntimeCoordinator {
+  private windows = new Map<string, { pending: Promise<WindowsRuntime>; runtime?: WindowsRuntime }>();
   private manager?: Manager;
   private family?: RuntimeFamily;
   private users = 0;
   private initializing?: Promise<void>;
   private idle: (() => void)[] = [];
   private admission: Promise<void> = Promise.resolve();
+
+  /** Only root startup or an explicit root transition supplies acquisition consent. */
+  async prepareWindows(family: RuntimeFamily, options: Omit<WindowsExecutorOptions, "decideNetwork" | "networkRevision">, prepare = prepareWindowsExecutor): Promise<void> {
+    if (process.platform !== "win32") return;
+    if (!family.decideHostWithRevision) throw new Error("Windows runtime requires revision-tagged live network decisions");
+    let entry = this.windows.get(family.id);
+    if (!entry) {
+      const pending = prepare({ ...options, networkRevision: () => family.network().revision,
+        decideNetwork: ({ request }, signal) => family.decideHostWithRevision!(request.host, request.port, signal) }).then((prepared) => {
+        const runtime = new WindowsRuntime(prepared); entry!.runtime = runtime; return runtime;
+      });
+      entry = { pending }; this.windows.set(family.id, entry);
+      const selected = entry;
+      void pending.catch(() => { if (this.windows.get(family.id) === selected) this.windows.delete(family.id); });
+    }
+    const runtime = await entry.pending;
+    runtime.prepared.assertIdentity();
+    if (!runtime.prepared.client.healthy) throw new Error("Windows executor is unhealthy; /reload is required");
+  }
+
+  windowsRuntime(family: string): WindowsRuntime | undefined { return this.windows.get(family)?.runtime; }
 
   private async acquire(family: RuntimeFamily, signal?: AbortSignal): Promise<Manager> {
     let unlock!: () => void;
@@ -317,7 +343,26 @@ export class RuntimeCoordinator {
     family: RuntimeFamily,
     beforeSpawn: () => void,
     noSandbox = false,
+    shell: { kind: WindowsShellKind; path?: string } = { kind: "bash" },
   ): BashOperations {
+    if (process.platform === "win32") return { exec: async (command, cwd, options) => {
+      try {
+        options.signal?.throwIfAborted();
+        const confined = snapshot.profile.kind !== "unrestricted" || family.network().restricted;
+        if (confined && noSandbox) throw new Error("--no-sandbox cannot disable a required filesystem or network layer");
+        const interpreter = discoverWindowsShell(shell.kind, snapshot.root.binding, { shellPath: shell.path });
+        if (!confined) { beforeSpawn(); return await directWindowsShellOperations(interpreter).exec(command, cwd, options); }
+        const entry = this.windows.get(family.id);
+        if (!entry) throw new Error("Native Windows executor was not prepared by the root; /reload is required");
+        await waitFor(entry.pending.then(() => {}), options.signal);
+        const native = entry.runtime!;
+        const operations = native.operations(snapshot, interpreter, () => family.network().restricted, () => { beforeSpawn(); family.reportEnforcement?.(); });
+        return await operations.exec(command, cwd, options);
+      } catch (error) {
+        if (!options.signal?.aborted) family.reportEnforcement?.(String(error));
+        throw error;
+      }
+    } };
     return {
       exec: async (command, cwd, options) => {
         let preparing = true;
@@ -391,6 +436,12 @@ export class RuntimeCoordinator {
   }
 
   async shutdown(family: string): Promise<void> {
+    const native = this.windows.get(family);
+    if (native) {
+      this.windows.delete(family);
+      const runtime = await native.pending.catch(() => undefined);
+      await runtime?.prepared.close();
+    }
     let unlock!: () => void;
     const before = this.admission;
     this.admission = new Promise<void>((resolve) => {

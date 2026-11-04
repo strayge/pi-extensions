@@ -10,15 +10,19 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PermissionOwner, type AskApproval } from "./approvals.ts";
 import { defaultConfig } from "./config-load.ts";
 import { createDirectTools } from "./direct-tools.ts";
-import { createSearchTools } from "./filtered-search.ts";
+import { createSearchTools as searchTools, grepBytes } from "./filtered-search.ts";
 import { bindPath } from "./paths.ts";
 import { resolveCatalog } from "./policy.ts";
+
+/** Byte-matcher injection keeps walker tests independent of native MXC installation. */
+const createSearchTools: typeof searchTools = (owner, cwd) => searchTools(owner, cwd, process.platform === "win32" ? grepBytes : undefined);
 
 function fixture(ask: AskApproval = async () => undefined) {
   const directory = fs.realpathSync.native(mkdtempSync(path.join(tmpdir(), "permission-tools-")));
   writeFileSync(path.join(directory, "auth.json"), "credential");
-  const home = process.env.HOME;
+  const home = process.env.HOME; const profile = process.env.USERPROFILE;
   process.env.HOME = directory;
+  if (process.platform === "win32") process.env.USERPROFILE = directory;
   const config = defaultConfig();
   config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: [] };
   config.modes.subproject = config.modes.project!;
@@ -32,7 +36,8 @@ function fixture(ask: AskApproval = async () => undefined) {
     owner,
     context,
     close: () => {
-      process.env.HOME = home;
+      if (home === undefined) delete process.env.HOME; else process.env.HOME = home;
+      if (profile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = profile;
       rmSync(directory, { recursive: true, force: true });
     },
   };

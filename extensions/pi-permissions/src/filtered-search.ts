@@ -17,6 +17,8 @@ import { macGrepSandbox, macRipgrep } from "./macos.ts";
 import { assertBinding, bindPath, modelPath, within } from "./paths.ts";
 import { decide } from "./policy.ts";
 import type { FilesystemSnapshot, PathBinding } from "./schema.ts";
+import { runtime } from "./sandbox.ts";
+import { createWindowsGrep, discoverWindowsRipgrep } from "./windows-grep.ts";
 
 interface Matcher {
   add(text: string): Matcher;
@@ -60,14 +62,14 @@ function trustedRg(): string {
 }
 
 /** Ripgrep sees only authorized bytes on stdin, never a recursive host search root. */
-async function grepBytes(
+export async function grepBytes(
   input: Buffer | string,
   pattern: string,
   options: { ignoreCase?: boolean; literal?: boolean; limit?: number },
   signal?: AbortSignal,
 ): Promise<number[]> {
   signal?.throwIfAborted();
-  const executable = process.platform === "darwin" ? macRipgrep() : trustedRg();
+  const executable = process.platform === "darwin" ? macRipgrep() : process.platform === "win32" ? discoverWindowsRipgrep(bindPath(process.cwd())).canonical : trustedRg();
   const args = [
     "--no-config",
     "--json",
@@ -403,7 +405,7 @@ async function authorizedLinkDirectory(walker: Walker, initial: string, signal?:
     for (let hops = 0; hops < 40; hops++) {
       signal?.throwIfAborted();
       if (!walker.allowed(target)) return false;
-      const parts = target.split(path.sep).filter(Boolean);
+      const parts = target.slice(path.parse(target).root.length).split(path.sep).filter(Boolean);
       let prefix = path.parse(target).root;
       let changed = false;
       for (let i = 0; i < parts.length; i++) {
@@ -455,7 +457,7 @@ function output(lines: string[], empty: string, omissions: Omissions, limit?: nu
   };
 }
 
-export function createSearchTools(getOwner: () => PermissionOwner | undefined, cwd: string) {
+export function createSearchTools(getOwner: () => PermissionOwner | undefined, cwd: string, grepRunner?: typeof grepBytes) {
   const find = createFindToolDefinition(cwd);
   const grep = createGrepToolDefinition(cwd);
   const ls = createLsToolDefinition(cwd);
@@ -477,7 +479,7 @@ export function createSearchTools(getOwner: () => PermissionOwner | undefined, c
           const walker = new Walker(owner, snapshot, binding!, "fd", signal);
           const lines: string[] = [];
           for await (const entry of walker.walk()) {
-            if (match(full ? entry.native : path.basename(entry.native)))
+            if (match(full ? entry.native.split(path.sep).join("/") : path.basename(entry.native)))
               lines.push(entry.relative + (entry.directory ? "/" : ""));
             if (lines.length >= (params.limit ?? 1000)) break;
           }
@@ -501,11 +503,20 @@ export function createSearchTools(getOwner: () => PermissionOwner | undefined, c
           !match ||
           match(
             body!.includes("/")
-              ? path.relative(process.cwd(), native).split(path.sep).join("/")
+              ? path.relative(ctx.cwd || cwd, native).split(path.sep).join("/")
               : path.basename(native),
           ) !== !!exclude;
-        await grepBytes(Buffer.alloc(0), params.pattern, params, signal);
+        if (process.platform !== "win32" || grepRunner) await (grepRunner ?? grepBytes)(Buffer.alloc(0), params.pattern, params, signal);
         return owner.run([root], "read", "Search file contents", signal, async (snapshot, [binding], signal) => {
+          const native = process.platform === "win32" && !grepRunner ? runtime.windowsRuntime(owner.id) : undefined;
+          if (process.platform === "win32" && !grepRunner && !native) throw new Error("Windows grep needs a root-prepared MXC executor; select a scoped profile or restricted networking and /reload. Tools never install a runtime.");
+          const contained = native ? createWindowsGrep(native, snapshot.root.binding) : undefined;
+          const query = (input: Buffer | string, options: typeof params, target?: PathBinding) => {
+            const check = () => { owner.check(snapshot.revision); if (target) assertBinding(target); };
+            if (contained) return contained(input, params.pattern, options, signal, check);
+            check(); return (grepRunner ?? grepBytes)(input, params.pattern, options, signal);
+          };
+          if (contained) await query(Buffer.alloc(0), params);
           const walker = new Walker(owner, snapshot, binding!, "rg", signal);
           const lines: string[] = [];
           let count = 0;
@@ -521,7 +532,7 @@ export function createSearchTools(getOwner: () => PermissionOwner | undefined, c
             owner.check(snapshot.revision);
             assertBinding(entry.binding);
             signal?.throwIfAborted();
-            const hits = await grepBytes(entry.native, params.pattern, { ...params, limit: limit - count }, signal);
+            const hits = await query(entry.native, { ...params, limit: limit - count }, entry.binding);
             if (!hits.length) continue;
             owner.check(snapshot.revision);
             assertBinding(entry.binding);

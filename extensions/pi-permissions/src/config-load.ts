@@ -1,5 +1,7 @@
-import { readFileSync } from "node:fs";
-import { bindPath, configLocation } from "./paths.ts";
+import { closeSync, constants, openSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { assertBinding, bindPath, configLocation, identity, sameIdentity } from "./paths.ts";
+import { assertWindowsPrivate } from "./windows-platform.ts";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { FilesystemProfile, ModeDef, NetworkPolicy, PathRule, PermissionModeConfig, ProcessMode, RuleAction } from "./schema.ts";
@@ -132,6 +134,10 @@ export function mergeConfig(base: PermissionModeConfig, raw: unknown): Permissio
 export const DEFAULTS_PATH = fileURLToPath(new URL("../permissions.defaults.json", import.meta.url));
 export function defaultConfig(agentDir?: string, home?: string): PermissionModeConfig {
   const config = parseConfig(JSON.parse(readFileSync(DEFAULTS_PATH, "utf8")));
+  if (process.platform === "win32") {
+    for (const mode of Object.values(config.modes))
+      if (mode.filesystem.kind === "scoped") mode.filesystem.readWrite = mode.filesystem.readWrite.map((value) => value === "/tmp" ? tmpdir() : value);
+  }
   if (process.platform === "darwin") {
     // Native tools may resolve per-user temporary directories independently of TMPDIR.
     for (const mode of Object.values(config.modes))
@@ -152,6 +158,16 @@ export function readConfig(file: string): unknown | undefined {
   const binding = bindPath(configLocation(file));
   if (binding.missing.length) return undefined;
   if (binding.canonical !== binding.lexical || binding.identity.type !== "file") throw new Error(`Permission configuration must be a regular file without symlink redirection: ${file}`);
+  if (process.platform === "win32") {
+    const fd = openSync(binding.canonical, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      assertWindowsPrivate(binding.canonical, false, fd);
+      if (!sameIdentity(identity(fd), binding.identity)) throw new Error("Permission configuration changed before being read");
+      const bytes = readFileSync(fd, "utf8");
+      assertBinding(binding);
+      return JSON.parse(bytes);
+    } finally { closeSync(fd); }
+  }
   return JSON.parse(readFileSync(binding.canonical, "utf8"));
 }
 

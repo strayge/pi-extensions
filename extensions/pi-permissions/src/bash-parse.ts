@@ -103,9 +103,20 @@ export async function discoverShellAccess(command: string, cwd: string, depth = 
   const functions = new Set<string>();
   let unknownCdPath = !!process.env.CDPATH;
   const merge = (a?: string, b?: string) => a === b ? a : undefined;
+  const resolveOperand = (value: string | undefined, current: string | undefined): string | undefined => {
+    if (!value || value === "-") return;
+    if (process.platform === "win32" && value.startsWith("/")) {
+      // Virtual MSYS roots are not native authority; only explicit drive prefixes are reliable.
+      if (value.startsWith("//") || value.includes("\\")) return;
+      const drive = path.posix.normalize(value).match(/^\/([a-zA-Z])(?:\/(.*))?$/);
+      if (!drive) return;
+      value = `${drive[1]!.toUpperCase()}:/${drive[2] ?? ""}`;
+    }
+    return !current && !path.isAbsolute(value) ? undefined : path.resolve(current ?? "/", value);
+  };
   const append = (value: string | undefined, access: Access, current: string | undefined, source: string) => {
-    if (!value || value === "-" || (!current && !path.isAbsolute(value))) return;
-    requests.push({ path: path.resolve(current ?? "/", value), access, source });
+    const resolved = resolveOperand(value, current);
+    if (resolved) requests.push({ path: resolved, access, source });
   };
   const sequence = async (nodes: Node[], current?: string): Promise<Flow> => {
     let flow: Flow = { success: current, failure: current };
@@ -176,7 +187,7 @@ export async function discoverShellAccess(command: string, cwd: string, depth = 
         const positional = args.filter((arg) => arg !== "--" && arg !== "-L" && arg !== "-P");
         const destination = positional.length === 1 && !positional[0]?.startsWith("-") ? positional[0] : undefined;
         append(destination, "read", current, node.text);
-        return { success: destination && !args.includes("-P") && !unknownCdPath && (current || path.isAbsolute(destination)) ? path.resolve(current ?? "/", destination) : undefined, failure: current };
+        return { success: !args.includes("-P") && !unknownCdPath ? resolveOperand(destination, current) : undefined, failure: current };
       }
       if (["eval", "source", ".", "pushd", "popd", "command", "builtin"].includes(head)) return {};
       if (["node", "python", "python3", "bash", "sh", "zsh"].includes(head)) {

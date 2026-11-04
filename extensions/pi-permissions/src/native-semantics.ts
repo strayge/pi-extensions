@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { lstatSync, statfsSync } from "node:fs";
 import path from "node:path";
+import { assertWindowsSemantics } from "./windows-platform.ts";
 import type { PathBinding } from "./schema.ts";
 
 const verified = new Map<string, string>();
@@ -15,6 +16,10 @@ export function isLinux9p(binding: PathBinding): boolean {
 /** Unknown filesystems fail closed; Linux 9p retains only best-effort nested protection. */
 export function assertNativeSemantics(binding: PathBinding): void {
   const directory = binding.identity.type === "directory" ? binding.prefix : path.dirname(binding.prefix);
+  if (process.platform === "win32") {
+    assertWindowsSemantics(directory);
+    return;
+  }
   let current = directory;
   for (;;) {
     verifyDirectory(current);

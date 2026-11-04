@@ -4,6 +4,7 @@ import { editDirectoryScope } from "./directory-scope.ts";
 import { approvalDialogOptions } from "./input-dialog.ts";
 import { bindPath } from "./paths.ts";
 import type { NetAsk } from "./network.ts";
+import { WINDOWS_CASE_AUTHORITY, WINDOWS_FILESYSTEM_LIMITATION } from "./windows-runtime.ts";
 
 /** Only the root UI can approve authority; a headless child never silently grants it. */
 export function approvalUI(context: () => ExtensionContext, owner?: () => PermissionOwner): AskApproval {
@@ -17,7 +18,8 @@ export function approvalUI(context: () => ExtensionContext, owner?: () => Permis
     for (;;) {
       const edited = request.kind === "directory" && directory !== request.path;
       const field = (label: string, value: string) => label.padEnd(edited ? 11 : 8) + value;
-      const scope = request.kind === "file" || (request.kind === "exception" && request.scope === "file") ? "This file only" : "Directory and all descendants";
+      const file = request.kind === "file" || (request.kind === "exception" && request.scope === "file");
+      const scope = file ? (process.platform === "win32" ? "File-name family only (nonrecursive)" : "This file only") : (process.platform === "win32" ? "Directory-name family and all descendants" : "Directory and all descendants");
       const warning = request.kind !== "exception" ? owner?.().grantWarning(binding, request.kind === "file" ? "file" : "tree", request.access) : undefined;
       const blocking = request.access === "read" ? "Blocking read access also blocks writes." : "Blocking write access does not block reads.\n      Reads still require permission.";
       const title = [
@@ -32,7 +34,8 @@ export function approvalUI(context: () => ExtensionContext, owner?: () => Permis
         request.reason,
         "",
         request.kind === "exception" ? `Note: This requires separate approval under a path rule.\n      ${blocking}` : `Note: ${blocking}`,
-        ...(request.kind !== "exception" ? ["", "Save globally", "Applies to all scoped profiles and projects.", warning?.limited ? "More-specific restrictions on 9p are best-effort only." : "More-specific restrictions remain protected."] : []),
+        ...(request.kind !== "exception" ? ["", "Save globally", "Applies to all scoped profiles and projects.", process.platform === "win32" ? "Windows nested shell restrictions are best-effort only." : warning?.limited ? "More-specific restrictions on 9p are best-effort only." : "More-specific restrictions remain protected."] : []),
+        ...(process.platform === "win32" ? ["", "Windows authority", WINDOWS_CASE_AUTHORITY, WINDOWS_FILESYSTEM_LIMITATION] : []),
         ...(warning?.message ? ["", "Warning", warning.message] : []),
         ...(request.kind === "directory" && binding.missing.length ? [
           "",

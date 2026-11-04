@@ -5,9 +5,11 @@ import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import { parseConfig } from "./config-load.ts";
 import { NetworkSession } from "./network.ts";
-import { assertBinding, bindPath, configLocation, resolvePermissionBinding } from "./paths.ts";
+import { assertBinding, bindPath, configLocation, contains, identity, resolvePermissionBinding, sameIdentity } from "./paths.ts";
 import { freeze, isRuntimeResource, resolveCatalog, survivingRules, type ResolutionContext } from "./policy.ts";
 import type { AccessGrant, NetworkSnapshot, PathBinding, PermissionBinding, PermissionModeConfig, ResolvedCatalog, RuleException } from "./schema.ts";
+
+import { assertWindowsPrivate, createWindowsPrivateDirectory } from "./windows-platform.ts";
 
 export const STATE_FILE = "state-v4.json";
 
@@ -34,8 +36,12 @@ function key(value: unknown, context?: ResolutionContext): string {
     return item;
   });
 }
-function secureFile(file: string, directory: boolean): void {
-  const st = lstatSync(file);
+function secureFile(file: string, directory: boolean, descriptor?: number): void {
+  if (process.platform === "win32") {
+    assertWindowsPrivate(file, directory, descriptor);
+    return;
+  }
+  const st = descriptor === undefined ? lstatSync(file) : fstatSync(descriptor);
   if (st.isSymbolicLink() || (directory ? !st.isDirectory() : !st.isFile()) || (process.getuid && st.uid !== process.getuid()) || st.mode & 0o077)
     throw new Error(`Permission state must be private and owned by this user: ${file}`);
 }
@@ -55,7 +61,8 @@ function savedBinding(binding: PathBinding, restore = true): void {
     throw new Error("Invalid saved path binding");
   if (restore) {
     const current = bindPath(binding.lexical);
-    if (current.canonical !== binding.canonical || (!binding.missing.length && current.identity.type !== binding.identity.type))
+    const materialized = process.platform === "win32" && binding.missing.length > 0 && contains(binding, current, "file");
+    if ((current.canonical !== binding.canonical && !materialized) || (!binding.missing.length && current.identity.type !== binding.identity.type))
       throw new Error(`Saved path target changed: ${binding.lexical}`);
     Object.assign(binding, current);
     assertBinding(binding);
@@ -66,10 +73,18 @@ function savedPermissionBinding(binding: PermissionBinding, scope: string, resto
   if (scope !== "file") throw new Error("Invalid saved permission scope");
   shape(binding, ["lexical", "canonical", "parent"]);
   if (!("parent" in binding)) throw new Error("Invalid saved file permission");
+  const originalParent = binding.parent?.canonical;
+  const originalLexical = binding.parent?.lexical;
   savedBinding(binding.parent, restore);
   if ([binding.lexical, binding.canonical].some((p) => typeof p !== "string" || p.includes("\0") || !path.isAbsolute(p)) ||
-    binding.parent.canonical !== path.dirname(binding.canonical) || binding.parent.lexical !== binding.parent.canonical || binding.parent.identity.type !== "directory")
+    originalParent !== path.dirname(binding.canonical) || originalLexical !== originalParent || binding.parent.identity.type !== "directory")
     throw new Error("Invalid saved file permission anchor");
+  if (restore) {
+    binding.canonical = path.join(binding.parent.canonical, path.basename(binding.canonical));
+    binding.parent.lexical = binding.parent.canonical;
+    try { binding.canonical = resolvePermissionBinding(binding).canonical; }
+    catch (error) { throw new Error(`Saved path target changed: ${binding.lexical}`, { cause: error }); }
+  }
 }
 
 /** Validate cache shape without opening obsolete targets; only current policy supplies authority. */
@@ -156,6 +171,7 @@ function validateRecords(grants: AccessGrant[], exceptions: RuleException[], cat
 /** A whole-document lock prevents stale sessions from resurrecting private project grants. */
 export class PermissionStore {
   readonly directory: string;
+  private readonly directoryBinding: PathBinding;
   private sessionGeneration = 0;
   private projectGeneration = 0;
   private binding?: SessionBinding;
@@ -165,10 +181,13 @@ export class PermissionStore {
     const parent = bindPath(configLocation(agentDir));
     this.directory = path.join(parent.canonical, "permissions");
     if (parent.missing.length || parent.lexical !== parent.canonical) throw new Error("Permission agent directory must exist without symlink redirection");
-    try { mkdirSync(this.directory, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    if (process.platform === "win32") createWindowsPrivateDirectory(this.directory);
+    else try { mkdirSync(this.directory, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     secureFile(this.directory, true);
+    this.directoryBinding = bindPath(this.directory);
   }
   private transaction<T>(operation: (document: Document) => { result: T; write?: boolean }, signal?: AbortSignal): T {
+    assertBinding(this.directoryBinding);
     const lock = path.join(this.directory, ".authority.lock");
     let fd: number;
     try { fd = openSync(lock, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
@@ -180,8 +199,15 @@ export class PermissionStore {
       secureFile(this.directory, true);
       let document: Document = { version: 4, sessions: {}, projects: {} };
       try {
-        secureFile(file, false);
-        document = JSON.parse(readFileSync(file, "utf8")) as Document;
+        const entry = lstatSync(file);
+        if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("Permission state must be a nonsymlinked regular file");
+        const input = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          secureFile(file, false, input);
+          document = JSON.parse(readFileSync(input, "utf8")) as Document;
+          if (!sameIdentity(identity(input), identity(file))) throw new Error("Permission state changed while being read");
+          assertBinding(this.directoryBinding);
+        } finally { closeSync(input); }
         shape(document, ["version", "sessions", "projects"]);
         if (document.version !== 4 || !document.sessions || typeof document.sessions !== "object" || Array.isArray(document.sessions) || !document.projects || typeof document.projects !== "object" || Array.isArray(document.projects))
           throw new Error("Unsupported or malformed permission state; explicitly run /perm reset");
@@ -193,8 +219,9 @@ export class PermissionStore {
       if (outcome.write) {
         temporary = path.join(this.directory, `.state-${randomUUID()}.tmp`);
         const out = openSync(temporary, "wx", 0o600);
-        try { writeFileSync(out, `${key(document, this.context)}\n`); fsyncSync(out); } finally { closeSync(out); }
+        try { secureFile(temporary, false, out); writeFileSync(out, `${key(document, this.context)}\n`); fsyncSync(out); } finally { closeSync(out); }
         signal?.throwIfAborted();
+        assertBinding(this.directoryBinding);
         renameSync(temporary, file);
         temporary = undefined;
         try {
@@ -206,9 +233,8 @@ export class PermissionStore {
     } finally {
       if (temporary) { try { unlinkSync(temporary); } catch {} }
       try {
-        const held = fstatSync(fd); closeSync(fd);
-        const current = lstatSync(lock);
-        if (held.dev === current.dev && held.ino === current.ino) unlinkSync(lock);
+        const held = identity(fd); closeSync(fd);
+        if (sameIdentity(held, identity(lock))) unlinkSync(lock);
       } catch { try { closeSync(fd); } catch {} }
     }
   }

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -86,8 +87,11 @@ test("protected session restore binds ID, canonical file, and root; stale projec
       () => new PermissionStore(f.dir).load({ ...binding, file: path.join(f.dir, "copied.jsonl") }, f.project),
       /binding mismatch/,
     );
-    chmodSync(path.join(f.dir, "permissions", STATE_FILE), 0o644);
-    assert.throws(() => new PermissionStore(f.dir).load(binding, f.project), /private/);
+    if (process.platform === "win32") {
+      const result = spawnSync(path.join(process.env.SystemRoot!, "System32", "icacls.exe"), [path.join(f.dir, "permissions", STATE_FILE), "/grant", "*S-1-1-0:R"], { encoding: "utf8", timeout: 3000 });
+      assert.equal(result.status, 0, result.stderr);
+    } else chmodSync(path.join(f.dir, "permissions", STATE_FILE), 0o644);
+    assert.throws(() => new PermissionStore(f.dir).load(binding, f.project), /private|DACL/);
   } finally {
     f.close();
   }

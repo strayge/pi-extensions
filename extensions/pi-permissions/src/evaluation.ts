@@ -1,3 +1,4 @@
+import path from "node:path";
 import { assertBinding, bindFile, contains, resolvePermissionBinding, within } from "./paths.ts";
 import { assertNativeSemantics, isLinux9p } from "./native-semantics.ts";
 import type { Access, FilesystemSnapshot, PathBinding, PermissionBinding, ResolvedRule, RuleAction } from "./schema.ts";
@@ -27,11 +28,12 @@ export function positiveTarget(binding: PermissionBinding | undefined, scope: "f
 function matchesRestriction(rule: ResolvedRule, binding: PathBinding, target: PathBinding): boolean {
   if (!rule.binding) return false;
   if (process.platform === "darwin" && binding.missing.length && target.missing.length && within(binding.prefix, target.canonical)) return true;
-  return contains(rule.binding, target, rule.scope) || (rule.scope === "file" ? rule.binding.lexical === target.lexical : within(rule.binding.lexical, target.lexical));
+  return contains(rule.binding, target, rule.scope) ||
+    contains({ canonical: rule.binding.lexical }, { canonical: target.lexical }, rule.scope);
 }
 function winner(candidates: Candidate[], baseline: boolean): Outcome {
   if (!candidates.length) return { action: baseline ? "allow" : "missing", exceptions: [] };
-  const depth = (boundary: string) => boundary.split("/").filter(Boolean).length;
+  const depth = (boundary: string) => boundary.slice(path.parse(boundary).root.length).split(path.sep).filter(Boolean).length;
   const closest = Math.max(...candidates.map((c) => depth(c.boundary)));
   const winning = candidates.filter((c) => depth(c.boundary) === closest);
   if (winning.some((c) => c.action === "deny")) return { action: "deny", exceptions: [] };

@@ -4,7 +4,8 @@ import path from "node:path";
 import { ApprovalQueue, type ApprovalTask } from "./approval-queue.ts";
 import { grantLimitations, positiveTarget } from "./evaluation.ts";
 import { NetworkSession, type NetAsk } from "./network.ts";
-import { assertBinding, bindFile, bindPath, resolvePermissionBinding, revalidate, within } from "./paths.ts";
+import { WINDOWS_CASE_AUTHORITY, WINDOWS_FILESYSTEM_LIMITATION, WINDOWS_GIT_BASH_NOTICE } from "./windows-runtime.ts";
+import { assertBinding, bindFile, bindPath, contains, resolvePermissionBinding, revalidate } from "./paths.ts";
 import { decide, freeze, resolveCatalog, type ResolutionContext } from "./policy.ts";
 import type { PermissionStore, SavedState } from "./permission-state.ts";
 import type { GlobalMutation, GlobalPolicyWriter, GlobalPreview } from "./policy-write.ts";
@@ -139,15 +140,16 @@ export class PermissionOwner {
   get sessionBlocks(): readonly ResolvedRule[] {
     return freeze([...this.blocks]);
   }
-  snapshot(): FilesystemSnapshot {
+  snapshot(mode = this.mode): FilesystemSnapshot {
+    if (!this.catalog.profiles[mode]) throw new Error(`Unknown profile ${mode}; use /perm to inspect configured profiles`);
     if (this.unavailable) throw new Error(`Filesystem policy unavailable: ${this.unavailable}`);
     assertBinding(this.catalog.root.binding);
     return freeze({
       revision: this.revision,
       root: this.catalog.root,
-      mode: this.mode,
+      mode,
       processMode: this.catalog.config.processMode ?? "compatible",
-      profile: this.catalog.profiles[this.mode]!,
+      profile: this.catalog.profiles[mode]!,
       rules: [...this.catalog.rules, ...this.blocks],
       grants: [...this.grants],
       exceptions: [...this.exceptions],
@@ -219,6 +221,16 @@ export class PermissionOwner {
   warnFilesystemLimitations(): void {
     if (!this.warn || !this.interactive?.() || this.unavailable) return;
     const snapshot = this.snapshot();
+    if (process.platform === "win32") {
+      const scoped = snapshot.profile.kind !== "unrestricted";
+      if (!scoped && !this.network.snapshot().restricted) return;
+      const key = scoped ? "windows:scoped" : "windows:network-only";
+      if (!this.limitationWarnings.has(key)) {
+        this.limitationWarnings.add(key);
+        this.warning([...(scoped ? [WINDOWS_CASE_AUTHORITY, WINDOWS_FILESYSTEM_LIMITATION] : []), WINDOWS_GIT_BASH_NOTICE].join("\n"));
+      }
+      return;
+    }
     if (snapshot.profile.kind === "unrestricted") return;
     const sources = [
       ...snapshot.profile.grants,
@@ -248,6 +260,12 @@ export class PermissionOwner {
 
   private warning(message: string): void {
     try { this.warn?.(message); } catch { /* Reporting cannot undo a committed policy change. */ }
+  }
+
+  /** Runtime consent shares the root's approval lane and cannot survive owner retirement. */
+  async queueRuntimeApproval<T>(operation: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const cancellation = signal ? AbortSignal.any([signal, this.approvalSignal]) : this.approvalSignal;
+    return this.approvalQueue.run(() => { this.snapshot(); cancellation.throwIfAborted(); return operation(cancellation); }, cancellation);
   }
 
   async changeGlobal(mutation: GlobalMutation, signal?: AbortSignal, agentWait = true): Promise<void> {
@@ -389,7 +407,7 @@ export class PermissionOwner {
             assertBinding(selected);
             if (answer.directory && answer.directory !== selected.lexical && answer.directory !== selected.canonical)
               throw new Error("Edited block must match its displayed directory");
-            if (!within(selected.canonical, frozen.canonical))
+            if (!contains(selected, frozen))
               throw new Error("Edited directory must contain the requested target");
             if (!selected.missing.length && selected.identity.type !== "directory")
               throw new Error("Session directory blocks require a directory scope");
@@ -431,7 +449,7 @@ export class PermissionOwner {
             throw new Error("Edited approval must retain its pre-confirmation identity");
           let binding = answer.binding ?? frozen;
           assertBinding(binding);
-          if (!within(binding.canonical, frozen.canonical))
+          if (!contains(binding, frozen))
             throw new Error("Edited directory must contain the requested target");
           if (!binding.missing.length && binding.identity.type !== "directory")
             throw new Error("Access grants require a directory");

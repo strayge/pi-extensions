@@ -1,7 +1,7 @@
 import path from "node:path";
 import { DynamicBorder, ExtensionInputComponent, getSelectListTheme, keyHint, rawKeyHint, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { bindPath, modelPath, within } from "./paths.ts";
+import { bindPath, contains, modelPath } from "./paths.ts";
 import { approvalDialogOptions } from "./input-dialog.ts";
 import type { Access, PathBinding } from "./schema.ts";
 
@@ -91,7 +91,7 @@ export async function editDirectoryScope(ctx: ExtensionContext, requested: strin
     }
     if (!selected) return undefined;
     const binding = bindPath(manualEntry && selected !== current ? modelPath(selected, ctx.cwd) : selected);
-    if (!within(binding.canonical, requested)) throw new Error("Edited directory must contain the requested target");
+    if (!contains(binding, { canonical: requested })) throw new Error("Edited directory must contain the requested target");
     if (!binding.missing.length && binding.identity.type !== "directory") throw new Error("Directory scope requires a directory");
     return binding;
   } finally {

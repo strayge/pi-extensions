@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -24,10 +24,10 @@ import permissionExtension, { type PermissionBridgeRequest } from "./index.ts";
 import { bindPath } from "./paths.ts";
 import { resolveCatalog } from "./policy.ts";
 import { GlobalPolicyWriter } from "./policy-write.ts";
-import { runtime } from "./sandbox.ts";
+import { runtime as permissionRuntime } from "./sandbox.ts";
 
 /** Real Pi loading and tool dispatch need no provider request or personal policy edits. */
-test("isolated SDK child keeps inherited direct and shell enforcement and sees parent grant/revoke", async () => {
+test("isolated SDK child keeps inherited direct and shell enforcement and sees parent grant/revoke", async (t) => {
   initTheme("dark");
   const dir = mkdtempSync(path.join(tmpdir(), "permission-sdk-"));
   const project = path.join(dir, "project");
@@ -64,7 +64,7 @@ test("isolated SDK child keeps inherited direct and shell enforcement and sees p
     resourceLoader: loader,
     settingsManager: SettingsManager.inMemory(),
     sessionManager: SessionManager.inMemory(outside),
-    tools: ["read", "bash"],
+    tools: process.platform === "win32" ? ["read", "bash", "powershell"] : ["read", "bash"],
   });
   try {
     await session.bindExtensions({});
@@ -78,8 +78,21 @@ test("isolated SDK child keeps inherited direct and shell enforcement and sees p
     owner.ask = async () => undefined;
     const result = await read.execute("allowed", { path: "sentinel" });
     assert.match(JSON.stringify(result.content), /shared-live-grant/);
-    const shellResult = await bash.execute("shell-allowed", { command: "cat sentinel", timeout: 10 });
-    assert.match(JSON.stringify(shellResult.content), /shared-live-grant/);
+    const nativeShell = { skip: process.platform === "win32" && process.env.PI_NATIVE_WINDOWS_MXC !== "1" ? "Native MXC/Bash requires PI_NATIVE_WINDOWS_MXC=1 and a compatible installed executor" : false };
+    const prepareParent = () => permissionRuntime.prepareWindows({ id: owner.id, network: () => owner.network.snapshot(), decideHost: async () => false,
+      decideHostWithRevision: (host, port, signal) => owner.network.decideWithRevision(host, port, owner.askNetwork, signal) }, { agentDir, project: root.binding, signal: owner.approvalSignal });
+    await t.test("native inherited Bash uses the parent's prepared executor and live grant", nativeShell, async () => {
+      if (process.platform === "win32") await prepareParent();
+      const shellResult = await bash.execute("shell-allowed", { command: "cat sentinel", timeout: 10 });
+      assert.match(JSON.stringify(shellResult.content), /shared-live-grant/);
+    });
+    await t.test("native inherited PowerShell preserves read-only parent authority", { skip: process.platform !== "win32" || process.env.PI_NATIVE_WINDOWS_MXC !== "1" ? "Native Windows MXC requires PI_NATIVE_WINDOWS_MXC=1" : false }, async () => {
+      await prepareParent(); const powershell = session.agent.state.tools.find((tool) => tool.name === "powershell")!; assert.ok(powershell);
+      assert.match(JSON.stringify((await powershell.execute("native-read", { command: "Get-Content -LiteralPath sentinel", timeout: 10 })).content), /shared-live-grant/);
+      const denied = await powershell.execute("native-readonly", { command: "[IO.File]::WriteAllText((Join-Path $PWD sentinel), 'changed')", timeout: 10 });
+      assert.match(JSON.stringify(denied.content), /Command exited with code/);
+      assert.equal(readFileSync(path.join(outside, "sentinel"), "utf8"), "shared-live-grant");
+    });
     owner.revoke();
     await assert.rejects(read.execute("revoked", { path: "sentinel" }), /denied/);
     await assert.rejects(bash.execute("shell-revoked", { command: "cat sentinel" }), /denied/);
@@ -88,7 +101,9 @@ test("isolated SDK child keeps inherited direct and shell enforcement and sees p
     owner.ask = async () => undefined;
     assert.equal(owner.snapshot().grants.length, 0);
     assert.match(JSON.stringify((await read.execute("global", { path: "sentinel" })).content), /shared-live-grant/);
-    assert.match(JSON.stringify((await bash.execute("global-shell", { command: "cat sentinel", timeout: 10 })).content), /shared-live-grant/);
+    await t.test("native inherited Bash observes globally published parent authority", nativeShell, async () => {
+      assert.match(JSON.stringify((await bash.execute("global-shell", { command: "cat sentinel", timeout: 10 })).content), /shared-live-grant/);
+    });
     owner.ask = async () => ({ action: "block" });
     await assert.rejects(owner.requestDirectory(outside, "read", "parent session block"), /blocked/);
     owner.ask = async () => assert.fail("Children must use the root's live denial without another dialog");
@@ -114,7 +129,7 @@ test("isolated SDK child keeps inherited direct and shell enforcement and sees p
   } finally {
     await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
     // This fixture supplies the parent owner; child shutdown does not retire its runtime.
-    await runtime.shutdown(owner.id);
+    await permissionRuntime.shutdown(owner.id);
     session.dispose();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -153,7 +168,8 @@ test("Pi's actual extension loader keeps stock tools usable when root policy ini
   }
 });
 
-test("real loader refreshes runtime resources on reload and restores pathname grants after a fresh root", async () => {
+test("real loader refreshes runtime resources on reload and restores pathname grants after a fresh root", async (t) => {
+  if (process.platform === "win32" && process.env.PI_NATIVE_WINDOWS_MXC !== "1") t.mock.method(permissionRuntime, "prepareWindows", async () => {});
   const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-restart-sdk-"))).canonical;
   const project = path.join(dir, "project"); const outside = path.join(dir, "outside");
   const agentDir = path.join(dir, "agent"); const piPackage = path.join(dir, "pi-runtime");
@@ -161,6 +177,7 @@ test("real loader refreshes runtime resources on reload and restores pathname gr
   const entry = path.join(piPackage, "cli.js");
   const manifest = JSON.stringify({ name: "@earendil-works/pi-coding-agent" });
   writeFileSync(entry, ""); writeFileSync(path.join(piPackage, "package.json"), manifest);
+  writeFileSync(path.join(project, "credential"), "secret");
   const config = defaultConfig(); config.pathRules = [{ path: "credential", scope: "file", read: "deny" }];
   config.modes.project!.filesystem = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: ["pi"] };
   config.modes.subproject = config.modes.project!;
@@ -212,7 +229,8 @@ test("real loader refreshes runtime resources on reload and restores pathname gr
   }
 });
 
-test("real root SDK session switches retire child leases and cannot inherit session grants", async () => {
+test("real root SDK session switches retire child leases and cannot inherit session grants", async (t) => {
+  if (process.platform === "win32" && process.env.PI_NATIVE_WINDOWS_MXC !== "1") t.mock.method(permissionRuntime, "prepareWindows", async () => {});
   const dir = mkdtempSync(path.join(tmpdir(), "permission-root-sdk-"));
   const project = path.join(dir, "project"); const outside = path.join(dir, "outside"); const agentDir = path.join(dir, "agent");
   for (const value of [project, outside, agentDir]) mkdirSync(value, { mode: 0o700 });

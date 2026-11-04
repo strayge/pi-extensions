@@ -22,19 +22,21 @@ test("strict v3 overrides reject duplicate rules and invalid shapes and normaliz
   assert.ok(!new RegExp(schema.$defs.paths.items.pattern).test("a\0b"));
 });
 
-test("macOS defaults include writable var/folders without overriding explicit filesystem scopes", () => {
+test("platform temporary defaults do not override explicit filesystem scopes", () => {
   const config = defaultConfig();
   for (const name of ["project", "subproject"]) {
     const filesystem = config.modes[name]!.filesystem;
     assert.equal(filesystem.kind, "scoped");
     if (filesystem.kind !== "scoped") assert.fail("Expected a scoped default profile");
-    assert.ok(filesystem.readWrite.includes("/tmp"));
+    assert.ok(filesystem.readWrite.includes(process.platform === "win32" ? tmpdir() : "/tmp"));
     assert.equal(filesystem.readWrite.includes("/var/folders"), process.platform === "darwin");
   }
   assert.deepEqual(config.modes.yolo!.filesystem, { kind: "unrestricted" });
   const scoped = { kind: "scoped", readOnly: [], readWrite: ["."], resourceReads: [] };
   const explicit = mergeConfig(config, { version: 3, modes: { project: { filesystem: scoped } } });
   assert.deepEqual(explicit.modes.project!.filesystem, scoped);
+  const posix = { ...scoped, readWrite: ["/tmp"] };
+  assert.deepEqual(mergeConfig(config, { version: 3, modes: { project: { filesystem: posix } } }).modes.project!.filesystem, posix);
 });
 
 test("process mode defaults to compatible, accepts strict, and remains optional", () => {

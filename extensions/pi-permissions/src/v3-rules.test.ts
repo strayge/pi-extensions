@@ -166,6 +166,7 @@ test("macOS rejects stale positive regions after profile generation without bann
 test("Linux argument generation constructs exception destinations before sealing masks and before private facilities", async () => {
   const f = fixture();
   const module = await import(new URL("./sandbox/linux-sandbox-utils.js", import.meta.resolve("@anthropic-ai/sandbox-runtime")).href);
+  const { quote } = await import(new URL("./utils/shell-quote.js", import.meta.resolve("@anthropic-ai/sandbox-runtime")).href);
   try {
     f.config.pathRules.push({ path: "private/notes.txt", scope: "file", write: "allow" });
     const policy = compileFilesystem(f.owner().snapshot()).explicitPolicy!;
@@ -175,15 +176,15 @@ test("Linux argument generation constructs exception destinations before sealing
       readConfig: { denyOnly: [], allowWithinDeny: [], explicitPolicy: policy },
       writeConfig: { allowOnly: [], denyWithinAllow: [], explicitPolicy: policy },
     });
-    const mask = `--tmpfs ${path.dirname(f.file)}`;
-    const leaf = `--bind-fd ${policy.sourceFds[f.file]} ${f.file}`;
-    const seal = `--remount-ro ${path.dirname(f.file)}`;
+    const mask = `--tmpfs ${quote([path.dirname(f.file)])}`;
+    const leaf = `--bind-fd ${policy.sourceFds[f.file]} ${quote([f.file])}`;
+    const seal = `--remount-ro ${quote([path.dirname(f.file)])}`;
     assert.ok(generated.includes(mask), generated);
     assert.ok(generated.indexOf(leaf) > generated.indexOf(mask), generated);
     assert.ok(generated.indexOf(seal) > generated.indexOf(leaf), generated);
     assert.ok(generated.indexOf("--dev /dev") > generated.indexOf(seal), generated);
     assert.ok(generated.indexOf("--proc /proc") > generated.indexOf(seal), generated);
-    assert.ok(!generated.includes(`--bind-fd ${policy.sourceFds[path.dirname(f.file)]} ${path.dirname(f.file)}`));
+    assert.ok(!generated.includes(`--bind-fd ${policy.sourceFds[path.dirname(f.file)]} ${quote([path.dirname(f.file)])}`));
   } finally { module.cleanupBwrapMountPoints(); f.close(); }
 });
 

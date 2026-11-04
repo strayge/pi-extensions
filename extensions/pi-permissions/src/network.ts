@@ -4,6 +4,7 @@ import type { NetworkPolicy, NetworkSnapshot } from "./schema.ts";
 
 export type NetAskResult = "allow-session" | "allow-forever" | "deny" | "dismiss";
 export type NetAsk = (host: string, port?: number, signal?: AbortSignal) => Promise<NetAskResult>;
+export interface NetworkVerdict { allow: boolean; revision: number }
 export const matchesDomainPattern = domainMatches;
 export function isHostAllowed(host: string, patterns: Iterable<string>): boolean {
   return [...patterns].some((p) => domainMatches(host, p));
@@ -12,7 +13,7 @@ export function isHostAllowed(host: string, patterns: Iterable<string>): boolean
 /** Every proxied connection consults current state; old prompt answers cannot undo a newer denial. */
 export class NetworkSession {
   private current: NetworkSnapshot;
-  private readonly pending = new Map<string, Promise<boolean>>();
+  private readonly pending = new Map<string, Promise<NetworkVerdict>>();
   private readonly persist: (state: NetworkSnapshot) => void;
   private readonly available: () => boolean;
   private readonly queueApproval: <T>(operation: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
@@ -83,33 +84,39 @@ export class NetworkSession {
     this.change({ allowedDomains: [...new Set([...this.current.allowedDomains, ...domains])] });
   }
   async decide(host: string, port?: number, ask?: NetAsk, signal?: AbortSignal): Promise<boolean> {
+    return (await this.decideWithRevision(host, port, ask, signal)).allow;
+  }
+
+  /** The transport must reject stale allows rather than relabel them with a later policy revision. */
+  async decideWithRevision(host: string, port?: number, ask?: NetAsk, signal?: AbortSignal): Promise<NetworkVerdict> {
+    const verdict = (allow: boolean): NetworkVerdict => ({ allow, revision: this.current.revision });
     signal?.throwIfAborted();
-    if (!this.available()) return false;
-    if (!this.current.restricted) return true;
+    if (!this.available()) return verdict(false);
+    if (!this.current.restricted) return verdict(true);
     const normalized = normalizeDomain(host);
-    if (!normalized || normalized.startsWith("*.")) return false;
+    if (!normalized || normalized.startsWith("*.")) return verdict(false);
     host = normalized;
-    if (isHostAllowed(host, this.current.deniedDomains)) return false;
-    if (isHostAllowed(host, this.current.allowedDomains)) return true;
-    if (!ask) return false;
+    if (isHostAllowed(host, this.current.deniedDomains)) return verdict(false);
+    if (isHostAllowed(host, this.current.allowedDomains)) return verdict(true);
+    if (!ask) return verdict(false);
     let pending = this.pending.get(host);
     if (!pending) {
       pending = this.queueApproval(async () => {
         signal?.throwIfAborted();
-        if (!this.available()) return false;
-        if (!this.current.restricted) return true;
-        if (isHostAllowed(host, this.current.deniedDomains)) return false;
-        if (isHostAllowed(host, this.current.allowedDomains)) return true;
+        if (!this.available()) return verdict(false);
+        if (!this.current.restricted) return verdict(true);
+        if (isHostAllowed(host, this.current.deniedDomains)) return verdict(false);
+        if (isHostAllowed(host, this.current.allowedDomains)) return verdict(true);
         const revision = this.current.revision;
         const answer = await ask(host, port, signal);
         signal?.throwIfAborted();
-        if (!this.available() || this.current.revision !== revision) return false;
+        if (!this.available() || this.current.revision !== revision) return verdict(false);
         if (answer === "allow-session" || answer === "allow-forever") {
           this.grant([host]);
-          return true;
+          return verdict(true);
         }
         if (answer === "deny") this.change({ deniedDomains: [...new Set([...this.current.deniedDomains, host])] });
-        return false;
+        return verdict(false);
       }, signal).finally(() => this.pending.delete(host));
       this.pending.set(host, pending);
     }

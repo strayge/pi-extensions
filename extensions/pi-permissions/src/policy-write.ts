@@ -7,6 +7,8 @@ import { assertBinding, bindPath, configLocation, configPath, contains, identity
 import { decide, positiveTarget, resolveCatalog, type ResolutionContext } from "./policy.ts";
 import type { Access, FileIdentity, FilesystemSnapshot, PathRule, PermissionBinding, ResolvedCatalog } from "./schema.ts";
 
+import { assertWindowsPrivate } from "./windows-platform.ts";
+
 export type GlobalMutation = { kind: "save"; binding: PermissionBinding; access: Access; scope: "file" | "tree" } | { kind: "revoke"; id: string } | { kind: "clear" };
 export interface GlobalPreview { title: string; message: string }
 interface FileVersion { bytes?: string; identity?: FileIdentity }
@@ -35,17 +37,23 @@ export class GlobalPolicyWriter {
   private checkDirectory(): void {
     assertBinding(this.directory);
     const st = lstatSync(this.directory.canonical);
-    if (this.directory.missing.length || this.directory.lexical !== this.directory.canonical || !st.isDirectory() || st.mode & 0o077 || (process.getuid && st.uid !== process.getuid()))
+    if (process.platform === "win32") assertWindowsPrivate(this.directory.canonical, true);
+    if (this.directory.missing.length || this.directory.lexical !== this.directory.canonical || !st.isDirectory() || (process.platform !== "win32" && (st.mode & 0o077 || (process.getuid && st.uid !== process.getuid()))))
       throw new Error("Global policy directory must be private, user-owned and nonsymlinked");
   }
   private capture(): FileVersion {
     this.checkDirectory();
     let fd: number;
-    try { fd = openSync(this.file, constants.O_RDONLY | constants.O_NOFOLLOW); }
+    try {
+      const entry = lstatSync(this.file);
+      if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("Global policy must be a nonsymlinked regular file");
+      fd = openSync(this.file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return {}; throw error; }
     try {
       const st = fstatSync(fd);
-      if (!st.isFile() || st.mode & 0o077 || (process.getuid && st.uid !== process.getuid())) throw new Error("Global policy must be a private user-owned regular file");
+      if (process.platform === "win32") assertWindowsPrivate(this.file, false, fd);
+      if (!st.isFile() || (process.platform !== "win32" && (st.mode & 0o077 || (process.getuid && st.uid !== process.getuid())))) throw new Error("Global policy must be a private user-owned regular file");
       const pinned = identity(fd);
       const bytes = readFileSync(fd, "utf8");
       if (!sameIdentity(identity(this.file), pinned)) throw new Error("Global policy changed while being read");
@@ -168,7 +176,7 @@ export class GlobalPolicyWriter {
       const catalog = resolveCatalog(prepared.catalog.config, prepared.catalog.root, this.context, prepared.catalog);
       temporary = path.join(this.directory.canonical, `.policy-${randomUUID()}.tmp`);
       const out = openSync(temporary, "wx", 0o600);
-      try { writeFileSync(out, `${JSON.stringify(prepared.document, null, 2)}\n`); fsyncSync(out); } finally { closeSync(out); }
+      try { if (process.platform === "win32") assertWindowsPrivate(temporary, false, out); writeFileSync(out, `${JSON.stringify(prepared.document, null, 2)}\n`); fsyncSync(out); } finally { closeSync(out); }
       signal?.throwIfAborted();
       checkRevision(prepared.revision);
       this.checkDirectory();

@@ -44,7 +44,7 @@
     "check": "biome check . && tsc --noEmit && npm test",
     "format": "biome check --write .",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types src/*.test.ts"
+    "test": "node --experimental-strip-types scripts/run-tests.ts"
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.73",

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { prepareWindowsComparison, windowsSystemResources } from "./windows-platform.ts";
 import { macExecutableFiles } from "./macos.ts";
 import { automaticWorktreeGrants } from "./worktree.ts";
 import { assertBinding, bindFile, bindPath, configPath, resolvePermissionBinding, within } from "./paths.ts";
@@ -110,7 +111,7 @@ export function isRuntimeResource(grant: ResourceGrant, context: ResolutionConte
 export function automaticResources(selectors: ("pi" | "system")[], context: ResolutionContext): ResourceGrant[] {
   const paths: string[] = [];
   if (selectors.includes("system")) {
-    const baseline = SYSTEM_PATHS[process.platform];
+    const baseline = SYSTEM_PATHS[process.platform] ?? (process.platform === "win32" ? windowsSystemResources() : undefined);
     if (!baseline) throw new Error(`No system resource baseline for ${process.platform}`);
     paths.push(...baseline);
   }
@@ -197,6 +198,7 @@ export function resolveCatalog(
   previous?: ResolvedCatalog,
 ): ResolvedCatalog {
   assertBinding(root.binding);
+  prepareWindowsComparison();
   const worktreeGrants = previous
     ? previous.worktreeGrants ?? []
     : automaticWorktreeGrants(root.binding);

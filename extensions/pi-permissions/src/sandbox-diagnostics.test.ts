@@ -62,7 +62,7 @@ test("diagnostic formatting suggests only currently grantable normalized hosts",
   assert.equal(formatSandboxDiagnostics(violation("grant.example"), { ...network, restricted: false }), violation("grant.example"));
 });
 
-test("attributed diagnostics remain separate for repeated long commands", async (t) => {
+test("attributed diagnostics remain separate for repeated long commands", { skip: process.platform === "win32" ? "Unix SandboxManager diagnostics; Windows uses native MXC" : false }, async (t) => {
   const directory = mkdtempSync(path.join(tmpdir(), "permission-sandbox-diagnostics-"));
   const ids: string[] = [];
   const commands: string[] = [];
@@ -113,7 +113,7 @@ test("attributed diagnostics remain separate for repeated long commands", async 
   }
 });
 
-test("diagnostics are reported after success, failure, timeout, and cancellation", async (t) => {
+test("diagnostics are reported after success, failure, timeout, and cancellation", { skip: process.platform === "win32" ? "Unix SandboxManager diagnostics; Windows uses native MXC" : false }, async (t) => {
   const directory = mkdtempSync(path.join(tmpdir(), "permission-sandbox-outcomes-"));
   t.mock.method(SandboxManager, "reset", async () => {});
   t.mock.method(SandboxManager, "cleanupAfterCommand", () => {});
@@ -152,7 +152,7 @@ test("diagnostics are reported after success, failure, timeout, and cancellation
   }
 });
 
-test("annotation failures do not change command results or cleanup", async (t) => {
+test("annotation failures do not change command results or cleanup", { skip: process.platform === "win32" ? "Unix SandboxManager diagnostics; Windows uses native MXC" : false }, async (t) => {
   const directory = mkdtempSync(path.join(tmpdir(), "permission-sandbox-best-effort-"));
   let cleaned = 0;
   let annotated = 0;

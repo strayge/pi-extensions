@@ -2,12 +2,15 @@ import { accessSync, closeSync, constants, fstatSync, lstatSync, openSync, readl
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertWindowsPath, windowsPermissionKey } from "./windows-platform.ts";
 import type { FileBinding, FileIdentity, PathBinding, PermissionBinding, RootIdentity } from "./schema.ts";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 
 export function identity(file: string | number): FileIdentity {
   const s = typeof file === "number" ? fstatSync(file, { bigint: true }) : lstatSync(file, { bigint: true });
+  if (process.platform === "win32" && (s.dev === 0n || s.ino === 0n || s.birthtimeNs <= 0n))
+    throw new Error("Windows filesystem returned a placeholder identity");
   return {
     dev: String(s.dev),
     ino: String(s.ino),
@@ -23,9 +26,11 @@ export function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
 /** Resolve components explicitly so ENOENT through a symlink never becomes a creatable tail. */
 export function bindPath(input: string): PathBinding {
   if (!path.isAbsolute(input) || input.includes("\0")) throw new Error("A native absolute path is required");
+  if (process.platform === "win32") assertWindowsPath(input);
   const lexical = path.normalize(input);
   let hops = 0;
   function resolve(absolute: string, throughLink: boolean): { canonical: string; prefix: string; missing: string[] } {
+    if (process.platform === "win32") assertWindowsPath(absolute);
     const parts = absolute.slice(path.parse(absolute).root.length).split(path.sep).filter(Boolean);
     let current = path.parse(absolute).root;
     for (let i = 0; i < parts.length; i++) {
@@ -52,7 +57,7 @@ export function bindPath(input: string): PathBinding {
     const canonical = realpathSync.native(current);
     return { canonical, prefix: canonical, missing: [] };
   }
-  const resolved = resolve(input, false);
+  const resolved = resolve(process.platform === "win32" ? input.replaceAll("/", path.sep) : input, false);
   return { lexical, ...resolved, identity: identity(resolved.prefix) };
 }
 
@@ -62,7 +67,8 @@ export function revalidate(binding: PathBinding, allowCreated = false): boolean 
     if (!sameIdentity(identity(binding.prefix), binding.identity)) return false;
     const current = bindPath(binding.lexical);
     return (
-      current.canonical === binding.canonical &&
+      (current.canonical === binding.canonical || (process.platform === "win32" && binding.missing.length > 0 &&
+        windowsPermissionKey(current.canonical) === windowsPermissionKey(binding.canonical))) &&
       (allowCreated || (current.prefix === binding.prefix && sameIdentity(current.identity, binding.identity)))
     );
   } catch {
@@ -83,7 +89,7 @@ export function refreshWriteBinding(binding: PathBinding): PathBinding {
   }
   assertBinding(binding, true);
   const current = bindPath(binding.lexical);
-  if (current.canonical !== binding.canonical || !current.missing.length)
+  if (!contains(binding, current, "file") || !current.missing.length)
     throw new Error(`Write target changed: ${binding.lexical}`);
   let parent = binding.prefix;
   for (const component of binding.missing.slice(0, binding.missing.length - current.missing.length)) {
@@ -122,21 +128,26 @@ export function resolvePermissionBinding(binding: PermissionBinding, allowCreate
   }
   assertBinding(binding.parent, true);
   const current = bindPath(binding.lexical);
-  if (current.canonical !== binding.canonical || (!current.missing.length && current.identity.type !== "file"))
+  if (!contains(binding, current, "file") || (!current.missing.length && current.identity.type !== "file"))
     throw new Error(`File permission target changed: ${binding.lexical}`);
   assertBinding(binding.parent, true);
   return current;
 }
 
 export function within(root: string, target: string): boolean {
+  // Native realpath supplies existing spelling. JS case folding can equate distinct NTFS Unicode names.
+  if (process.platform === "win32") return root === target || target.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
   const relative = path.relative(root, target);
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-/** Canonical identities preserve native aliases without equating distinct Unicode filenames. */
+/** Policy containment uses verified Windows case families; native identities remain exact. */
 export function contains(root: Pick<PathBinding, "canonical">, target: Pick<PathBinding, "canonical">, scope: "file" | "tree" = "tree"): boolean {
-  if (scope === "file") return root.canonical === target.canonical;
-  return within(root.canonical, target.canonical);
+  if (root.canonical === target.canonical) return true;
+  const key = (value: string) => process.platform === "win32" ? windowsPermissionKey(value) : value;
+  const from = key(root.canonical); const to = key(target.canonical);
+  if (scope === "file") return from === to;
+  return within(from, to);
 }
 
 /** Apple's protected top-level aliases are not user-controlled config redirections. */
@@ -195,6 +206,12 @@ export function configPath(value: string, root: RootIdentity, agentDir: string, 
     home,
   );
   if (path.isAbsolute(expanded)) return bindPath(expanded);
+  if (process.platform === "win32") {
+    const binding = bindPath(path.resolve(root.binding.canonical, expanded));
+    assertBinding(root.binding);
+    assertBinding(binding);
+    return binding;
+  }
   const fd = openSync(root.binding.canonical, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try {
     assertBinding(root.binding);

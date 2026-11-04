@@ -6,7 +6,6 @@ import {
   lstatSync,
   copyFileSync,
   constants,
-  fstatSync,
   unlinkSync,
   existsSync,
   mkdirSync,
@@ -35,13 +34,15 @@ import { approvalUI, networkUI } from "./file-approval.ts";
 import { approvalDialogOptions } from "./input-dialog.ts";
 import { createSearchTools } from "./filtered-search.ts";
 import { normalizeDomain } from "./network.ts";
-import { assertBinding, bindPath, configLocation, modelPath } from "./paths.ts";
+import { assertBinding, bindPath, configLocation, identity, modelPath, sameIdentity } from "./paths.ts";
 import { activePiPackage, resolveCatalog } from "./policy.ts";
 import { PermissionStore, STATE_FILE, type SessionBinding } from "./permission-state.ts";
-import { runtime } from "./sandbox.ts";
+import { runtime, type RuntimeFamily } from "./sandbox.ts";
+import { compileWindowsFilesystem } from "./windows-runtime.ts";
 import { GlobalPolicyWriter } from "./policy-write.ts";
 import { createStatus } from "./status.ts";
 import type { PathBinding } from "./schema.ts";
+import { assertWindowsPrivate, createWindowsPrivateDirectory, prepareWindowsComparison } from "./windows-platform.ts";
 
 interface Attachment {
   owner: PermissionOwner;
@@ -93,6 +94,26 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
     if (inherited) throw new Error("Profile and revocation controls belong to the parent session");
   };
 
+  const runtimeFamily = (active: PermissionOwner): RuntimeFamily => ({
+    id: active.id,
+    network: () => active.network.snapshot(),
+    reportEnforcement: (error?: string) => { active.enforcementError = error; showStatus(); },
+    decideHost: (host, port) => active.reason ? Promise.resolve(false) : active.network.decide(host, port, active.askNetwork),
+    decideHostWithRevision: (host, port, signal) => active.network.decideWithRevision(host, port, active.askNetwork, AbortSignal.any([signal, active.approvalSignal])),
+  });
+  const prepareRuntime = async (active: PermissionOwner, mode?: string, restricted = active.network.snapshot().restricted) => {
+    if (process.platform !== "win32") return;
+    const snapshot = active.snapshot(mode);
+    if (snapshot.profile.kind === "unrestricted" && !restricted) return;
+    if (inherited) throw new Error("Windows executor preparation belongs to the root session");
+    compileWindowsFilesystem(snapshot);
+    await runtime.prepareWindows(runtimeFamily(active), {
+      project: snapshot.root.binding, agentDir, signal: active.approvalSignal,
+      ...(ctx.hasUI ? { approveDownload: (preview, signal) => active.queueRuntimeApproval((signal) => ctx.ui.confirm(preview.title, preview.message, approvalDialogOptions(false, { signal })), signal) } : {}),
+    });
+    active.check(snapshot.revision);
+  };
+
   pi.registerFlag("perm", {
     description: "Filesystem profile (project, subproject, yolo, or a configured name)",
     type: "string",
@@ -139,13 +160,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
               active.check(snapshot.revision);
               for (const target of result.targets) assertBinding(target);
             }
-            const family = {
-              id: active.id,
-              network: () => active.network.snapshot(),
-              reportEnforcement: (error?: string) => { active.enforcementError = error; showStatus(); },
-              decideHost: (host: string, port?: number) =>
-                active.reason ? Promise.resolve(false) : active.network.decide(host, port, active.askNetwork),
-            };
+            const family = runtimeFamily(active);
             const operations = runtime.operations(
               snapshot,
               family,
@@ -154,10 +169,12 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
                 for (const target of targets) assertBinding(target);
               },
               pi.getFlag("no-sandbox") === true,
+              { kind: shell.name === "powershell" ? "powershell" : "bash", path: shell.name === "bash" ? pi.getSettings?.().shellPath : undefined },
             );
             const tool =
               shell.name === "bash"
                 ? createBashToolDefinition(cwd, { operations })
+                : process.platform === "win32" ? createPowerShellToolDefinition(cwd, { operations })
                 : createPowerShellToolDefinition(cwd, {
                     operations: {
                       exec: async (command, executionCwd, options) => {
@@ -274,9 +291,10 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         assertBinding(root);
         if (resetting) assertBinding(resetting.rootIdentity.binding);
         const directory = configLocation(path.join(agentDir, "permissions"));
-        mkdirSync(directory, { recursive: true, mode: 0o700 });
+        if (process.platform === "win32") createWindowsPrivateDirectory(directory);
+        else mkdirSync(directory, { recursive: true, mode: 0o700 });
         if (bindPath(directory).canonical !== directory) throw new Error("Permission setup does not follow directory symlinks");
-        chmodSync(directory, 0o700);
+        if (process.platform !== "win32") chmodSync(directory, 0o700);
         const files = [
           path.join(directory, "config.json"),
           path.join(directory, STATE_FILE),
@@ -284,11 +302,12 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         for (const file of files) {
           const binding = bindPath(file);
           if (binding.canonical !== file || (!binding.missing.length && !lstatSync(file).isFile())) throw new Error(`Permission reset will not copy or replace a symlink or special file: ${file}`);
+          if (process.platform === "win32" && !binding.missing.length) assertWindowsPrivate(file, false);
         }
         const suffix = `.backup-${randomUUID()}`;
         const lock = path.join(directory, ".authority.lock");
         const lockFd = openSync(lock, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-        const heldLock = fstatSync(lockFd);
+        const heldLock = identity(lockFd);
         const temporary = path.join(directory, `.config-${randomUUID()}.tmp`);
         const changed: string[] = [];
         try {
@@ -316,8 +335,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
           try { if (existsSync(temporary)) rmSync(temporary); } catch {}
           try {
             closeSync(lockFd);
-            const current = lstatSync(lock);
-            if (current.dev === heldLock.dev && current.ino === heldLock.ino) unlinkSync(lock);
+            if (sameIdentity(identity(lock), heldLock)) unlinkSync(lock);
           } catch {
             // A completed reset remains committed; an orphan lock blocks subsequent state writes.
             try { closeSync(lockFd); } catch {}
@@ -327,7 +345,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         return;
       }
       const active = getOwner();
-      if (!action || action === "status" || action === "grants" || action === "inspect") ctx.ui.notify(permissionAwareness(active), "info");
+      if (!action || action === "status" || action === "grants" || action === "inspect") ctx.ui.notify(permissionAwareness(active, action === "inspect"), "info");
       else if (action === "clear") {
         if (!rest.length) active.revoke();
         else if (rest.length === 1 && rest[0] === "global") await active.changeGlobal({ kind: "clear" }, undefined, false);
@@ -346,7 +364,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         if ((access !== "read" && access !== "write") || !rest.length)
           throw new Error("Usage: /perm grant read|write <path>");
         await active.requestGrant(modelPath(rest.join(" "), ctx.cwd), access, "User path request", undefined, false);
-      } else active.select(action);
+      } else { await prepareRuntime(active, action); active.select(action); }
       showStatus();
     },
   });
@@ -358,10 +376,11 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
       const active = getOwner();
       const [action, ...domains] = args.trim().split(/\s+/);
       if (!action) ctx.ui.notify(JSON.stringify(active.network.snapshot(), null, 2), "info");
-      else if (action === "open" || action === "restricted" || action === "toggle")
-        active.network.change({
-          restricted: action === "toggle" ? !active.network.snapshot().restricted : action === "restricted",
-        });
+      else if (action === "open" || action === "restricted" || action === "toggle") {
+        const restricted = action === "toggle" ? !active.network.snapshot().restricted : action === "restricted";
+        await prepareRuntime(active, undefined, restricted);
+        active.network.change({ restricted });
+      }
       else if (action === "allow" || action === "deny") {
         const normalized = domains.map((d) => {
           const domain = normalizeDomain(d);
@@ -374,6 +393,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
             deniedDomains: [...new Set([...active.network.snapshot().deniedDomains, ...normalized])],
           });
       } else throw new Error("Usage: /net [open|restricted|toggle|allow <domain>|deny <domain>]");
+      if (process.platform === "win32") active.warnFilesystemLimitations();
       showStatus();
     },
   });
@@ -383,7 +403,8 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
       requireRoot();
       const active = getOwner();
       const order = active.config.cycleOrder;
-      active.select(order[(order.indexOf(active.snapshot().mode) + 1) % order.length]!);
+      const mode = order[(order.indexOf(active.snapshot().mode) + 1) % order.length]!;
+      await prepareRuntime(active, mode); active.select(mode);
       showStatus();
     },
   });
@@ -392,7 +413,9 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
     handler: async () => {
       requireRoot();
       const active = getOwner();
-      active.network.change({ restricted: !active.network.snapshot().restricted });
+      const restricted = !active.network.snapshot().restricted;
+      await prepareRuntime(active, undefined, restricted); active.network.change({ restricted });
+      if (process.platform === "win32") active.warnFilesystemLimitations();
       showStatus();
     },
   });
@@ -444,6 +467,7 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
       startingRoot = prior?.rootIdentity.binding ?? startingRoots.get(retainedKey) ?? bindPath(path.resolve(ctx.cwd));
       startingRoots.set(retainedKey, startingRoot);
       assertBinding(startingRoot);
+      prepareWindowsComparison(true);
       const loaded = loadConfig(agentDir, homedir());
       if (prior && !prior.resetPending) {
         owner = prior;
@@ -502,22 +526,24 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
       }
       const flag = pi.getFlag("perm");
       if (typeof flag === "string" && flag) getOwner().select(flag);
+      await prepareRuntime(owner);
+      if (process.platform === "win32") owner.enforcementError = undefined;
       owner.warnFilesystemLimitations();
       startupError = undefined;
       retainedKey = key();
       retained.set(retainedKey, owner);
     } catch (error) {
-      const failure = String(error);
+      let failure = String(error);
       if (owner) {
         owner.block(failure);
         await owner.drain();
-        await runtime.shutdown(owner.id);
+        await runtime.shutdown(owner.id).catch((error) => { failure += `; runtime cleanup: ${String(error)}`; });
       }
       owner = undefined;
       retained.delete(key());
       startupError = failure;
       ctx.ui.notify(
-        `${startupError}\nPermission policy failed to initialize. Filesystem and network restrictions are disabled. Repair the reported configuration or filesystem boundary, then /reload to restore restrictions.`,
+        `${startupError}\nPermission policy failed to initialize. Filesystem and network restrictions are disabled. ${process.platform === "win32" ? "Repair the configuration, authority boundary, or native executor/MXC availability, then /reload to retry preparation." : "Repair the reported configuration or filesystem boundary, then /reload to restore restrictions."}`,
         "warning",
       );
     }
@@ -550,15 +576,9 @@ export default function permissionExtension(pi: ExtensionAPI, inherited?: Attach
         for (const request of accesses)
           await active.authorize([request.path], request.access, request.source, options.signal, false);
         return active.run([path.resolve(cwd)], "read", "User shell", options.signal, async (snapshot, _targets, signal) => {
-          const family = {
-            id: active.id,
-            network: () => active.network.snapshot(),
-            reportEnforcement: (error?: string) => { active.enforcementError = error; showStatus(); },
-            decideHost: (host: string, port?: number) =>
-              active.reason ? Promise.resolve(false) : active.network.decide(host, port, active.askNetwork),
-          };
+          const family = runtimeFamily(active);
           return runtime
-            .operations(snapshot, family, () => active.check(snapshot.revision), pi.getFlag("no-sandbox") === true)
+            .operations(snapshot, family, () => active.check(snapshot.revision), pi.getFlag("no-sandbox") === true, { kind: "bash", path: pi.getSettings?.().shellPath })
             .exec(command, cwd, { ...options, signal });
         }, false);
       },

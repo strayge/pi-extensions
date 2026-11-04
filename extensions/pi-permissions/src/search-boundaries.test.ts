@@ -10,19 +10,24 @@ import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PermissionOwner } from "./approvals.ts";
 import { defaultConfig } from "./config-load.ts";
-import { createSearchTools } from "./filtered-search.ts";
+import { createSearchTools as searchTools, grepBytes } from "./filtered-search.ts";
+import { discoverWindowsRipgrep } from "./windows-grep.ts";
 import { macRipgrep } from "./macos.ts";
 import { bindPath } from "./paths.ts";
 import { resolveCatalog } from "./policy.ts";
+
+/** Byte-matcher injection keeps walker tests independent of native MXC installation. */
+const createSearchTools: typeof searchTools = (owner, cwd) => searchTools(owner, cwd, process.platform === "win32" ? grepBytes : undefined);
 
 function fixture() {
   const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-ignore-"))).canonical;
   const project = path.join(dir, "project"); mkdirSync(project);
   const previousCwd = process.cwd(); process.chdir(project);
-  const home = process.env.HOME; const xdg = process.env.XDG_CONFIG_HOME;
+  const home = process.env.HOME; const profile = process.env.USERPROFILE; const xdg = process.env.XDG_CONFIG_HOME;
+  if (process.platform === "win32") process.env.USERPROFILE = dir;
   process.env.HOME = dir; process.env.XDG_CONFIG_HOME = path.join(dir, ".config");
   const put = (file: string, content: string) => { const target = path.join(dir, file); mkdirSync(path.dirname(target), { recursive: true }); writeFileSync(target, content); };
-  put(".gitconfig", `[core]\n excludesFile = ${path.join(dir, "global.ignore")}\n`);
+  put(".gitconfig", `[core]\n excludesFile = ${path.join(dir, "global.ignore").split(path.sep).join("/")}\n`);
   put("global.ignore", "/global-drop.txt\n");
   put(".gitignore", "parent-drop.txt\n");
   put("project/.git", "gitdir: ../metadata/worktrees/branch\n");
@@ -49,6 +54,7 @@ function fixture() {
     },
     close: () => {
     if (home === undefined) delete process.env.HOME; else process.env.HOME = home;
+    if (profile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = profile;
     if (xdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = xdg;
     process.chdir(previousCwd);
     rmSync(dir, { recursive: true, force: true });
@@ -62,10 +68,10 @@ test("Gitfile/common-dir exclusions and anchored global rules respect nested rep
     const owner = f.owner(); const [, grep] = createSearchTools(() => owner, f.project);
     const actual = text(await grep.execute("search", { pattern: "needle" }, undefined, undefined, f.ctx))
       .split("\n").filter((line) => line.endsWith(":1: needle")).map((line) => line.slice(0, -10)).sort();
-    const rg = process.platform === "darwin" ? macRipgrep() : "/usr/bin/rg";
+    const rg = process.platform === "darwin" ? macRipgrep() : process.platform === "win32" ? discoverWindowsRipgrep(bindPath(f.project)).canonical : "/usr/bin/rg";
     const native = spawnSync(rg, ["--no-config", "--hidden", "-l", "needle", "."], { encoding: "utf8", cwd: f.project });
     assert.equal(native.status, 0, native.stderr);
-    const expected = native.stdout.trim().split("\n").map((file) => path.relative(f.project, file)).sort();
+    const expected = native.stdout.trim().split("\n").map((file) => path.relative(f.project, file).split(path.sep).join("/")).sort();
     assert.deepEqual(actual, expected);
     assert.ok(!actual.includes("global-drop.txt")); assert.ok(actual.includes("nested/global-drop.txt"));
     assert.ok(actual.includes("nested/nested-drop.txt")); assert.ok(actual.includes("nested/common-drop.txt"));
@@ -74,7 +80,7 @@ test("Gitfile/common-dir exclusions and anchored global rules respect nested rep
       .split("\n").filter((line) => line.endsWith(":1: needle")).map((line) => line.slice(0, -10)).sort();
     const nativeInside = spawnSync(rg, ["--no-config", "--hidden", "-l", "needle", nested], { encoding: "utf8", cwd: f.project });
     assert.equal(nativeInside.status, 0, nativeInside.stderr);
-    assert.deepEqual(inside, nativeInside.stdout.trim().split("\n").map((file) => path.relative(nested, file)).sort());
+    assert.deepEqual(inside, nativeInside.stdout.trim().split("\n").map((file) => path.relative(nested, file).split(path.sep).join("/")).sort());
   } finally { f.close(); }
 });
 

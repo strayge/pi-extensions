@@ -14,6 +14,7 @@ import { PermissionStore, STATE_FILE } from "./permission-state.ts";
 import { decide, resolveCatalog } from "./policy.ts";
 import { compileFilesystem, RuntimeCoordinator } from "./sandbox.ts";
 import { automaticWorktreeGrants } from "./worktree.ts";
+import { createWindowsPrivateDirectory } from "./windows-platform.ts";
 
 function fixture(mainName = "main") {
   const dir = bindPath(mkdtempSync(path.join(tmpdir(), "permission-worktree-"))).canonical;
@@ -189,7 +190,9 @@ test("Pi's actual loader initializes automatic worktree access without UI or per
   const agentDir = path.join(f.dir, "agent");
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
   try {
-    mkdirSync(agentDir, { mode: 0o700 }); mkdirSync(path.join(agentDir, "permissions"), { mode: 0o700 });
+    mkdirSync(agentDir, { mode: 0o700 });
+    if (process.platform === "win32") createWindowsPrivateDirectory(path.join(agentDir, "permissions"));
+    else mkdirSync(path.join(agentDir, "permissions"), { mode: 0o700 });
     writeFileSync(path.join(agentDir, "permissions", "config.json"), JSON.stringify(f.config), { mode: 0o600 });
     process.env.PI_CODING_AGENT_DIR = agentDir;
     const loader = new DefaultResourceLoader({

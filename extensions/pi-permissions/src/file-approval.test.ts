@@ -8,8 +8,11 @@ import type { ApprovalRequest } from "./approvals.ts";
 import { approvalUI, networkUI } from "./file-approval.ts";
 import { approvalDialogOptions } from "./input-dialog.ts";
 import { bindPath, revalidate } from "./paths.ts";
+import { prepareWindowsComparison } from "./windows-platform.ts";
+import { WINDOWS_CASE_AUTHORITY, WINDOWS_FILESYSTEM_LIMITATION } from "./windows-runtime.ts";
 
 function fixture(t: { after: (cleanup: () => void) => void }) {
+  prepareWindowsComparison();
   const root = bindPath(mkdtempSync(path.join(tmpdir(), "permission-approval-ui-"))).canonical;
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const directory = path.join(root, "directory");
@@ -28,6 +31,10 @@ function context(cwd: string, ui: Partial<ExtensionContext["ui"]>): ExtensionCon
   } } as ExtensionContext;
 }
 
+const fileScope = process.platform === "win32" ? "File-name family only (nonrecursive)" : "This file only";
+const treeScope = process.platform === "win32" ? "Directory-name family and all descendants" : "Directory and all descendants";
+const protection = process.platform === "win32" ? "Windows nested shell restrictions are best-effort only." : "More-specific restrictions remain protected.";
+const windowsQualifier = process.platform === "win32" ? `\n\nWindows authority\n${WINDOWS_CASE_AUTHORITY}\n${WINDOWS_FILESYSTEM_LIMITATION}` : "";
 const directoryOptions = ["Allow for this session", "Remember for this project", "Save globally", "Edit directory scope", "Deny and block for this session", "Deny"];
 
 test("directory approval chooses scope and lifetime in one menu", async (t) => {
@@ -38,7 +45,7 @@ test("directory approval chooses scope and lifetime in one menu", async (t) => {
       select: async (title, options) => {
         prompts++;
         assert.deepEqual(options, directoryOptions);
-        assert.equal(title, `Directory access · Read/write\n\nPath    ${f.directory}\nScope   Directory and all descendants\n\nReason\n${f.request.reason}\n\nNote: Blocking write access does not block reads.\n      Reads still require permission.\n\nSave globally\nApplies to all scoped profiles and projects.\nMore-specific restrictions remain protected.`);
+        assert.equal(title, `Directory access · Read/write\n\nPath    ${f.directory}\nScope   ${treeScope}\n\nReason\n${f.request.reason}\n\nNote: Blocking write access does not block reads.\n      Reads still require permission.\n\nSave globally\nApplies to all scoped profiles and projects.\n${protection}${windowsQualifier}`);
         return choice;
       },
     }));
@@ -193,7 +200,7 @@ test("exact-file approval offers global saving without widening the scope", asyn
   const ask = approvalUI(() => context(f.root, {
     select: async (title, options) => {
       assert.ok(title.startsWith("File access · Read/write\n\n"));
-      assert.ok(title.includes("Scope   This file only"));
+      assert.ok(title.includes(`Scope   ${fileScope}`));
       assert.deepEqual(options, ["Allow for this session", "Remember for this project", "Save globally", "Deny and block for this session", "Deny"]);
       return "Save globally";
     },
@@ -207,7 +214,7 @@ test("global file approval displays the canonical target when the requested path
   writeFileSync(file, "NOTE"); symlinkSync(file, alias);
   const ask = approvalUI(() => context(f.root, {
     select: async (title) => {
-      assert.ok(title.includes(`Path    ${alias}\nTarget  ${file}\nScope   This file only`));
+      assert.ok(title.includes(`Path    ${alias}\nTarget  ${file}\nScope   ${fileScope}`));
       assert.ok(title.includes("Save globally\nApplies to all scoped profiles and projects."));
       return "Save globally";
     },
@@ -238,7 +245,7 @@ test("explicit session blocking shows scope and denial semantics without selecti
     const ask = approvalUI(() => context(f.root, {
       select: async (title, options) => {
         assert.ok(options.includes("Deny and block for this session"));
-        assert.ok(title.includes(`Scope   ${scope === "file" ? "This file only" : "Directory and all descendants"}`));
+        assert.ok(title.includes(`Scope   ${scope === "file" ? fileScope : treeScope}`));
         assert.ok(title.includes(access === "read" ? "Blocking read access also blocks writes" : "Blocking write access does not block reads"));
         return "Deny and block for this session";
       },
