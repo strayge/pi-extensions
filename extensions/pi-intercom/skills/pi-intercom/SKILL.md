@@ -13,6 +13,20 @@ Use this skill when you need to coordinate work across multiple pi sessions
 running on the same machine. Pi-intercom enables direct 1:1 messaging between
 sessions for delegation, context sharing, and collaborative workflows.
 
+## Pool boundaries
+
+Discovery and routing are limited to the current pool. New sessions default to
+**the launching wmux workspace**, or **the current directory outside wmux**.
+Children inherit the parent's pool, even in a different worktree. Do not guess a
+parent from a machine-wide session name: list the current pool and use its exact
+session ID, or use `contact_supervisor` when available.
+
+`/intercom-pool` shows the pool; `/intercom-pool <name>` changes it.
+`/intercom-pool default` explicitly joins the shared global pool. Both peers must
+join that pool for cross-workspace/cross-directory communication; this is not an
+all-pools bypass. An explicit `PI_INTERCOM_SCOPE_ID` overrides automatic selection
+(an empty value selects global). Pool choices survive reloads.
+
 When you are supervising `pi-subagents`, delegated child agents can escalate to
 you via `contact_supervisor` if `pi-subagents` supplied child bridge metadata.
 This skill covers how to handle those orchestrator-side escalations.
@@ -71,7 +85,7 @@ Before sending, verify who's connected:
 
 ```typescript
 intercom({ action: "list" })
-// → Shows all connected sessions with names, cwd, models, live status, and
+// → Shows connected sessions in the current pool with names, cwd, models, live status, and
 //   current Herdr workspace/tab/pane (or explicit not-hosted/unavailable state)
 ```
 
@@ -130,8 +144,9 @@ intercom({
 
 ### Pattern 6: Cross-Codebase Peer Messages
 
-Use `to` alone to message any explicit live peer on the machine, even when it is
-in another codebase. Use `cwd` alone when there should be exactly one live peer
+Use `to` alone to message an explicit live peer in the current pool, even when it is
+in another codebase. Cross-workspace peers (or different directories outside wmux)
+need an explicitly shared pool first. Use `cwd` alone when there should be exactly one live peer
 in that repo. Use `to` plus `cwd` when the directory is a safety guard.
 
 ```typescript
@@ -255,7 +270,7 @@ new visible project panes should go through the supervisor.
 | `ask` | Blocks until reply (10 min default, configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`) | You need an answer to continue |
 | `reply` | Responds to the active or pending inbound ask | You were asked something and need to answer naturally |
 | `pending` | Lists unresolved inbound asks | You need to see who is waiting before replying |
-| `list` | Returns all sessions with live status and freshly resolved Herdr location | You need to discover targets or choose an idle peer |
+| `list` | Returns current-pool sessions with live status and freshly resolved Herdr location | You need to discover targets or choose an idle peer |
 | `status` | Returns your connection state | Troubleshooting |
 
 ## Visible Peer Sessions
@@ -381,7 +396,8 @@ Replies to recently disconnected explicitly named senders can be queued by the b
 
 1. Check intercom is enabled: `intercom({ action: "status" })`
 2. Verify the target session has loaded pi-intercom
-3. Ensure both sessions are on the same machine (intercom is same-machine only)
+3. Ensure both sessions are on the same machine and in the same intercom pool.
+4. Use `/intercom-pool` to inspect the pool; both peers can explicitly join a named pool or the global pool with `/intercom-pool default`.
 
 ### Message not delivered
 

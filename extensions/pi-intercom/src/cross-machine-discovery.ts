@@ -80,7 +80,7 @@ export function parseCrossMachineTarget(target: string): { agentTarget: string; 
   if (parts.length !== 2 || parts.some((part) => !part || /\s/.test(part))) {
     throw new Error(`Invalid remote target "${target}"; expected name@machine or full-session-uuid@machine.`);
   }
-  return { agentTarget: parts[0], machineLabel: parts[1] };
+  return { agentTarget: parts[0]!, machineLabel: parts[1]! };
 }
 
 export async function listSavedMachines(deps: DiscoveryDeps): Promise<SavedMachine[]> {

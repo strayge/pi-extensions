@@ -49,7 +49,11 @@ export class ReplyTracker {
   private readonly pendingTurnContexts: IntercomContext[] = [];
   private currentTurnContext: IntercomContext | null = null;
 
-  constructor(private readonly askTimeoutMs = getAskTimeoutMs()) {}
+  private readonly askTimeoutMs: number;
+
+  constructor(askTimeoutMs = getAskTimeoutMs()) {
+    this.askTimeoutMs = askTimeoutMs;
+  }
 
   recordIncomingMessage(from: SessionInfo, message: Message, receivedAt = Date.now()): IntercomContext {
     const context = { from, message, receivedAt };

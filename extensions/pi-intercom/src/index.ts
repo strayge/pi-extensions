@@ -33,6 +33,7 @@ import { ReplyTracker } from "./reply-tracker.ts";
 import { homedir } from "node:os";
 import { join as joinPath, resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
+import { initializeIntercomPool } from "./pool.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
 import { relaySenderName } from "./cross-machine-envelope.ts";
@@ -1606,12 +1607,17 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (reconnectPromise && reconnectPromiseGeneration === generationAtStart) {
       return reconnectPromise;
     }
-    const nextReconnectPromise = (async () => {
+    let nextReconnectPromise!: Promise<IntercomClient>;
+    nextReconnectPromise = (async () => {
       const nextClient = new IntercomClient();
       client = nextClient;
       attachClientHandlers(nextClient);
       let retryAfterFailure = false;
       try {
+        await initializeIntercomPool(contextAtStart.cwd);
+        if (!getLiveContext(contextAtStart, generationAtStart)) {
+          throw new Error("Intercom runtime no longer active");
+        }
         await spawnBrokerIfNeeded(config.brokerCommand, config.brokerArgs);
         await nextClient.connect(buildRegistration(), currentIntercomSessionId ?? currentSessionId);
         if (!getLiveContext(contextAtStart, generationAtStart)) {
@@ -2187,11 +2193,15 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     });
   });
   const unsubscribeOutboxRequest = pi.events.on(INTERCOM_OUTBOX_REQUEST_EVENT, handleOutboxRequest);
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     if (!config.enabled) {
       return;
     }
     startSessionRuntime(ctx);
+    // Resolve the pool before the first turn can launch children with inherited env.
+    await ensureConnected("startup").catch((error) => {
+      notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "warning", runtimeGeneration);
+    });
   });
   
   pi.on("session_shutdown", async () => {
@@ -3169,7 +3179,7 @@ Usage:
     // A connect already in flight registered with the old pool; let it settle first.
     await reconnectPromise?.catch(() => undefined);
     if (!getLiveContext(liveContext, commandGeneration)) return;
-    if (nextPool === getIntercomScopeId()) {
+    if (process.env.PI_INTERCOM_SCOPE_ID !== undefined && nextPool === getIntercomScopeId()) {
       notifyCommand(liveContext, `Already in intercom pool: ${requested}`, "info", commandGeneration);
       return;
     }

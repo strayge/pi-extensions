@@ -10,6 +10,7 @@ export class InlineMessageComponent implements Component {
   private theme: Theme;
   private replyCommand?: string;
   private bodyText?: string;
+  private expansionState: { expanded: boolean };
   // Caches assume message/bodyText never mutate after construction; theme
   // styling stays outside the caches so live theme changes apply per render.
   private collapsedPreview?: string;
@@ -22,13 +23,14 @@ export class InlineMessageComponent implements Component {
     replyCommand?: string,
     bodyText?: string,
     collapsed = false,
-    private expansionState: { expanded: boolean } = { expanded: !collapsed },
+    expansionState: { expanded: boolean } = { expanded: !collapsed },
   ) {
     this.from = from;
     this.message = message;
     this.theme = theme;
     this.replyCommand = replyCommand;
     this.bodyText = bodyText;
+    this.expansionState = expansionState;
   }
 
   invalidate(): void {}

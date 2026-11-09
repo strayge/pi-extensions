@@ -61,8 +61,10 @@ function connectToBrokerTarget(target: BrokerConnectTarget): net.Socket {
 /** connect() rejected because another live process holds the requested session id. */
 export class IntercomSessionHeldError extends Error {
   readonly code = SESSION_HELD_ERROR_CODE;
-  constructor(message: string, readonly holder: SessionHolder) {
+  readonly holder: SessionHolder;
+  constructor(message: string, holder: SessionHolder) {
     super(message);
+    this.holder = holder;
     this.name = "IntercomSessionHeldError";
   }
 }

@@ -224,7 +224,9 @@ function isPendingAskRecord(value: unknown): value is PendingAskRecord {
     && typeof value.target.sessionId === "string"
     && (typeof value.target.name === "string" || value.target.name === null)
     && typeof value.question === "string"
+    && typeof value.createdAt === "number"
     && Number.isSafeInteger(value.createdAt)
+    && typeof value.expiresAt === "number"
     && Number.isSafeInteger(value.expiresAt)
     && value.expiresAt >= value.createdAt;
 }
@@ -768,13 +770,13 @@ class IntercomBroker {
           clientMessage.to = targetId;
         }
 
-        const targets = this.findSessions(clientMessage.to, fromSession.scopeId);
+        const targets = this.findSessions(clientMessage.to as string, fromSession.scopeId);
         if (targets.length === 1) {
           if (message.replyTo && !replyEdge) {
             this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
             break;
           }
-          const target = targets[0];
+          const target = targets[0]!;
           const fingerprint = messageDeliveryFingerprint(message, target.info.id);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;
@@ -838,7 +840,7 @@ class IntercomBroker {
           break;
         }
 
-        const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to, fromSession.scopeId);
+        const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to as string, fromSession.scopeId);
         if (disconnectedTargets.length === 1) {
           if (message.replyTo && !replyEdge) {
             this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
@@ -1579,7 +1581,7 @@ class IntercomBroker {
         return a.session.info.id.localeCompare(b.session.info.id);
       });
 
-      const winner = candidates[0];
+      const winner = candidates[0]!;
       const existing = this.namespaceOwners.get(namespaceKey);
 
       const ownerChanged = !existing || existing.sessionKey !== winner.sessionKey;

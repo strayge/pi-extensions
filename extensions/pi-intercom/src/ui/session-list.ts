@@ -151,7 +151,7 @@ export class SessionListOverlay implements Component {
       const endIndex = Math.min(startIndex + this.maxVisible, this.sessions.length);
 
       for (let index = startIndex; index < endIndex; index += 1) {
-        const session = this.sessions[index];
+        const session = this.sessions[index]!;
         const isSelected = index === this.selectedIndex;
         const sameCwd = session.cwd === this.currentSession.cwd;
         const prefix = isSelected ? this.theme.fg("accent", "→ ") : "  ";
