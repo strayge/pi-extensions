@@ -16,7 +16,7 @@ sessions for delegation, context sharing, and collaborative workflows.
 ## Pool boundaries
 
 Discovery and routing are limited to the current pool. New sessions default to
-**the launching wmux workspace**, or **the current directory outside wmux**.
+**the launching wmux or cmux workspace**, or **the current directory outside both**.
 Children inherit the parent's pool, even in a different worktree. Do not guess a
 parent from a machine-wide session name: list the current pool and use its exact
 session ID, or use `contact_supervisor` when available.
@@ -145,7 +145,7 @@ intercom({
 ### Pattern 6: Cross-Codebase Peer Messages
 
 Use `to` alone to message an explicit live peer in the current pool, even when it is
-in another codebase. Cross-workspace peers (or different directories outside wmux)
+in another codebase. Cross-workspace peers (or different directories outside wmux/cmux)
 need an explicitly shared pool first. Use `cwd` alone when there should be exactly one live peer
 in that repo. Use `to` plus `cwd` when the directory is a safety guard.
 

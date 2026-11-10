@@ -26,12 +26,13 @@ Only sessions with the extension loaded and enabled appear in the roster. A loca
 New sessions choose a pool automatically:
 
 - **Inside wmux:** the launching surface's workspace ID (for example, `ws-80334311-2d5d-4f5e-b70d-dc546868f114`), even when peers use different directories.
-- **Outside wmux:** the canonical current working directory.
+- **Inside cmux:** the launching workspace's `CMUX_WORKSPACE_ID`, also shared across directories. No CLI lookup is needed.
+- **Outside wmux and cmux:** the canonical current working directory.
 - **Children:** inherit their parent's pool, including when launched in a different worktree.
 
 `/intercom-pool` shows the current pool. `/intercom-pool <name>` joins a named pool. `/intercom-pool default` explicitly joins the shared **global pool**; both peers must join it to communicate across workspaces or directories. It does not bypass other pools. Pool choices survive `/reload`.
 
-Set `PI_INTERCOM_SCOPE_ID` before launch to override automatic selection; an empty value selects the global pool. A failed wmux workspace lookup leaves intercom offline rather than silently widening its pool. Retry or select an explicit pool with `/intercom-pool`.
+Set `PI_INTERCOM_SCOPE_ID` before launch to override automatic selection; an empty value selects the global pool. A failed wmux workspace lookup or missing/empty cmux workspace identity leaves intercom offline rather than silently widening its pool. Retry or select an explicit pool with `/intercom-pool`.
 
 Sessions in separate pools cannot discover or message each other through the local broker. Existing sessions using the original package remain in their old pools until migrated and restarted.
 

@@ -34,7 +34,16 @@ export async function initializeIntercomPool(
   if (env.PI_INTERCOM_SCOPE_ID !== undefined) return;
 
   let scope: string;
-  if (env.WMUX_SURFACE_ID) {
+  if (env.CMUX_WORKSPACE_ID !== undefined || env.CMUX_SURFACE_ID) {
+    const workspace = env.CMUX_WORKSPACE_ID?.trim();
+    if (!workspace) {
+      // Never join a broader pool when cmux identity is incomplete.
+      throw new Error(
+        "Cannot determine the cmux workspace for intercom; retry or select an explicit /intercom-pool.",
+      );
+    }
+    scope = workspace;
+  } else if (env.WMUX_SURFACE_ID) {
     try {
       scope = await workspaceId(env);
     } catch (error) {
@@ -49,6 +58,6 @@ export async function initializeIntercomPool(
     scope = `cwd:${process.platform === "win32" ? directory.toLowerCase() : directory}`;
   }
 
-  // A manual switch made during the wmux lookup takes precedence.
+  // A manual switch made during the workspace lookup takes precedence.
   env.PI_INTERCOM_SCOPE_ID ??= scope;
 }

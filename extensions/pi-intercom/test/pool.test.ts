@@ -8,7 +8,12 @@ import { initializeIntercomPool, readWmuxWorkspace } from "../src/pool.ts";
 
 test("explicit pools, including the global pool, bypass automatic detection", async () => {
   for (const scope of ["my-pool", "", "  "]) {
-    const env = { WMUX_SURFACE_ID: "surface", PI_INTERCOM_SCOPE_ID: scope };
+    const env = {
+      WMUX_SURFACE_ID: "surface",
+      CMUX_SURFACE_ID: "cmux-surface",
+      CMUX_WORKSPACE_ID: "",
+      PI_INTERCOM_SCOPE_ID: scope,
+    };
     await initializeIntercomPool("/project", env, async () => {
       throw new Error("must not query wmux");
     });
@@ -40,7 +45,46 @@ test("wmux pool names are just the workspace id", async () => {
   assert.equal(env.PI_INTERCOM_SCOPE_ID, id);
 });
 
-test("outside wmux, canonical cwd selects the pool", async () => {
+test("cmux pools use workspace identity across directories and inherit it in children", async () => {
+  const workspace = "80334311-2d5d-4f5e-b70d-dc546868f114";
+  const parent: NodeJS.ProcessEnv = { CMUX_WORKSPACE_ID: workspace, CMUX_SURFACE_ID: "parent" };
+  const peer: NodeJS.ProcessEnv = { CMUX_WORKSPACE_ID: workspace, CMUX_SURFACE_ID: "peer" };
+  const elsewhere: NodeJS.ProcessEnv = { CMUX_WORKSPACE_ID: "other-workspace" };
+  await initializeIntercomPool("/repo-a", parent);
+  await initializeIntercomPool("/repo-b", peer);
+  await initializeIntercomPool("/repo-a", elsewhere);
+  assert.equal(parent.PI_INTERCOM_SCOPE_ID, workspace);
+  assert.equal(peer.PI_INTERCOM_SCOPE_ID, workspace);
+  assert.notEqual(elsewhere.PI_INTERCOM_SCOPE_ID, workspace);
+
+  const child: NodeJS.ProcessEnv = { ...parent, CMUX_WORKSPACE_ID: "different-workspace" };
+  await initializeIntercomPool("/child-worktree", child);
+  assert.equal(child.PI_INTERCOM_SCOPE_ID, workspace);
+});
+
+test("cmux workspace identity takes precedence over inherited wmux metadata", async () => {
+  const env: NodeJS.ProcessEnv = { CMUX_WORKSPACE_ID: " workspace-a ", WMUX_SURFACE_ID: "stale" };
+  await initializeIntercomPool("/repo", env, async () => {
+    throw new Error("must not query wmux inside cmux");
+  });
+  assert.equal(env.PI_INTERCOM_SCOPE_ID, "workspace-a");
+});
+
+test("incomplete cmux identity never silently joins a broader pool", async () => {
+  for (const workspace of [undefined, "", "  "]) {
+    const env: NodeJS.ProcessEnv = { CMUX_SURFACE_ID: "surface", CMUX_WORKSPACE_ID: workspace };
+    await assert.rejects(
+      initializeIntercomPool("/repo", env),
+      /Cannot determine the cmux workspace/,
+    );
+    assert.equal(env.PI_INTERCOM_SCOPE_ID, undefined);
+    env.CMUX_WORKSPACE_ID = "recovered";
+    await initializeIntercomPool("/repo", env);
+    assert.equal(env.PI_INTERCOM_SCOPE_ID, "recovered");
+  }
+});
+
+test("outside wmux and cmux, canonical cwd selects the pool", async () => {
   const a: NodeJS.ProcessEnv = {};
   const b: NodeJS.ProcessEnv = {};
   const other: NodeJS.ProcessEnv = {};
