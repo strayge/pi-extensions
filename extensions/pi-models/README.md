@@ -34,6 +34,31 @@ llama.cpp models are omitted from both views when their cached catalogue is conf
 24 hours. Opening `/models` does not refresh it; models return after a successful refresh in pi.
 Other providers and missing or unreadable cache timestamps are unaffected.
 
+## Model aliases
+
+Create `~/.pi/agent/pi-models.json` to add model-switching slash commands
+(or `pi-models.json` inside `PI_CODING_AGENT_DIR` when set):
+
+```json
+{
+  "aliases": {
+    "fast": { "model": "openai/gpt-4.1" },
+    "deep": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
+  }
+}
+```
+
+Use `/fast` or `/deep` to switch the current session without changing its global default.
+Model identifiers must include the provider; model IDs may contain further slashes.
+Optional `thinkingLevel` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`
+and is clamped to the model's capabilities. Without it, the usual remembered level is restored.
+
+Run `/reload` after editing the file. Names must start with a lowercase letter and contain only
+lowercase letters, digits, hyphens, or underscores. `/models` and built-in command names are reserved.
+Invalid configuration is reported without disabling the picker; invalid entries are skipped.
+Commands from other extensions with the same name follow pi's numeric suffix convention.
+The target model and provider authentication must be available when invoking an alias.
+
 ## Installation
 
 ```bash

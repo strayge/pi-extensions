@@ -3,6 +3,7 @@ import {
   type ExtensionUIDialogOptions,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { loadAliases } from "./aliases.ts";
 import { prioritizeModelsCommand } from "./autocomplete.ts";
 import { GoCatalogCache } from "./opencode-go-cache.ts";
 import { chooseModel } from "./selector.ts";
@@ -13,11 +14,33 @@ export default function (pi: ExtensionAPI): void {
   let activeModel: string | undefined;
   let activeThinking: ThinkingLevel | undefined;
   const goCatalog = new GoCatalogCache();
+  const aliasConfig = loadAliases();
+  for (const alias of aliasConfig.aliases) {
+    pi.registerCommand(alias.name, {
+      description: `Select ${alias.provider}/${alias.modelId}${alias.thinkingLevel ? ` (${alias.thinkingLevel})` : ""}`,
+      handler: async (_args, ctx) => {
+        const model = ctx.modelRegistry.find(alias.provider, alias.modelId);
+        if (!model) {
+          ctx.ui.notify(`Unknown model: ${alias.provider}/${alias.modelId}`, "error");
+          return;
+        }
+        if (!(await pi.setModel(model))) {
+          ctx.ui.notify(
+            `Unable to select ${alias.provider}/${alias.modelId}: check provider authentication`,
+            "error",
+          );
+          return;
+        }
+        if (alias.thinkingLevel !== undefined) pi.setThinkingLevel(alias.thinkingLevel);
+      },
+    });
+  }
   pi.on("session_shutdown", () => goCatalog.dispose());
 
   pi.on("session_start", (_event, ctx) => {
     activeModel = ctx.model ? modelKey(ctx.model) : undefined;
     activeThinking = ctx.thinkingLevel;
+    for (const error of aliasConfig.errors) ctx.ui.notify(`pi-models: ${error}`, "warning");
     if (ctx.mode !== "tui") return;
     ctx.ui.addAutocompleteProvider((current) => ({
       async getSuggestions(lines, cursorLine, cursorCol, options) {

@@ -4,7 +4,7 @@ import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent"
 
 export type ThinkingLevel = Parameters<ExtensionAPI["setThinkingLevel"]>[0];
 
-const thinkingLevels = new Set<ThinkingLevel>([
+export const thinkingLevels = new Set<ThinkingLevel>([
   "off",
   "minimal",
   "low",
