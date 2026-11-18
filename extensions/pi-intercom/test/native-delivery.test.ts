@@ -374,11 +374,69 @@ test("native loader delivery wakes, steers headless work, and defers quiet conte
 
   const tool = session.agent.state.tools.find((candidate) => candidate.name === "intercom");
   assert.ok(tool);
+  const schema = tool.parameters as {
+    properties: Record<string, { enum?: string[] }>;
+  };
+  assert.deepEqual(schema.properties.action?.enum, [
+    "list",
+    "send",
+    "handover",
+    "status",
+    "cancel",
+  ]);
+  for (const key of ["cwd", "openProjectPaneIfMissing", "focus"]) {
+    assert.equal(key in schema.properties, false);
+  }
+  const forbiddenGeneration = t.mock.method(context.modelRegistry, "streamSimple", () => {
+    throw new Error("Rejected directory targeting must not generate a summary");
+  });
+  const beforeLegacy = replies.length;
+  try {
+    for (const action of ["send", "handover"]) {
+      for (const legacy of [
+        { cwd: join(dir, "missing") },
+        { openProjectPaneIfMissing: true },
+        { openProjectPaneIfMissing: false },
+        { focus: false },
+      ]) {
+        const rejected = await tool.execute("removed-directory-option", {
+          action,
+          to: "native-sender",
+          message: "must not dispatch or generate",
+          ...legacy,
+        });
+        assert.equal(rejected.details.error, true);
+        assert.match(
+          JSON.stringify(rejected.content),
+          /Directory targeting is no longer supported/,
+        );
+      }
+      const missingRecipient = await tool.execute("missing-recipient", {
+        action,
+        message: "must not infer the sole peer or broadcast",
+      });
+      assert.equal(missingRecipient.details.error, true);
+      assert.match(JSON.stringify(missingRecipient.content), /Missing 'to' recipient/);
+    }
+    const removedList = await tool.execute("removed-list", {
+      action: "list-cwd",
+      to: "native-sender",
+    });
+    assert.equal(removedList.details.error, true);
+    assert.match(JSON.stringify(removedList.content), /Use intercom list/);
+    assert.equal(forbiddenGeneration.mock.callCount(), 0);
+    await sender.listSessions();
+    assert.equal(replies.length, beforeLegacy);
+  } finally {
+    forbiddenGeneration.mock.restore();
+  }
+  const listed = await tool.execute("current-pool-list", { action: "list" });
+  assert.equal(listed.details.roster.peers, 1);
+  assert.match(JSON.stringify(listed.content), /native-sender/);
   const invalid = await tool.execute("invalid", {
     action: "send",
-    cwd: join(dir, "missing"),
-    openProjectPaneIfMissing: true,
-    message: "must not create a pane",
+    to: "native-sender",
+    message: "invalid wait",
     wait: true,
     quiet: true,
   });

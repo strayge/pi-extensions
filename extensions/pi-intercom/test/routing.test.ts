@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { sendBroadcast } from "../src/broadcast.ts";
 import { IntercomClient, type SendResult } from "../src/broker/client.ts";
 import { createMessageReader, writeMessage } from "../src/broker/framing.ts";
@@ -23,7 +24,6 @@ import {
   type IntercomSessionIdentityRequestV1,
 } from "../src/extension-api.ts";
 import { initializeIntercomPool } from "../src/pool.ts";
-import { resolveTargetInCwd, waitForProjectSession } from "../src/project-agent.ts";
 import { ReplyWaiter } from "../src/reply-tracker.ts";
 import type {
   Message,
@@ -32,6 +32,7 @@ import type {
   SessionRegistration,
 } from "../src/types.ts";
 import { ComposeOverlay } from "../src/ui/compose.ts";
+import { HandoverPicker, type HandoverPickerResult } from "../src/ui/handover-picker.ts";
 
 const registration = (name: string, cwd: string) => ({
   name,
@@ -53,6 +54,79 @@ function closeClientSocket(client: IntercomClient): void {
   assert.ok(socket);
   socket.destroy();
 }
+
+test("handover picker keeps explicit local and remote selection without a project action", async () => {
+  const current: SessionInfo = { ...registration("self", "/project"), id: "self", status: "idle" };
+  const peer: SessionInfo = {
+    ...registration("local peer", "/other/project"),
+    id: "local-peer",
+    endpointEpoch: "selected-endpoint",
+    status: "idle",
+  };
+  const results: Array<HandoverPickerResult | undefined> = [];
+  let fetched = 0;
+  let remoteRendered = () => {};
+  const remoteReady = new Promise<void>((resolve) => {
+    remoteRendered = resolve;
+  });
+  let picker: HandoverPicker;
+  const createPicker = (preselectSessionId?: string) =>
+    new HandoverPicker(
+      {
+        requestRender: () => {
+          if (picker.render(88).join("\n").includes("worker@remote")) remoteRendered();
+        },
+      } as ConstructorParameters<typeof HandoverPicker>[0],
+      {
+        fg: (_color: string, text: string) => text,
+        bold: (text: string) => text,
+      } as ConstructorParameters<typeof HandoverPicker>[1],
+      {
+        matches: (data: string, key: string) => data === key,
+        getKeys: () => [],
+      } as unknown as ConstructorParameters<typeof HandoverPicker>[2],
+      {
+        currentSession: current,
+        sessions: [current, peer],
+        preselectSessionId,
+        lister: {
+          listMachines: async () => {
+            fetched++;
+            return [{ label: "remote", target: "host", enabled: true }];
+          },
+          listAgents: async () => [{ name: "worker", cwd: "/remote/project" }],
+        },
+      },
+      (result) => results.push(result),
+    );
+  picker = createPicker(peer.id);
+  picker.handleInput("continue the task");
+  for (const width of [1, 2, 10, 30, 88]) {
+    assert.ok(picker.render(width).every((line) => visibleWidth(line) <= width));
+  }
+  assert.doesNotMatch(picker.render(88).join("\n"), /New session|project path/);
+  picker.handleInput("tui.select.confirm");
+  assert.deepEqual(results[0], {
+    target: { kind: "local", session: peer },
+    goal: "continue the task",
+  });
+  assert.equal(fetched, 0);
+
+  picker = createPicker();
+  picker.handleInput("tui.select.down");
+  picker.handleInput("tui.select.confirm");
+  await remoteReady;
+  assert.equal(fetched, 1, "fetch is the action immediately after local peers");
+  for (const width of [1, 2, 10, 30, 88]) {
+    assert.ok(picker.render(width).every((line) => visibleWidth(line) <= width));
+  }
+  picker.handleInput("tui.select.down");
+  picker.handleInput("tui.select.confirm");
+  assert.deepEqual(results[1], {
+    target: { kind: "remote", target: "worker@remote" },
+    goal: undefined,
+  });
+});
 
 test("unified direct messaging keeps discovery scoped and routing identity-bound", async (t) => {
   const agentDir = mkdtempSync(join(tmpdir(), "intercom-direct-"));
@@ -530,182 +604,6 @@ test("unified direct messaging keeps discovery scoped and routing identity-bound
       }
     },
   );
-
-  await t.test(
-    "cwd targeting and pane polling obey authoritative exact-ID resolution",
-    async () => {
-      const remoteId = "00000000-0000-4000-8000-000000000201";
-      const unknownId = "00000000-0000-4000-8000-000000000202";
-      const remoteCwd = join(agentDir, "remote-project");
-      const decoyMail: Message[] = [];
-      await connect("cwd-decoy", remoteId, scopeA, (_from, message) => decoyMail.push(message));
-      await connect("unknown-cwd-decoy", unknownId, scopeA, (_from, message) =>
-        decoyMail.push(message),
-      );
-      const remote = await connect(remoteId, "external-cwd-peer", scopeB, undefined, remoteCwd);
-      const sessions = await child.listSessions();
-      const base = { sessions, currentSessionId: "child-a" };
-      await assert.rejects(
-        resolveTargetInCwd(child, { ...base, targetCwd: agentDir, to: remoteId }),
-        /not the requested cwd/,
-      );
-      const resolved = await resolveTargetInCwd(child, {
-        ...base,
-        targetCwd: remoteCwd,
-        to: remoteId,
-      });
-      assert.equal(resolved.session?.id, remoteId);
-      assert.ok(resolved.session);
-      const received = nextMessage(remote);
-      assert.equal(
-        (await child.send(remoteId, { target: resolved.session, text: "exact cwd peer" }))
-          .delivered,
-        true,
-      );
-      await received;
-      assert.equal(
-        (await resolveTargetInCwd(child, { ...base, targetCwd: agentDir, to: unknownId })).kind,
-        "missing",
-      );
-      assert.equal(
-        (
-          await resolveTargetInCwd(child, {
-            ...base,
-            targetCwd: remoteCwd,
-            to: "external-cwd-peer",
-          })
-        ).kind,
-        "missing",
-      );
-      await assert.rejects(
-        waitForProjectSession(child, {
-          projectRoot: agentDir,
-          currentSessionId: "child-a",
-          beforeSessionIds: new Set(),
-          to: remoteId,
-          timeoutMs: 100,
-          pollMs: 5,
-        }),
-        /not the requested cwd/,
-      );
-      await assert.rejects(
-        waitForProjectSession(child, {
-          projectRoot: agentDir,
-          currentSessionId: "child-a",
-          beforeSessionIds: new Set(),
-          to: unknownId,
-          timeoutMs: 30,
-          pollMs: 5,
-        }),
-        /Timed out waiting/,
-      );
-      const duplicateId = "00000000-0000-4000-8000-000000000203";
-      await connect(duplicateId, "duplicate-cwd-a", scopeA);
-      await connect(duplicateId, "duplicate-cwd-b", scopeB, undefined, remoteCwd);
-      await assert.rejects(
-        resolveTargetInCwd(child, { ...base, targetCwd: agentDir, to: duplicateId }),
-        /Ambiguous session ID/,
-      );
-      const namedCwd = join(agentDir, "named-project");
-      await connect("cwd-named-peer", "cwd-worker", scopeA, undefined, namedCwd);
-      await connect("other-cwd-named-peer", "cwd-worker", scopeA, undefined, remoteCwd);
-      const local = {
-        sessions: await child.listSessions(),
-        currentSessionId: "child-a",
-        targetCwd: namedCwd,
-      };
-      assert.equal(
-        (await resolveTargetInCwd(child, { ...local, to: "cwd-worker" })).session?.id,
-        "cwd-named-peer",
-      );
-      assert.equal((await resolveTargetInCwd(child, local)).session?.id, "cwd-named-peer");
-      assert.equal(
-        (
-          await waitForProjectSession(child, {
-            projectRoot: namedCwd,
-            currentSessionId: "child-a",
-            beforeSessionIds: new Set(),
-            to: "cwd-worker",
-            timeoutMs: 100,
-          })
-        ).id,
-        "cwd-named-peer",
-      );
-      assert.equal(
-        (
-          await waitForProjectSession(child, {
-            projectRoot: remoteCwd,
-            currentSessionId: "child-a",
-            beforeSessionIds: new Set(),
-            to: remoteId,
-            timeoutMs: 100,
-          })
-        ).id,
-        remoteId,
-      );
-      assert.deepEqual(decoyMail, []);
-    },
-  );
-
-  await t.test("cwd short IDs are not shadowed by names outside the directory", async () => {
-    const targetCwd = join(agentDir, "prefix-project");
-    const prefix = "abcd1234";
-    const peerId = "abcd1234-0000-4000-8000-000000000301";
-    const outsideMail: Message[] = [];
-    await connect("outside-prefix-name", prefix, scopeA, (_from, message) =>
-      outsideMail.push(message),
-    );
-    const peer = await connect(peerId, "prefix-worker", scopeA, undefined, targetCwd);
-    assert.deepEqual(
-      (await child.listSessions({ resolve: prefix })).map((session) => session.id),
-      ["outside-prefix-name"],
-    );
-    const input = {
-      sessions: await child.listSessions(),
-      currentSessionId: "child-a",
-      targetCwd,
-      to: prefix,
-    };
-    const resolved = await resolveTargetInCwd(child, input);
-    assert.ok(resolved.session);
-    assert.equal(resolved.session.id, peerId);
-    const received = nextMessage(peer);
-    assert.equal(
-      (await child.send(peerId, { target: resolved.session, text: "cwd short ID" })).delivered,
-      true,
-    );
-    await received;
-    assert.equal(
-      (
-        await waitForProjectSession(child, {
-          projectRoot: targetCwd,
-          currentSessionId: "child-a",
-          beforeSessionIds: new Set(),
-          to: prefix,
-          timeoutMs: 100,
-        })
-      ).id,
-      peerId,
-    );
-    assert.deepEqual(outsideMail, []);
-
-    for (const reserved of ["parent", "workspace", "global"]) {
-      const reservedId = `cwd-reserved-${reserved}`;
-      await connect(reservedId, reserved, scopeA, undefined, targetCwd);
-      const local = { ...input, sessions: await child.listSessions() };
-      await assert.rejects(
-        resolveTargetInCwd(child, { ...local, to: reserved }),
-        /Reserved destination/,
-      );
-      for (const target of [reserved.toUpperCase(), reserved.slice(0, 3)]) {
-        assert.equal((await resolveTargetInCwd(child, { ...local, to: target })).kind, "missing");
-      }
-      assert.equal(
-        (await resolveTargetInCwd(child, { ...local, to: reservedId })).session?.id,
-        reservedId,
-      );
-    }
-  });
 
   await t.test("explicit pool changes move only the same exact retained identity", async () => {
     const offline = await connect("move-mailbox", "move-mailbox", scopeA);
@@ -1445,7 +1343,10 @@ test("unified direct messaging keeps discovery scoped and routing identity-bound
           ...options,
         });
         assert.equal(rejected.details.error, true);
-        assert.match(JSON.stringify(rejected.content), /cannot be combined/);
+        assert.match(
+          JSON.stringify(rejected.content),
+          /Directory targeting is no longer supported/,
+        );
       }
       const outboxResult = new Promise<IntercomOutboxResultV1>((resolve) => {
         eventBus.on(INTERCOM_OUTBOX_RESULT_EVENT, (payload) => {
@@ -1541,6 +1442,71 @@ test("unified direct messaging keeps discovery scoped and routing identity-bound
           await replacement?.disconnect();
         }
       });
+
+      await st.test(
+        "path handovers reject before opening generation or calling the model",
+        async (ht) => {
+          const previousUI = session.extensionRunner.getUIContext();
+          const notices: string[] = [];
+          const context = session.extensionRunner.createCommandContext();
+          const generation = ht.mock.method(context.modelRegistry, "streamSimple", () => {
+            throw new Error("Path handovers must not call the model");
+          });
+          let dialogs = 0;
+          session.extensionRunner.setUIContext(
+            {
+              ...previousUI,
+              notify: (message) => notices.push(message),
+              custom: async () => {
+                dialogs++;
+                throw new Error("Path handovers must not open generation");
+              },
+            },
+            "tui",
+          );
+          try {
+            const command = session.extensionRunner.getCommand("handover");
+            assert.ok(command);
+            for (const path of [
+              "/project",
+              "./project",
+              "../project",
+              "~/project",
+              ".",
+              "..",
+              "C:\\project",
+              ".\\project",
+            ]) {
+              await command.handler(
+                `${path} next task`,
+                session.extensionRunner.createCommandContext(),
+              );
+              assert.match(notices.at(-1) ?? "", /Use intercom list.*peer recipient/);
+            }
+            assert.equal(dialogs, 0);
+            assert.equal(generation.mock.callCount(), 0);
+            session.extensionRunner.setUIContext(
+              {
+                ...previousUI,
+                custom: async <T>() => {
+                  dialogs++;
+                  return null as T;
+                },
+              },
+              "tui",
+            );
+            await command.handler(
+              "review/api next task",
+              session.extensionRunner.createCommandContext(),
+            );
+            assert.equal(dialogs, 1, "a slash in a peer name must not imply directory targeting");
+            assert.equal(generation.mock.callCount(), 0);
+          } finally {
+            generation.mock.restore();
+            session.extensionRunner.setUIContext(previousUI, "tui");
+          }
+        },
+      );
 
       await st.test("picker handover pins its endpoint through editing", async (ht) => {
         const originalPeer = await connect("entry-handover-target", "handover-target", scopeA);

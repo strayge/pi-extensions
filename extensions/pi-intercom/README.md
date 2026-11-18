@@ -15,7 +15,7 @@ Restart pi after installing. Do not load this package alongside another copy of 
 - Press **Alt+M** or run `/intercom` to choose a connected session and compose a message.
 - Use `/alias <name>` to give your session a recognizable name.
 - Use `/intercom-id` to insert your session's stable target into the editor.
-- The `intercom` tool supports `list`, `list-cwd`, `send`, `status`, `cancel`, and `handover`. Use `send` with `wait: true` to wait for a direct response, or `send` with an explicit `to` and `replyTo` to answer any earlier message.
+- The `intercom` tool supports `list`, `send`, `status`, `cancel`, and `handover`. Discover peers with `list`, then specify an explicit `to` recipient. Use `send` with `wait: true` to wait for a direct response, or `send` with an explicit `to` and `replyTo` to answer any earlier message.
 - Children contact their immediate spawning session with `send` to `parent`, optionally with `wait: true`. This requires current-launch parent metadata (supplied by pi-subagents), not a name or saved transcript ancestor.
 - The bundled `pi-intercom` skill documents coordination workflows.
 
@@ -53,7 +53,7 @@ Pools are discovery groups, not direct-delivery isolation boundaries. Names, pre
 - `workspace`: other connected top-level Pi sessions in the current pool, including named or default pools.
 - `global`: other connected top-level Pi sessions across all pools on **this broker**, not other Windows/WSL brokers or SSH hosts.
 
-Broadcasts exclude the sender, all sessions with current parent metadata, and transport-only CLI clients. Children remain directly addressable. The default pool is one shared discovery group, not a global broadcast. These three destination words are reserved: reach a colliding display name by full session ID; literal reserved routing IDs are rejected. Built-in destinations cannot combine with cwd/project-pane targeting.
+Broadcasts exclude the sender, all sessions with current parent metadata, and transport-only CLI clients. Children remain directly addressable. The default pool is one shared discovery group, not a global broadcast. These three destination words are reserved: reach a colliding display name by full session ID; literal reserved routing IDs are rejected.
 
 ### CLI
 
@@ -64,6 +64,8 @@ Existing SSH text sends remain supported; waiting, quiet delivery, threading, at
 ### Coordinated upgrade
 
 Unified messaging requires a compatible broker and receiving sessions. Upgrade all participants, explicitly stop/restart the old broker when it is safe, then reload sessions. Reload/disconnection can interrupt an active wait; it is not recreated or resent. Intercom reports incompatible participants; it never automatically stops a live broker.
+
+Directory targeting and automatic project launch are removed: `list-cwd`, `cwd`, `openProjectPaneIfMissing`, and `focus` are unsupported. Use `list` and an explicit `to`; `/handover` accepts peers, not project paths. Working directories remain roster metadata and the fallback for automatic pool selection.
 
 Public `ask`, `reply`, `pending`, and `contact_supervisor` are removed, with no aliases. Use `send` with optional `wait`, explicit `to`/`replyTo`, or `to: "parent"` instead. Explicit obsolete receiver settings `inboundTrigger` and `busyDelivery` now fail configuration loading with migration guidance: remove them and choose `quiet` per message. Other settings such as `enabled`, `confirmSend`, and timeout configuration are retained.
 

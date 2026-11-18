@@ -11,7 +11,6 @@ const CONTEXT_WARNING_PCT = 80;
 
 export type HandoverPickerTarget =
   | { kind: "local"; session: SessionInfo }
-  | { kind: "project" }
   | { kind: "remote"; target: string };
 
 export interface HandoverPickerResult {
@@ -45,7 +44,6 @@ type RemoteState =
 
 type Item =
   | { kind: "local"; session: SessionInfo }
-  | { kind: "project" }
   | { kind: "fetch" }
   | { kind: "remote"; machine: SavedMachine; agent: RemoteAgent };
 
@@ -95,7 +93,7 @@ export class HandoverPicker implements Component {
 
   private items(): Item[] {
     const items: Item[] = this.localSessions.map((session) => ({ kind: "local", session }));
-    items.push({ kind: "project" }, { kind: "fetch" });
+    items.push({ kind: "fetch" });
     if (this.remote.state === "machines") {
       for (const entry of this.remote.machines) {
         if (entry.state !== "done") continue;
@@ -251,7 +249,6 @@ export class HandoverPicker implements Component {
         `${status}${pct}`,
       );
     }
-    pushItem(items.find((item) => item.kind === "project")!, "+ New session in a project path…");
 
     body.push(separator, row(this.theme.bold(" Other machines")));
     pushItem(

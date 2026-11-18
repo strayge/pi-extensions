@@ -12,11 +12,12 @@ and explicitly carries `replyTo`; intercom never infers either from pending work
 
 ```ts
 intercom({ action: "list" });
-intercom({ action: "list-cwd", cwd: "/path/to/repo" });
 intercom({ action: "status" });
 ```
 
 `list` shows the current pool's live peers, status, and available terminal location.
+Choose a peer from that roster and supply an explicit `to`; directories are metadata,
+not recipients. Missing recipients never infer a peer or broadcast.
 Use full session IDs from incoming messages/results for exact routing. Names and
 abbreviated IDs/names resolve only inside your pool; full IDs can cross pools on
 this broker. Never use terminal pane IDs as intercom addresses. `/alias <name>`
@@ -43,7 +44,7 @@ Reserved destinations:
 Reserved words cannot address a peer by display name; use its full session ID.
 Literal reserved routing IDs are rejected. Broadcasts exclude self, **all** sessions
 with current parent metadata, and transport-only CLI clients. Children remain
-reachable by direct ID. Built-in destinations cannot combine with cwd/pane options.
+reachable by direct ID.
 
 ## Send, wait, answer
 
@@ -127,17 +128,16 @@ active, nonwaiting message to a direct recipient. It cannot carry reply/retry
 relationships or attachments. `/handover <target> [next task]` lets humans review
 before sending; `/handover` opens the picker.
 
-For direct send/handover, use `cwd` alone for the sole live peer in a repo, or
-`to` plus `cwd` as a safety guard. Only set `openProjectPaneIfMissing: true` when a
-long-lived visible Herdr peer is needed; it reuses an existing matching peer or
-opens one. Prefer bounded subagents with explicit cwd for delegated work. If Herdr
-is unavailable, do not invent a terminal fallback.
-
 Existing `agent@machine` SSH text sends retain their existing capability level:
 no waiting, quiet delivery, threading, attachments, or group routing over SSH.
 Do not silently drop unsupported options or assume cross-broker discovery.
 
 ## Migration and troubleshooting
+
+Directory targeting and automatic project launch are removed. `list-cwd`, `cwd`,
+`openProjectPaneIfMissing`, and `focus` are unsupported, even alongside `to`.
+Use `list`, then an explicit peer recipient; `/handover` rejects project paths.
+Working-directory metadata and cwd-based pool fallback remain unchanged.
 
 Public `ask`, `reply`, `pending`, and `contact_supervisor` are removed without
 aliases. Use only `send`, optional `wait`, explicit `to`/`replyTo`, and `parent`.

@@ -31,12 +31,8 @@ import {
   type IntercomSessionIdentityRequestV1,
 } from "./extension-api.ts";
 import { ReplyWaiter } from "./reply-tracker.ts";
-import { homedir } from "node:os";
-import { join as joinPath, resolve as resolvePath } from "node:path";
-import { sameCwd } from "./cwd.ts";
 import { initializeIntercomPool } from "./pool.ts";
 import { formatContextUsage } from "./format-context.ts";
-import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
 import { relaySenderName } from "./cross-machine-envelope.ts";
 import { runCommand, sendCrossMachine } from "./cross-machine-transport.ts";
 import { listMachineAgents, listSavedMachines, parseCrossMachineTarget } from "./cross-machine-discovery.ts";
@@ -61,18 +57,8 @@ interface InboundMessageEntry {
   bodyText: string;
 }
 
-interface DeliveryTarget {
-  id: string;
-  label: string;
-  peer?: SessionInfo;
-  projectPane?: ProjectPaneLaunch;
-}
-
 interface DeliveryRequest {
   to?: string;
-  cwd?: string;
-  openProjectPaneIfMissing?: boolean;
-  focus?: boolean;
   message: string;
   attachments?: Attachment[];
   replyTo?: string;
@@ -128,17 +114,12 @@ function triggerTurnRunsPromptLifecycle(piVersion: string): boolean {
 
 export function explicitCrossMachineSendRestriction(options: {
   to?: string;
-  cwd?: string;
-  openProjectPaneIfMissing?: boolean;
   attachments?: readonly unknown[];
   replyTo?: string;
   supersedes?: string;
   retryOf?: string;
 }): string | undefined {
   if (!options.to?.includes("@")) return undefined;
-  if (options.cwd || options.openProjectPaneIfMissing) {
-    return "Cross-machine send does not support cwd or opening project panes.";
-  }
   if (options.replyTo || options.supersedes || options.retryOf || options.attachments?.length) {
     return "Cross-machine send only supports a new text message; attachments, reply relationships, supersede, and retry are not supported.";
   }
@@ -334,9 +315,6 @@ function previewText(value: unknown, maxLength = 72): string | undefined {
     return undefined;
   }
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
-}
-function expandHomePath(path: string): string {
-  return path === "~" ? homedir() : path.startsWith("~/") ? joinPath(homedir(), path.slice(2)) : path;
 }
 function firstTextContent(result: { content?: Array<{ type: string; text?: string }> }): string {
   return result.content?.find((item) => item.type === "text" && typeof item.text === "string")?.text?.replace(/\*\*/g, "") ?? "";
@@ -1302,50 +1280,6 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
     return `No connected session matches "${to}". Run intercom list for connected sessions.`;
   }
-  async function resolveCwdDeliveryTarget(activeClient: IntercomClient, options: {
-    to?: string;
-    cwd: string;
-    openProjectPaneIfMissing?: boolean;
-    focus?: boolean;
-    signal?: AbortSignal;
-  }): Promise<DeliveryTarget> {
-    const sessions = await activeClient.listSessions();
-    const currentSessionId = activeClient.sessionId;
-    if (!currentSessionId) {
-      throw new Error("Current session is not registered with intercom.");
-    }
-    const currentSession = sessions.find((session) => session.id === currentSessionId);
-    if (!currentSession) {
-      throw new Error("Current session is missing from intercom session list.");
-    }
-
-    const targetCwd = options.cwd && options.cwd !== "."
-      ? resolvePath(currentSession.cwd, options.cwd)
-      : currentSession.cwd;
-    const existing = await resolveTargetInCwd(activeClient, {
-      sessions,
-      currentSessionId,
-      targetCwd,
-      ...(options.to ? { to: options.to } : {}),
-    });
-    if (existing.kind === "found" && existing.session) {
-      return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id, peer: existing.session };
-    }
-    if (!options.openProjectPaneIfMissing) {
-      throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} Pass openProjectPaneIfMissing: true to open a Herdr project pane and start Pi there.`);
-    }
-
-    const beforeSessionIds = new Set(sessions.map((session) => session.id));
-    const projectPane = await openProjectPane({ cwd: targetCwd, focus: options.focus, signal: options.signal });
-    const session = await waitForProjectSession(activeClient, {
-      projectRoot: projectPane.projectRoot,
-      currentSessionId,
-      beforeSessionIds,
-      ...(options.to ? { to: options.to } : {}),
-      signal: options.signal,
-    });
-    return { id: session.id, label: session.name || session.id, peer: session, projectPane };
-  }
   /** Shared by send, handover, and /handover. Never throws; failures are returned as error results. */
   async function deliverMessage(
     connectedClient: IntercomClient,
@@ -1353,13 +1287,13 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     signal: AbortSignal | undefined,
     request: DeliveryRequest,
   ): Promise<IntercomToolResult> {
-    const { to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, quiet } = request;
+    const { to, message, attachments, replyTo, supersedes, retryOf, quiet } = request;
     try {
+      if (!to?.trim()) throw new Error("Missing 'to' recipient. Use intercom list and specify a peer or an explicit destination.");
       if (request.wait && quiet) throw new Error("wait: true cannot be combined with quiet: true");
       if (isBroadcastDestination(to)) {
         if (request.handover) throw new Error("Handover requires a direct recipient, not a broadcast");
         if (request.wait || replyTo !== undefined) throw new Error("Broadcasts do not support wait: true or replyTo");
-        if (cwd !== undefined || openProjectPaneIfMissing !== undefined || focus !== undefined) throw new Error("Broadcast destinations cannot be combined with cwd or project-pane options");
         if (supersedes !== undefined || retryOf !== undefined) throw new Error("Broadcasts are new messages; supersedes and retryOf require a direct recipient");
         if (signal?.aborted) throw new Error("Cancelled before dispatch");
         const snapshot = await connectedClient.listSessions({ audience: to });
@@ -1375,13 +1309,11 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         }
         return { content: [{ type: "text", text: formatBroadcastResult(result) }], details: { ...result, delivered: result.ok, error: !result.ok } };
       }
-      if (to === "parent" && (cwd !== undefined || openProjectPaneIfMissing !== undefined || focus !== undefined)) throw new Error("The parent destination cannot be combined with cwd or project-pane options");
-      if (replyTo && !to) throw new Error("Threaded sends require an explicit 'to' recipient");
-      const crossMachineTarget = Boolean(to?.includes("@"));
+      const crossMachineTarget = to.includes("@");
       if (crossMachineTarget && (request.wait || quiet)) throw new Error("Cross-machine sends do not support wait: true or quiet: true");
       if (request.wait && replyWaiter.active) throw new Error("Already waiting for a reply");
       const crossMachineRestriction = explicitCrossMachineSendRestriction({
-        to, cwd, openProjectPaneIfMissing, attachments, replyTo, supersedes, retryOf,
+        to, attachments, replyTo, supersedes, retryOf,
       });
       if (crossMachineRestriction) {
         return {
@@ -1391,7 +1323,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       }
       if (crossMachineTarget) {
         try {
-          parseCrossMachineTarget(to!);
+          parseCrossMachineTarget(to);
         } catch (error) {
           return {
             content: [{ type: "text", text: getErrorMessage(error) }],
@@ -1399,26 +1331,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           };
         }
       }
-      if (openProjectPaneIfMissing && !cwd) {
-        return {
-          content: [{ type: "text", text: "openProjectPaneIfMissing requires a target cwd." }],
-          details: { error: true },
-        };
-      }
       const confirmSend = !replyTo && config.confirmSend && ctx.hasUI;
       const attachmentText = attachments?.length ? formatAttachments(attachments) : "";
-      if (confirmSend && cwd && openProjectPaneIfMissing) {
-        const confirmed = await ctx.ui.confirm(
-          "Send message",
-          `Send to "${to ?? cwd}":\n\n${message}${attachmentText}`,
-        );
-        if (!confirmed) {
-          return {
-            content: [{ type: "text", text: "Message cancelled by user" }],
-            details: {},
-          };
-        }
-      }
       if (confirmSend && crossMachineTarget) {
         const confirmed = await ctx.ui.confirm("Send message", `Send to "${to}":\n\n${message}`);
         if (!confirmed) {
@@ -1434,7 +1348,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         }
         const identity = buildPresenceIdentity(pi, connectedClient.sessionId ?? ctx.sessionManager.getSessionId());
         try {
-          const remote = await sendCrossMachine(to!, message, {
+          const remote = await sendCrossMachine(to, message, {
             name: identity.name,
             sessionId: connectedClient.sessionId ?? ctx.sessionManager.getSessionId(),
             machine: config.crossMachine.machineName,
@@ -1459,20 +1373,17 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           };
         }
       }
-      const peer = cwd ? undefined : request.resolvedPeer ?? await connectedClient.resolveTarget(to!, { requireLive: request.wait });
-      if (!cwd && !peer) throw new Error(describeNoSessionMatch(await connectedClient.listSessions(), to!));
-      const target: DeliveryTarget = cwd
-        ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal })
-        : { id: peer?.id ?? to!, label: to!, ...(peer ? { peer } : {}) };
-      const sendTo = target.id;
-      const targetDisplay = target.projectPane ? target.label : to ?? target.label;
+      const peer = request.resolvedPeer ?? await connectedClient.resolveTarget(to, { requireLive: request.wait });
+      if (!peer) throw new Error(describeNoSessionMatch(await connectedClient.listSessions(), to));
+      const sendTo = peer.id;
+      const targetDisplay = to;
       if (sendTo === connectedClient.sessionId) {
         return {
           content: [{ type: "text", text: "Cannot message the current session" }],
           details: { error: true },
         };
       }
-      if (confirmSend && !(cwd && openProjectPaneIfMissing)) {
+      if (confirmSend) {
         const confirmed = await ctx.ui.confirm(
           "Send message",
           `Send to "${targetDisplay}":\n\n${message}${attachmentText}`,
@@ -1491,7 +1402,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       if (request.wait) {
         let messageId: string | null = null;
         let deliveryState = "created";
-        const sent = await sendAndWait(connectedClient, sendTo, { text: message, attachments, replyTo, supersedes, retryOf, target: target.peer }, {
+        const sent = await sendAndWait(connectedClient, sendTo, { text: message, attachments, replyTo, supersedes, retryOf, target: peer }, {
           signal,
           onAttempt: (id) => { messageId = id; },
           deliveryState: () => latestDeliveryState(messageId, deliveryState),
@@ -1508,7 +1419,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         }
       }
       const result = await connectedClient.send(sendTo, {
-        text: message, attachments, replyTo, supersedes, retryOf, quiet, target: target.peer, signal,
+        text: message, attachments, replyTo, supersedes, retryOf, quiet, target: peer, signal,
       });
       const noMatchText = result.code === "E_TARGET_NOT_FOUND"
         ? describeNoSessionMatch(await connectedClient.listSessions(), sendTo)
@@ -1531,15 +1442,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           type: "text",
           text: result.delivery === "queued"
             ? queuedText(result.targetId ?? targetDisplay, "message")
-            : target.projectPane
-              ? `Opened Herdr project pane ${target.projectPane.paneId} for ${target.projectPane.projectRoot} and sent message to ${targetDisplay}`
-              : `Message sent to ${result.targetId ?? targetDisplay}`,
+            : `Message sent to ${result.targetId ?? targetDisplay}`,
         }],
         details: {
           ...deliveryDetails(result),
           targetId: result.targetId,
           ...(replyTo ? { replyTo } : {}),
-          ...(target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {}),
         },
       };
     } catch (error) {
@@ -1927,7 +1835,9 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     name: "intercom",
     label: "Intercom",
     description: `Coordinate with pi sessions on this broker using send, optionally with wait: true.
-Names, prefixes, and list discovery stay in the current pool; full session IDs route across pools.
+Use list to discover peers in the current pool, then specify an explicit to recipient.
+Names and prefixes stay in the current pool; full session IDs route across pools.
+Automatic pools follow the wmux/cmux workspace, otherwise canonical cwd; overrides and inheritance still apply.
 Use full sender IDs and explicit replyTo to answer any earlier message, even after a wait ends.
 The reserved destinations parent, workspace, and global are not peer names; use a full ID for colliding names.
 parent uses current launch metadata, not transcript ancestry. workspace means this pool (including named/default pools);
@@ -1937,17 +1847,13 @@ Active sends wake idle peers or steer busy work without aborting it. Acceptance 
 Receipt timeout is unknown: do not automatically retry an uncertain send. Broadcast results can be partial.
 
 Usage:
-  intercom({ action: "list" })                    → List active sessions
-  intercom({ action: "list-cwd" })                → List sessions in the current working directory
-  intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
+  intercom({ action: "list" })                    → List active sessions in the current pool
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
-  intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
   intercom({ action: "send", to: "name-or-id", message: "...", wait: true }) → Send and wait for the first exact-peer correlated response
   intercom({ action: "send", to: "parent", message: "Need a decision", wait: true }) → Contact the immediate spawning session
   intercom({ action: "send", to: "workspace", message: "Status update" }) → Quiet broadcast to top-level peers in this pool
   intercom({ action: "send", to: "global", message: "Attention needed", quiet: false }) → Active broadcast across this broker
   intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
-  intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
   intercom({ action: "send", to: "full-sender-id", replyTo: "message-id", message: "..." }) → Send a threaded answer
   intercom({ action: "status" })                  → Show connection status`,
@@ -1961,11 +1867,11 @@ Usage:
     ],
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "handover", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'handover', 'status', or 'cancel'. Use send with wait: true to wait for a response; always specify a recipient for threaded sends.",
+      action: StringEnum(["list", "send", "handover", "status", "cancel"] as const, {
+        description: "Action: 'list', 'send', 'handover', 'status', or 'cancel'. Use list for current-pool discovery; send and handover require an explicit recipient. Use send with wait: true to wait for a response.",
       }),
       to: Type.Optional(Type.String({
-        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). Full IDs route across pools; names and prefixes are scoped to this pool. Use parent for the immediate spawning session (requires explicit launch metadata; supports wait). Use workspace for other connected top-level Pi agents in this pool, or global across this broker's pools; broadcasts exclude children and transport clients. Built-in destinations cannot combine with cwd/project-pane options. With cwd, omit to target the sole live session there.",
+        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). Full IDs route across pools; names and prefixes are scoped to this pool. Use parent for the immediate spawning session (requires explicit launch metadata; supports wait). Use workspace for other connected top-level Pi agents in this pool, or global across this broker's pools; broadcasts exclude children and transport clients.",
       })),
       message: Type.Optional(Type.String({
         description: "Message to send. For 'handover', the optional next task for the receiver.",
@@ -1990,18 +1896,15 @@ Usage:
       retryOf: Type.Optional(Type.String({
         description: "Previous message ID this send is a user-authored retry of. Retries always send a new message ID.",
       })),
-      cwd: Type.Optional(Type.String({
-        description: "Working directory filter for 'list-cwd'. For send/handover, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd.",
-      })),
-      openProjectPaneIfMissing: Type.Optional(Type.Boolean({
-        description: "For send/handover with cwd, open a visible Herdr project pane and launch Pi there when no matching live session is connected.",
-      })),
-      focus: Type.Optional(Type.Boolean({
-        description: "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true.",
-      })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if ((params.action as string) === "list-cwd" || ["cwd", "openProjectPaneIfMissing", "focus"].some((key) => Object.prototype.hasOwnProperty.call(params, key))) {
+        return { content: [{ type: "text", text: "Directory targeting is no longer supported: remove list-cwd, cwd, openProjectPaneIfMissing, and focus. Use intercom list, then specify an explicit to recipient." }], details: { error: true } };
+      }
+      if ((params.action === "send" || params.action === "handover") && !params.to?.trim()) {
+        return { content: [{ type: "text", text: "Missing 'to' recipient. Use intercom list and specify a peer or an explicit destination." }], details: { error: true } };
+      }
       if (params.wait && params.quiet) return { content: [{ type: "text", text: "wait: true cannot be combined with quiet: true" }], details: { error: true } };
       if (params.quiet !== undefined && params.action !== "send") return { content: [{ type: "text", text: "quiet is only supported for send" }], details: { error: true } };
       let connectedClient: IntercomClient;
@@ -2016,7 +1919,7 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, wait, quiet } = params;
+      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, wait, quiet } = params;
       if (wait && action !== "send") return { content: [{ type: "text", text: "wait is only supported for send" }], details: { error: true } };
 
       switch (action) {
@@ -2043,60 +1946,6 @@ Usage:
             return {
               content: [{ type: "text", text: `${currentSection}\n\n${otherSection}` }],
               details: { roster: { peers: otherSessions.length, total: sessions.length } },
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `Failed to list sessions: ${getErrorMessage(error)}` }],
-              details: { error: true },
-            };
-          }
-        }
-
-        case "list-cwd": {
-          try {
-            const mySessionId = connectedClient.sessionId;
-            const sessions = await connectedClient.listSessions();
-            const currentSession = sessions.find(s => s.id === mySessionId);
-
-            if (!currentSession) {
-              return {
-                content: [{ type: "text", text: "Current session is missing from intercom session list." }],
-                details: { error: true },
-              };
-            }
-
-            // Default to the current session's cwd; an explicit `cwd` overrides
-            // (relative paths resolved against it, "." meaning the current cwd).
-            const filterCwd = cwd && cwd !== "."
-              ? resolvePath(currentSession.cwd, cwd)
-              : currentSession.cwd;
-
-            const otherSessions = sessions.filter(
-              s => s.id !== mySessionId && sameCwd(s.cwd, filterCwd),
-            );
-
-            // Fail loud: filtering by a directory with no peers while the
-            // session's OWN cwd has some otherwise reads as a misleading empty
-            // result (common when a caller passes a guessed parent cwd).
-            let emptyNote = "No other sessions in this directory.";
-            if (otherSessions.length === 0 && !sameCwd(filterCwd, currentSession.cwd)) {
-              const here = sessions.filter(
-                s => s.id !== mySessionId && sameCwd(s.cwd, currentSession.cwd),
-              ).length;
-              if (here > 0) {
-                emptyNote += ` Your session's cwd is ${currentSession.cwd} (${here} peer${here === 1 ? "" : "s"} there) — call list-cwd without a cwd argument to list them.`;
-              }
-            }
-
-            const prefixes = sessionIdPrefixes(sessions);
-            const currentSection = `**Current session:**\n${formatSessionListRow(currentSession, currentSession.cwd, true, prefixes.get(currentSession.id)!)}`;
-            const otherSection = otherSessions.length === 0
-              ? `**Other sessions (cwd: ${filterCwd}):**\n${emptyNote}`
-              : `**Other sessions (cwd: ${filterCwd}):**\n${otherSessions.map((session) => formatSessionListRow(session, currentSession.cwd, false, prefixes.get(session.id)!)).join("\n")}`;
-
-            return {
-              content: [{ type: "text", text: `${currentSection}\n\n${otherSection}` }],
-              details: { roster: { peers: otherSessions.length, total: sessions.length, cwd: filterCwd } },
             };
           } catch (error) {
             return {
@@ -2135,25 +1984,19 @@ Usage:
         }
 
         case "send": {
-          if ((!to && !cwd) || !message) {
+          if (!message) {
             return {
-              content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
+              content: [{ type: "text", text: "Missing 'message' parameter" }],
               details: { error: true },
             };
           }
           return deliverMessage(connectedClient, ctx, _signal, {
-            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, wait, quiet,
+            to, message, attachments, replyTo, supersedes, retryOf, wait, quiet,
           });
         }
 
         case "handover": {
           if (isBroadcastDestination(to)) return { content: [{ type: "text", text: "Handover requires a direct recipient, not a broadcast" }], details: { error: true } };
-          if (!to && !cwd) {
-            return {
-              content: [{ type: "text", text: "Missing 'to' or 'cwd' parameter" }],
-              details: { error: true },
-            };
-          }
           if (replyTo || supersedes || retryOf || attachments?.length) {
             return {
               content: [{ type: "text", text: "Handover always sends a new message; replyTo, supersedes, retryOf, and attachments are not supported." }],
@@ -2169,7 +2012,7 @@ Usage:
               details: { error: true },
             };
           }
-          return deliverMessage(connectedClient, ctx, _signal, { to, cwd, openProjectPaneIfMissing, focus, message: handoverText, handover: true });
+          return deliverMessage(connectedClient, ctx, _signal, { to, message: handoverText, handover: true });
         }
 
         case "status": {
@@ -2225,14 +2068,13 @@ Usage:
       if (isPartial) {
         return new Text(theme.fg("warning", "Intercom working..."), 0, 0);
       }
-      const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; reason?: string; roster?: { peers: number; total: number; cwd?: string } } | undefined;
+      const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; reason?: string; roster?: { peers: number; total: number } } | undefined;
       const failed = Boolean(context.isError || details?.error === true || details?.delivered === false);
       let text = failed ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
       if (details?.roster && !failed && !context.expanded) {
         // Collapsed rows are display-only; the model still receives the full roster text.
-        const { peers, total, cwd: rosterCwd } = details.roster;
-        const where = rosterCwd ? ` in ${rosterCwd}` : "";
-        text += theme.fg("text", peers === 0 ? `no other sessions${where}` : `${peers} other session${peers === 1 ? "" : "s"}${where}`);
+        const { peers, total } = details.roster;
+        text += theme.fg("text", peers === 0 ? "no other sessions" : `${peers} other session${peers === 1 ? "" : "s"}`);
         text += theme.fg("dim", ` (${total} connected)`);
         return new Text(text, 0, 0);
       }
@@ -2388,9 +2230,13 @@ Usage:
     }
     const target = input.split(/\s+/, 1)[0]!;
     const goal = input.slice(target.length).trim() || undefined;
-    const isPath = /^(\/|\.\.?\/|~(\/|$))/.test(target);
-    const request = isPath ? { cwd: expandHomePath(target), openProjectPaneIfMissing: true } : { to: target };
-    await performHandover(liveContext, commandGeneration, request, { goal, crossMachine: !isPath && target.includes("@") });
+    // Peer names can contain slashes; reject explicit path syntax, not names like "review/api".
+    const isPath = /^(?:[\\/]|\.\.?([\\/]|$)|~([\\/]|$)|[A-Za-z]:[\\/])/.test(target);
+    if (isPath) {
+      notifyCommand(liveContext, "Directory handovers are no longer supported. Use intercom list, then /handover <peer recipient> [next task].", "error", commandGeneration);
+      return;
+    }
+    await performHandover(liveContext, commandGeneration, { to: target }, { goal, crossMachine: target.includes("@") });
   }
 
   async function openHandoverPicker(ctx: ExtensionContext, generation: number, preselectSessionId?: string): Promise<void> {
@@ -2438,19 +2284,12 @@ Usage:
       await performHandover(ctx, generation, { to: target.target }, { goal, crossMachine: true });
       return;
     }
-    const path = (await ctx.ui.input("Project path for the new session", "~/dev/project"))?.trim();
-    if (!getLiveContext(ctx, generation)) return;
-    if (!path) {
-      notifyIfLive(ctx, "Handover cancelled", "info", generation);
-      return;
-    }
-    await performHandover(ctx, generation, { cwd: expandHomePath(path), openProjectPaneIfMissing: true }, { goal, crossMachine: false });
   }
 
   async function performHandover(
     ctx: ExtensionContext,
     generation: number,
-    request: Pick<DeliveryRequest, "to" | "cwd" | "openProjectPaneIfMissing" | "resolvedPeer">,
+    request: Pick<DeliveryRequest, "to" | "resolvedPeer">,
     options: { goal?: string; crossMachine: boolean },
   ): Promise<void> {
     let handoverClient: IntercomClient;
@@ -2594,7 +2433,7 @@ Usage:
   });
 
   pi.registerCommand("handover", {
-    description: "Summarize this session and hand it over to another session (usage: /handover to pick a session, or /handover <target or project path> [next task])",
+    description: "Summarize this session and hand it over to another session (usage: /handover to pick a session, or /handover <peer recipient> [next task])",
     handler: async (args, ctx) => runHandoverCommand(args, ctx),
   });
 
