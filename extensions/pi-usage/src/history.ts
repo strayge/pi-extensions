@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { opendir, realpath, stat } from "node:fs/promises";
+import { createReadStream, type Dirent } from "node:fs";
+import { opendir, readdir, realpath, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import {
   type ExtensionContext,
   type SessionInfo,
@@ -118,6 +118,8 @@ type ListAll = (sessionDir?: string) => Promise<ListedSession[]>;
 export interface LoadHistoryOptions {
   signal?: AbortSignal;
   now?: number;
+  /** Additional Pi session roots or individual project session directories. */
+  extraSessionDirs?: readonly string[];
   /** Test seam for Pi's public, read-only session listing API. */
   listAll?: ListAll;
   /** Test seam; defaults to pi-subagents' platform-safe temporary root. */
@@ -1362,6 +1364,43 @@ function deduplicateOutputs(
   return retained;
 }
 
+/** Pi's global store has one directory per project; a custom store can be flat. */
+async function listExtraSessionPaths(
+  root: string,
+  warnings: HistoryWarning[],
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const paths: string[] = [];
+  const scan = async (dir: string, includeProjectDirs: boolean, symlink = false) => {
+    checkAbort(signal);
+    let entries: Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      checkAbort(signal);
+      if (symlink && (error as NodeJS.ErrnoException).code === "ENOTDIR") return;
+      warning(
+        warnings,
+        "unreadable-source",
+        `Unable to list session directory: ${String(error)}`,
+        dir,
+      );
+      return;
+    }
+    checkAbort(signal);
+    for (const entry of entries) {
+      checkAbort(signal);
+      const path = join(dir, entry.name);
+      if (entry.isFile() && entry.name.endsWith(".jsonl")) paths.push(path);
+      else if (includeProjectDirs && (entry.isDirectory() || entry.isSymbolicLink())) {
+        await scan(path, false, entry.isSymbolicLink());
+      }
+    }
+  };
+  await scan(root, true);
+  return paths;
+}
+
 /** Load and deduplicate all range-independent historical records without writing sources. */
 export async function loadHistory(
   ctx: Pick<ExtensionContext, "cwd" | "sessionManager">,
@@ -1396,27 +1435,27 @@ export async function loadHistory(
       sessionDir ? SessionManager.listAll(sessionDir) : SessionManager.listAll());
   const listed = await listAll();
   checkAbort(signal);
-  const candidates = [...listed];
-  const listedCanonical = new Set<string>();
-  for (const info of listed) {
-    checkAbort(signal);
-    listedCanonical.add(await canonicalPath(info.path));
-    checkAbort(signal);
-  }
-  if (activeFile && !listedCanonical.has(activeCanonical)) {
+  const paths = new Set<string>();
+  const extraPaths = new Set<string>();
+  const addPaths = async (candidates: Iterable<string>, extra = false) => {
+    for (const path of candidates) {
+      checkAbort(signal);
+      const canonical = await canonicalPath(path);
+      paths.add(canonical);
+      if (extra) extraPaths.add(canonical);
+      checkAbort(signal);
+    }
+  };
+  await addPaths(listed.map((info) => info.path));
+  if (activeFile && !paths.has(activeCanonical)) {
     const customListed = await listAll(activeManager.getSessionDir());
     checkAbort(signal);
-    candidates.push(...customListed);
+    await addPaths(customListed.map((info) => info.path));
   }
-
-  const paths = new Map<string, ListedSession>();
-  for (const info of candidates) {
-    checkAbort(signal);
-    const canonical = await canonicalPath(info.path);
-    checkAbort(signal);
-    if (canonical === activeCanonical) continue;
-    if (!paths.has(canonical)) paths.set(canonical, info);
+  for (const root of options.extraSessionDirs ?? []) {
+    await addPaths(await listExtraSessionPaths(root, warnings, signal), true);
   }
+  paths.delete(activeCanonical);
 
   const activeParent =
     typeof activeHeader.parentSession === "string" && activeHeader.parentSession
@@ -1435,7 +1474,7 @@ export async function loadHistory(
       lineageValid: true,
     },
   ];
-  for (const path of paths.keys()) {
+  for (const path of paths) {
     checkAbort(signal);
     try {
       if ((await stat(path)).mtimeMs < cutoff) continue;
@@ -1469,10 +1508,20 @@ export async function loadHistory(
       const entry = rows[index]?.value;
       if (entry) entries.push(entry);
     }
-    const parentCanonicalPath =
-      typeof header.parentSession === "string" && header.parentSession
-        ? await canonicalPath(resolve(dirname(path), header.parentSession))
-        : undefined;
+    let parentCanonicalPath: string | undefined;
+    const parent = header.parentSession;
+    if (typeof parent === "string" && parent) {
+      const dir = dirname(path);
+      if (extraPaths.has(path) && !isAbsolute(parent) && win32.isAbsolute(parent)) {
+        // Relocate a Windows parent to its discovered sibling only. Don't guess across projects.
+        if (win32.basename(win32.dirname(parent)) === basename(dir)) {
+          const sibling = join(dir, win32.basename(parent));
+          if (extraPaths.has(sibling)) parentCanonicalPath = sibling;
+        }
+      } else {
+        parentCanonicalPath = await canonicalPath(resolve(dir, parent));
+      }
+    }
     checkAbort(signal);
     sessions.push({
       path,

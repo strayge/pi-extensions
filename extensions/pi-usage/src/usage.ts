@@ -807,7 +807,11 @@ export default function usageExtension(
               ctx,
               "Loading usage history…",
               controller.signal,
-              (signal) => history.load(ctx, { signal }),
+              (signal) =>
+                history.load(ctx, {
+                  signal,
+                  extraSessionDirs: loadDisplayConfig().extraSessionDirs,
+                }),
             );
             if (!loaded) {
               if (controller.signal.aborted) return;

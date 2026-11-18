@@ -88,6 +88,28 @@ function resetCreditsLine(
   );
 }
 
+test("manual history sources are validated and survive saving a display preset", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-usage-config-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "usage.json");
+  const sessions = join(dir, "sessions");
+  const extraSessionDirs = [sessions, "relative", 123, sessions];
+  writeFileSync(path, JSON.stringify({ extraSessionDirs }));
+
+  const loaded = loadDisplayConfig(path);
+  assert.deepEqual(loaded.extraSessionDirs, [sessions]);
+  assert.equal(loaded.warnings.length, 2);
+  saveDisplayConfig(presetConfig("full"), path);
+  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).extraSessionDirs, extraSessionDirs);
+  assert.deepEqual(loadDisplayConfig(path).extraSessionDirs, [sessions]);
+  assert.equal(loadDisplayConfig(path).config.preset, "full");
+
+  writeFileSync(path, JSON.stringify({ extraSessionDirs: sessions }));
+  saveDisplayConfig(presetConfig("full"), path);
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).extraSessionDirs, sessions);
+  assert.equal(loadDisplayConfig(path).extraSessionDirs, undefined);
+});
+
 test("durations drop the smaller unit once the larger one makes it noise", () => {
   const ladder: Array<[number, string]> = [
     [0.4, "<1m"],

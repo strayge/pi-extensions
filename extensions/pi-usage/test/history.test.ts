@@ -255,6 +255,110 @@ test("merges active unflushed entries, custom sessions, branch-safe billed calls
   ]);
 });
 
+test("merges configured Pi stores without counting overlapping paths twice", async (t) => {
+  const root = await workspace(t);
+  const local = join(root, "local.jsonl");
+  const extra = join(root, "extra-sessions");
+  const project = join(extra, "--project--");
+  const remote = join(project, "remote.jsonl");
+  const flat = join(extra, "flat.jsonl");
+  const missing = join(root, "missing");
+  await writeJsonl(local, [header("local"), assistant("local-call", null)]);
+  await writeJsonl(remote, [
+    header("remote"),
+    assistant("remote-call", null),
+    custom("remote-observation", "remote-call", "pi-usage:snapshot", snapshot("remote")),
+  ]);
+  await writeJsonl(flat, [header("flat"), assistant("flat-call", null)]);
+  await writeJsonl(join(project, "nested", "deeper", "ignored.jsonl"), [
+    header("nested"),
+    assistant("ignored-call", null),
+  ]);
+  for (const path of [local, remote, flat]) await utimes(path, NOW / 1000, NOW / 1000);
+
+  const result = await loadHistory(
+    context(manager({ dir: root, entries: [assistant("active-call", null)] })),
+    {
+      now: NOW,
+      listAll: async () => [info(local)],
+      extraSessionDirs: [missing, extra, project],
+      outputRoot: join(root, "outputs"),
+    },
+  );
+  assert.deepEqual(result.calls.map((call) => call.entryId).sort(), [
+    "active-call",
+    "flat-call",
+    "local-call",
+    "remote-call",
+  ]);
+  assert.equal(result.snapshots.length, 1);
+  assert.ok(
+    result.warnings.some(
+      (warning) => warning.code === "unreadable-source" && warning.source === missing,
+    ),
+  );
+});
+
+test("discovers an extra store's symlinked project directory", async (t) => {
+  const root = await workspace(t);
+  const project = join(root, "project");
+  const extra = join(root, "extra");
+  const session = join(project, "session.jsonl");
+  await writeJsonl(session, [header("linked"), assistant("linked-call", null)]);
+  await utimes(session, NOW / 1000, NOW / 1000);
+  await mkdir(extra);
+  await symlink(project, join(extra, "linked-project"), "junction");
+
+  const result = await loadHistory(context(manager({ dir: root })), {
+    now: NOW,
+    listAll: async () => [],
+    extraSessionDirs: [extra],
+    outputRoot: join(root, "outputs"),
+  });
+  assert.deepEqual(
+    result.calls.map((call) => call.entryId),
+    ["linked-call"],
+  );
+});
+
+test("relocates Windows fork parents on POSIX only within the same configured project", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const root = await workspace(t);
+  const project = join(root, "--project--");
+  const parent = join(project, "parent.jsonl");
+  const fork = join(project, "fork.jsonl");
+  const other = join(root, "--other--", "fork.jsonl");
+  const copiedCall = assistant("copied-call", null);
+  const windowsParent = "C:\\Users\\test\\.pi\\agent\\sessions\\--project--\\parent.jsonl";
+  await writeJsonl(parent, [header("parent"), copiedCall]);
+  await writeJsonl(fork, [
+    header("fork", windowsParent),
+    copiedCall,
+    assistant("new-call", "copied-call"),
+  ]);
+  await writeJsonl(other, [header("other", windowsParent), copiedCall]);
+  for (const path of [parent, fork, other]) await utimes(path, NOW / 1000, NOW / 1000);
+
+  const result = await loadHistory(context(manager({ dir: root })), {
+    now: NOW,
+    listAll: async () => [],
+    extraSessionDirs: [root],
+    outputRoot: join(root, "outputs"),
+  });
+  assert.deepEqual(result.calls.map((call) => call.entryId).sort(), [
+    "copied-call",
+    "copied-call",
+    "new-call",
+  ]);
+  assert.deepEqual(
+    result.warnings
+      .filter((warning) => warning.code === "broken-lineage")
+      .map((warning) => warning.source),
+    [other],
+  );
+});
+
 test("accounts active standalone usage without changing the inherited model route", async (t) => {
   const root = await workspace(t);
   const route = {

@@ -375,6 +375,35 @@ deduplicated globally by `observationId`, and an unambiguous persisted subagent
 call suppresses its matching transcript copy. Ambiguous associations are kept
 rather than silently undercounted and can produce a concise warning.
 
+### Include sessions from another Pi installation
+
+Add `extraSessionDirs` to the `usage.json` in the agent directory of the Pi
+where you run `/usage` (usually `~/.pi/agent/usage.json`). Use absolute paths
+as seen by that Pi, pointing to the other installation's `sessions` directory
+or to a single project session directory.
+
+For Pi running in WSL, to include Windows sessions:
+
+```json
+{ "extraSessionDirs": ["/mnt/c/Users/stray/.pi/agent/sessions"] }
+```
+
+For Pi running on Windows, to include WSL sessions (replace `Ubuntu` and `user`
+with your distro and username):
+
+```json
+{ "extraSessionDirs": ["\\\\wsl.localhost\\Ubuntu\\home\\user\\.pi\\agent\\sessions"] }
+```
+
+The next `/usage` → History view merges these saved sessions with local history.
+The directories are read-only sources; live quota still uses the active Pi
+account. Unavailable directories are skipped with a history warning. WSL can
+match Windows fork parents within the same discovered project folder. Forks
+with unresolved parents and separate copies of the same store can count calls
+more than once. Temporary subagent transcripts are read only from the local Pi.
+
+### Quota estimates
+
 Quota observations stay separated by provider, identity kind/id, and bucket,
 except that **Anthropic history assumes one account** and combines observations
 across credential changes. A real Anthropic account switch is therefore combined
@@ -440,8 +469,8 @@ consumption can be missed. Account quota can include usage by clients outside
 Pi, while local calls do not retain their historical credential identity.
 Recorded cost may be zero because historical pricing is partial; the extension
 does not invent prices. Temporary subagent output can be disabled, removed, or
-not yet flushed, arbitrary custom session directories are not globally
-discoverable, and ephemeral compaction work is absent from `.output`.
+not yet flushed, custom session directories outside the active or configured
+sources aren't discovered, and ephemeral compaction work is absent from `.output`.
 
 ## Historical model speed
 

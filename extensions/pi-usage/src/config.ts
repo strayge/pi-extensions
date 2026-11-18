@@ -7,7 +7,7 @@
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type {
   UsageBucketMode,
@@ -104,6 +104,7 @@ const PRESETS: Record<PresetName, Omit<UsageDisplayConfig, "version" | "preset">
 
 export interface LoadedDisplayConfig {
   config: UsageDisplayConfig;
+  extraSessionDirs?: string[];
   path: string;
   warnings: string[];
   /** False when the file was missing or unreadable and a preset was used. */
@@ -161,13 +162,36 @@ export function loadDisplayConfig(path = configPath()): LoadedDisplayConfig {
   }
 
   const { config, warnings } = validateDisplayConfig(parsed);
-  return { config, path, warnings, fromFile: true };
+  let extraSessionDirs: string[] | undefined;
+  if (isRecord(parsed) && parsed.extraSessionDirs !== undefined) {
+    if (Array.isArray(parsed.extraSessionDirs)) {
+      extraSessionDirs = [];
+      for (const [index, dir] of parsed.extraSessionDirs.entries()) {
+        if (typeof dir === "string" && !dir.includes("\0") && isAbsolute(dir)) {
+          if (!extraSessionDirs.includes(dir)) extraSessionDirs.push(dir);
+        } else {
+          warnings.push(`extraSessionDirs[${index}] must be an absolute path; skipped`);
+        }
+      }
+    } else {
+      warnings.push("extraSessionDirs is not an array; ignored");
+    }
+  }
+  return { config, extraSessionDirs, path, warnings, fromFile: true };
 }
 
 export function saveDisplayConfig(config: UsageDisplayConfig, path = configPath()): void {
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.tmp`;
-  const stored: UsageDisplayConfig = { ...config, preset: matchingPreset(config) };
+  // Keep hand-written history settings intact, including values the loader rejects.
+  let extraSessionDirs: unknown;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (isRecord(parsed)) extraSessionDirs = parsed.extraSessionDirs;
+  } catch {
+    // No parseable history settings to preserve.
+  }
+  const stored = { ...config, preset: matchingPreset(config), extraSessionDirs };
   writeFileSync(temporary, `${JSON.stringify(stored, null, 2)}\n`, {
     encoding: "utf8",
     mode: 0o600,
