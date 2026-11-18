@@ -2,7 +2,7 @@
 
 Extensions for the [pi](https://github.com/earendil-works/pi) coding agent.
 
-All extensions require pi >=1.0.2.
+All extensions require pi >=1.5.0.
 
 ## vendor/
 

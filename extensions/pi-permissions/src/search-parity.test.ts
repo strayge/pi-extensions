@@ -82,7 +82,7 @@ test("fd and rg differential fixtures cover parent/tool ignore precedence, overr
           "needle",
           directory,
         ],
-        { encoding: "utf8" },
+        { cwd: directory, encoding: "utf8" },
       );
       assert.ok(native.status === 0 || native.status === 1, native.stderr);
       const actual = await grep.execute("grep", { pattern: "needle", glob }, undefined, undefined, ctx);

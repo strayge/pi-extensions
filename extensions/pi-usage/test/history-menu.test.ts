@@ -98,6 +98,17 @@ function snapshot(
   return { snapshot: value, source: { kind: "session", id: `snapshot-${observationId}` } };
 }
 
+function createTestTheme(): Theme {
+  const colors = {
+    accent: "#88ccff",
+    dim: "#777777",
+    muted: "#777777",
+    text: "#ffffff",
+    thinkingXhigh: "#ffffff",
+  };
+  return new Theme(colors as never, { selectedBg: "#333333" } as never, "truecolor");
+}
+
 function fixture(): LoadedHistory {
   const calls = [
     call("a1", 0.5, "provider-a", "model-one"),
@@ -504,11 +515,7 @@ test("Quotas compact names, aligned percentages, details, and indented warnings"
   assert.doesNotMatch(hundred, /Weekly: {2,}100%/);
   firstBucket.observedConsumption = 58;
 
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const theme = new Theme(colors as never, colors as never, "truecolor");
+  const theme = createTestTheme();
   for (let width = 1; width <= 240; width += 1) {
     const options = { view, padToHeight: false };
     const plain = renderUsageHistory(history, state, width, 10_000, options).lines;
@@ -769,11 +776,7 @@ test("per-model quota rows sanitize model IDs and stay width-safe with real them
       intervals: 0,
     },
   ];
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const theme = new Theme(colors as never, colors as never, "truecolor");
+  const theme = createTestTheme();
   const state = { ...createHistoryMenuState(), tab: "Quotas" as const };
   for (let width = 1; width <= 240; width += 1) {
     const options = { view, padToHeight: false };
@@ -894,11 +897,7 @@ test("Cache cells preserve compact counts while dimming only count text", () => 
   assert.match(plainRow, / {3}— 2M {3}/);
   assert.equal(plainRow.includes("\x1b"), false);
 
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const realTheme = new Theme(colors as never, colors as never, "truecolor");
+  const realTheme = createTestTheme();
   const themed = renderUsageHistory(
     history,
     { ...createHistoryMenuState(), tab: "Cache" },
@@ -981,11 +980,7 @@ test("real-theme Cache values retain plain alignment with normal padding and per
   row.gaps["5–10m"] = { samples: 8, percentage: 100 };
   row.gaps["10–30m"] = { samples: 0, percentage: undefined };
 
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const realTheme = new Theme(colors as never, colors as never, "truecolor");
+  const realTheme = createTestTheme();
   for (const width of [140, 80]) {
     const plain = renderUsageHistory(
       history,
@@ -1024,11 +1019,7 @@ test("Cache narrow rows share label, count, and percentage columns at width 129"
     };
   }
 
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const realTheme = new Theme(colors as never, colors as never, "truecolor");
+  const realTheme = createTestTheme();
   const plain = renderUsageHistory(
     history,
     { ...createHistoryMenuState(), tab: "Cache" },
@@ -1103,11 +1094,7 @@ test("Cache huge counts use narrow rows at width 130 without swapping bucket val
 });
 
 test("Cache plain and themed rendering have exhaustive tiny-width parity", () => {
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const realTheme = new Theme(colors as never, colors as never, "truecolor");
+  const realTheme = createTestTheme();
 
   for (const hugeCounts of [false, true]) {
     const history = fixture();
@@ -1322,11 +1309,7 @@ test("warnings are sanitized and scoped to affected sections", () => {
 
 test("warnings and quota names are dim without changing text or layout", () => {
   const history = fixture();
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const theme = new Theme(colors as never, colors as never, "truecolor");
+  const theme = createTestTheme();
   const state = createHistoryMenuState();
   const plain = renderUsageHistory(history, state, 100, 100).lines;
   const themed = renderUsageHistory(history, state, 100, 100, { theme }).lines;
@@ -1443,11 +1426,7 @@ test("narrow tall terminals wrap selector values without hiding the selection", 
 });
 
 test("real-theme ANSI selectors trim spacing before styling at width 10", () => {
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const realTheme = new Theme(colors as never, colors as never, "truecolor");
+  const realTheme = createTestTheme();
   const lines = renderUsageHistory(fixture(), createHistoryMenuState(), 10, 80, {
     theme: realTheme,
   }).lines;
@@ -2473,11 +2452,7 @@ test("narrow quota reports retain colliding sanitized provider headings safely",
   ];
   history.warnings = [];
   const state = { ...createHistoryMenuState(), tab: "Quotas" as const };
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const themes = [undefined, new Theme(colors as never, colors as never, "truecolor")];
+  const themes = [undefined, createTestTheme()];
 
   for (const theme of themes) {
     const width16 = renderUsageHistory(history, state, 16, 100, { theme }).lines;
@@ -2511,11 +2486,7 @@ test("plain tiny rendering stays ANSI-free", () => {
 });
 
 test("tiny selectors remain width-safe with only two selected rows", () => {
-  const colors = new Proxy<Record<string, string>>(
-    { accent: "#88ccff", dim: "#777777" },
-    { get: (target, key: string) => target[key] ?? "#ffffff" },
-  );
-  const themes = [undefined, new Theme(colors as never, colors as never, "truecolor")];
+  const themes = [undefined, createTestTheme()];
 
   for (const theme of themes) {
     for (const width of [1, 2, 3]) {

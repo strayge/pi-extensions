@@ -5,7 +5,7 @@ conversation when switching checkouts. Never commits, merges, fetches, or pushes
 
 ## Install
 
-Requires pi **1.0.4+** and Node **22.19+**. If upstream is installed, first run
+Requires pi **1.5.0+** and Node **22.19+**. If upstream is installed, first run
 `pi uninstall npm:@narumitw/pi-worktree`. **Do not load both:** they register the
 same `/worktree` command.
 

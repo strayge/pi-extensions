@@ -2076,6 +2076,7 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    if (event.messageType !== "user") return; // Custom runs use agent_start below.
     const context = snapshotContext(ctx);
     const sessionId = context.sessionId;
     if (!sessionId) return;
@@ -2091,7 +2092,7 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
     const sessionId = context.sessionId;
     if (!sessionId) return;
     stateFor(sessionStates, sessionId).parentSettled = false;
-    // Idle sendMessage({ triggerTurn: true }) skips before_agent_start.
+    // Track idle sendMessage({ triggerTurn: true }) runs without a user prompt.
     // Normal prompts, retries, and queued continuations already own a turn;
     // keep that ID and its pending completion until agent_settled claims it.
     if (stateFor(sessionStates, sessionId).activeTurnId) return;

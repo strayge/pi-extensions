@@ -121,7 +121,7 @@ describe("strictAgentFiles gates extension activation", () => {
       getSystemPrompt: vi.fn(() => "parent"),
     } as any;
 
-    const result = await agentTool.execute("call-1", { subagent_type: "nope", prompt: "x" }, undefined, vi.fn(), uiCtx);
+    const result = await agentTool.execute("call-1", { description: "Test non-strict agent reload", subagent_type: "nope", prompt: "x" }, undefined, vi.fn(), uiCtx);
     expect(JSON.stringify(result)).not.toContain("Nested mappings");
   });
 });

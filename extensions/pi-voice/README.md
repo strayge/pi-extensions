@@ -1,7 +1,7 @@
 # pi-voice
 
 Local speech-to-text for Pi, with editable filler removal and a correction dictionary for voice dictation.
-Requires Pi >=1.4.0 and Node >=22.19.0.
+Requires Pi >=1.5.0 and Node >=22.19.0.
 
 ## Why this fork exists
 

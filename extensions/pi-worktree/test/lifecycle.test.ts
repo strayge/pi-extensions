@@ -203,7 +203,13 @@ function harness(f: ReturnType<typeof fixture>, initialCwd: string) {
         const injected = hooks.exec?.(directory, args);
         if (injected) return injected;
         try {
-          return { stdout: git(directory, ...args), stderr: "", code: 0, killed: false };
+          return {
+            stdout: git(directory, ...args),
+            stderr: "",
+            code: 0,
+            killed: false,
+            truncated: false,
+          };
         } catch (error) {
           const failure = error as { stdout?: string; stderr?: string; status?: number };
           return {
@@ -211,6 +217,7 @@ function harness(f: ReturnType<typeof fixture>, initialCwd: string) {
             stderr: String(failure.stderr ?? ""),
             code: failure.status ?? 1,
             killed: false,
+            truncated: false,
           };
         }
       },
@@ -637,7 +644,13 @@ test("cleanup failure stays in main and allows a fresh finish retry without rest
     const h = harness(f, f.feature);
     h.hooks.exec = (_cwd, args) =>
       args[0] === "worktree" && args[1] === "remove"
-        ? { stdout: "", stderr: "injected cleanup failure", code: 1, killed: false }
+        ? {
+            stdout: "",
+            stderr: "injected cleanup failure",
+            code: 1,
+            killed: false,
+            truncated: false,
+          }
         : undefined;
     await h.propose({ action: "finish" });
     await h.drain();
@@ -1290,7 +1303,13 @@ for (const problem of [
           ) {
             if (problem === "cancellation") controller.abort();
             else
-              return { stdout: "", stderr: "injected post-check failure", code: 1, killed: false };
+              return {
+                stdout: "",
+                stderr: "injected post-check failure",
+                code: 1,
+                killed: false,
+                truncated: false,
+              };
           }
           return undefined;
         };

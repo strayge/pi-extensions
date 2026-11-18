@@ -24,7 +24,7 @@ notification/Stop dispatch is deferred while a tracked dialog is open, not for
 an entire deferred worktree operation or gaps between screens. Already-dispatched
 requests cannot be recalled.
 
-Requires Pi >=1.0.2 and Node.js >=22.19.0. Outside a cmux surface, it does nothing.
+Requires Pi >=1.5.0 and Node.js >=22.19.0. Outside a cmux surface, it does nothing.
 
 ## Installation
 

@@ -179,7 +179,7 @@ function setup(options: { child?: boolean; hasUI?: boolean; transport?: boolean 
 }
 async function turn(harness: ReturnType<typeof setup>, text = "Done") {
   harness.idle(false);
-  await harness.event("before_agent_start", { prompt: "test" });
+  await harness.event("before_agent_start", { messageType: "user", prompt: "test" });
   await harness.event("agent_start");
   await harness.event("agent_end", {
     messages: [{ role: "assistant", content: [{ type: "text", text }] }],
@@ -311,7 +311,11 @@ test("ordinary turns notify only after final settlement and never twice", async 
   const harness = setup();
   await harness.start();
   harness.idle(false);
-  await harness.event("before_agent_start", { prompt: "test" });
+  const prompt = "Expanded user prompt\n\nWith context";
+  await harness.event("before_agent_start", { messageType: "user", prompt });
+  await flush();
+  assert.equal(payload("prompt-submit").prompt, prompt);
+  await harness.event("agent_start");
   await harness.event("agent_end", { messages: [] });
   await flush();
   assert.equal(hooks("stop").length, 0);
@@ -319,8 +323,32 @@ test("ordinary turns notify only after final settlement and never twice", async 
   await harness.event("agent_settled");
   await harness.event("agent_settled");
   await flush();
+  assert.equal(hooks("prompt-submit").length, 1);
   assert.equal(hooks("stop").length, 1);
   assert.equal(hooks("notification").length, 1);
+  await harness.event("session_shutdown");
+});
+
+test("idle custom runs are tracked without sending custom content as a user prompt", async () => {
+  const harness = setup();
+  await harness.start();
+  harness.idle(false);
+  await harness.event("before_agent_start", {
+    messageType: "custom",
+    message: { role: "custom", customType: "background", content: "Extension context" },
+  });
+  await flush();
+  assert.equal(hooks("prompt-submit").length, 0);
+
+  await harness.event("agent_start");
+  await flush();
+  assert.equal(hooks("prompt-submit").length, 1);
+  assert.equal(Object.hasOwn(payload("prompt-submit"), "prompt"), false);
+  await harness.event("agent_end", { messages: [] });
+  harness.idle(true);
+  await harness.event("agent_settled");
+  await flush();
+  assert.equal(payload("stop").turn_id, payload("prompt-submit").turn_id);
   await harness.event("session_shutdown");
 });
 
@@ -617,7 +645,7 @@ test("new parent turns supersede a pending background completion", async () => {
   await harness.start();
   await turn(harness);
   harness.idle(false);
-  await harness.event("before_agent_start", { prompt: "next" });
+  await harness.event("before_agent_start", { messageType: "user", prompt: "next" });
   manager.finish();
   await flush();
   assert.equal(hooks("stop").length, 0);
@@ -648,7 +676,7 @@ for (const cancelled of [false, true]) {
     const harness = setup({ hasUI: true });
     await harness.start();
     harness.idle(false);
-    await harness.event("before_agent_start", { prompt: "ask" });
+    await harness.event("before_agent_start", { messageType: "user", prompt: "ask" });
     const form = question(harness);
     await flush();
     const notice = payload("notification");
@@ -713,7 +741,7 @@ for (const newerWork of ["main", "background"]) {
       harness.pi.events.emit("subagents:started", { id: "scheduled" });
     } else {
       harness.idle(false);
-      await harness.event("before_agent_start", { prompt: "new work" });
+      await harness.event("before_agent_start", { messageType: "user", prompt: "new work" });
     }
     form.close(undefined);
     await form.result;
@@ -939,7 +967,11 @@ for (const customFirstClose of [false, true]) {
     await flush();
     const first = payload("notification");
     harness.idle(false);
-    await harness.event("before_agent_start", { turnId: "new-turn", prompt: "work" });
+    await harness.event("before_agent_start", {
+      messageType: "user",
+      turnId: "new-turn",
+      prompt: "work",
+    });
     harness.ctx.cwd = path.join(directory, "other-context");
     const approval = harness.ctx.ui.confirm("approval", "allow?");
     await flush();
@@ -1217,7 +1249,7 @@ test("final receipt closing before the queued reset retries completion without a
     },
   );
   harness.idle(false);
-  await harness.event("before_agent_start", { prompt: "work" });
+  await harness.event("before_agent_start", { messageType: "user", prompt: "work" });
   await harness.event("agent_end", {
     messages: [{ role: "assistant", content: [{ type: "text", text: "Original answer" }] }],
   });
@@ -1364,7 +1396,7 @@ for (const shutdown of [false, true]) {
       },
     );
     harness.idle(false);
-    await harness.event("before_agent_start", { prompt: "work" });
+    await harness.event("before_agent_start", { messageType: "user", prompt: "work" });
     await harness.event("tool_execution_end", { toolName: "read", toolCallId: "failed" });
     const stall = stallFeed();
     const notice = stallRun("notification", (entry) => entry.payload?.message === "needs_input");
@@ -1399,7 +1431,7 @@ test("intentional interruption suppression survives deferral and shutdown does n
   await harness.start();
   const stall = stallFeed();
   harness.idle(false);
-  await harness.event("before_agent_start", { prompt: "work" });
+  await harness.event("before_agent_start", { messageType: "user", prompt: "work" });
   await harness.event("agent_end", {
     messages: [
       { role: "assistant", stopReason: "stop", cmuxSuppressNotification: true, content: [] },

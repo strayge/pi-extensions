@@ -31,7 +31,7 @@ no compatibility package.
 pi install npm:@strayge/pi-builtin-tool-limits
 ```
 
-Requires Node.js >=22.19.0 and pi >=1.0.2.
+Requires Node.js >=22.19.0 and pi >=1.5.0.
 
 For development, load this checkout directly:
 

@@ -10,7 +10,7 @@ import { createMockContext, createMockPi } from "./support.ts";
 const oid = "0123456789abcdef0123456789abcdef01234567";
 
 function result(stdout = "", code = 0, stderr = ""): ExecResult {
-  return { stdout, stderr, code, killed: false };
+  return { stdout, stderr, code, killed: false, truncated: false };
 }
 
 function porcelain(

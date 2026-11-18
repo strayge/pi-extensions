@@ -170,6 +170,7 @@ test("currentWorktreePath preserves valid trailing spaces while removing Git's l
         stderr: "",
         code: 0,
         killed: false,
+        truncated: false,
       }),
     },
     "/repo trailing  ",
@@ -184,7 +185,7 @@ test("durable ref checks reject malformed porcelain OIDs without invoking Git", 
       {
         exec: async () => {
           calls += 1;
-          return { stdout: "", stderr: "", code: 0, killed: false };
+          return { stdout: "", stderr: "", code: 0, killed: false, truncated: false };
         },
       },
       "/repo",
@@ -203,6 +204,7 @@ test("prune preview includes Git stderr because verbose prune may write there", 
         stderr: "stderr line\n",
         code: 0,
         killed: false,
+        truncated: false,
       }),
     },
     "/repo",

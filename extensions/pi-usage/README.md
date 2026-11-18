@@ -14,7 +14,7 @@ those limits mean the same thing.
 pi install npm:@strayge/pi-usage
 ```
 
-Requires Node.js >=22.19.0 and pi >=1.0.2.
+Requires Node.js >=22.19.0 and pi >=1.5.0.
 
 For development, load this checkout directly:
 
@@ -318,7 +318,7 @@ Queries that outlive their model — because you switched models while one was i
 flight — are discarded rather than published.
 
 Credentials resolved for a custom or proxy `baseUrl` are never sent to a
-provider's official usage endpoint. The extension requires pi 1.0.2 or newer; this behavior uses pi's
+provider's official usage endpoint. The extension requires pi 1.5.0 or newer; this behavior uses pi's
 resolved-auth origin inspection.
 
 ## Historical usage

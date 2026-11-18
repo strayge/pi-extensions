@@ -1,5 +1,4 @@
 import { BorderedLoader, defineTool, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
@@ -1864,7 +1863,8 @@ Usage:
     ],
 
     parameters: Type.Object({
-      action: StringEnum(["list", "send", "handover", "status", "cancel"] as const, {
+      action: Type.Enum(["list", "send", "handover", "status", "cancel"], {
+        type: "string",
         description: "Action: 'list', 'send', 'handover', 'status', or 'cancel'. Use list for current-pool discovery; send and handover require an explicit recipient. Use send with wait: true to wait for a response.",
       }),
       to: Type.Optional(Type.String({
@@ -1874,7 +1874,7 @@ Usage:
         description: "Message to send. For 'handover', the optional next task for the receiver.",
       })),
       attachments: Type.Optional(Type.Array(Type.Object({
-        type: StringEnum(["file", "snippet", "context"] as const),
+        type: Type.Enum(["file", "snippet", "context"], { type: "string" }),
         name: Type.String(),
         content: Type.String(),
         language: Type.Optional(Type.String()),

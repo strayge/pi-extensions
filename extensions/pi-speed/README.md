@@ -7,7 +7,7 @@ The extension owns the historical `/speed` report and the current-session
 ## Requirements
 
 - Node.js >=22.19.0
-- pi >=1.0.2
+- pi >=1.5.0
 
 ## Installation
 

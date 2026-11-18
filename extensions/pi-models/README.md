@@ -65,7 +65,7 @@ The target model and provider authentication must be available when invoking an 
 pi install npm:@strayge/pi-models
 ```
 
-Requires Node.js >=22.19.0 and pi >=1.0.2.
+Requires Node.js >=22.19.0 and pi >=1.5.0.
 
 For development, load this checkout directly:
 

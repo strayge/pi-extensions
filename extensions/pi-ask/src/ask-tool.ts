@@ -32,17 +32,10 @@ export function registerAskTool(
 			"Clarify ambiguous or preference-sensitive decisions with a short interactive interview before proceeding",
 		promptGuidelines: [...ASK_TOOL_PROMPT_GUIDELINES],
 		parameters: AskParamsSchema,
+		// Pi validates the prepared arguments after this hook, including invalid inputs.
 		prepareArguments: (args) => prepareAskParams(args) as AskParams,
 		execute: (toolCallId, params, signal, onUpdate, ctx) =>
-			executeAskTool(
-				pi,
-				toolCallId,
-				params as AskParams,
-				signal,
-				onUpdate,
-				ctx,
-				remoteAsk
-			),
+			executeAskTool(pi, toolCallId, params, signal, onUpdate, ctx, remoteAsk),
 		renderCall: renderAskToolCall,
 		renderResult: renderAskToolResult,
 	});

@@ -949,7 +949,7 @@ function runGitWithInputAllowFailure(
   timeout = GIT_TIMEOUT_MS,
 ): Promise<ExecResult> {
   if (signal?.aborted) {
-    return Promise.resolve({ stdout: "", stderr: "", code: 1, killed: true });
+    return Promise.resolve({ stdout: "", stderr: "", code: 1, killed: true, truncated: false });
   }
   return new Promise((resolveResult, reject) => {
     // ExtensionAPI.exec has no stdin channel; Git's rule checks and ref transactions need one.
@@ -999,7 +999,13 @@ function runGitWithInputAllowFailure(
     });
     child.once("error", fail);
     child.once("close", (code, closeSignal) => {
-      finish({ stdout, stderr, code: code ?? 1, killed: killed || closeSignal !== null });
+      finish({
+        stdout,
+        stderr,
+        code: code ?? 1,
+        killed: killed || closeSignal !== null,
+        truncated: false, // This runner does not cap captured output.
+      });
     });
     signal?.addEventListener("abort", stop, { once: true });
     if (signal?.aborted) stop();

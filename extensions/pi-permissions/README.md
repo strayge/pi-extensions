@@ -29,7 +29,7 @@ To opt into strict mode, add `"processMode": "strict"` to the user-owned version
 
 ## Setup and configuration
 
-Requires pi >=1.0.2. Load the local package, or install `npm:@strayge/pi-permissions` when available. On Linux, install bubblewrap (with FD bind-mount support), socat, and ripgrep using your system package manager. On macOS, scoped access requires APFS and Apple's `/usr/bin/sandbox-exec`; search uses Homebrew ripgrep (`brew install ripgrep`). No bubblewrap or socat is needed on macOS. The runtime dependency is pinned and patched by `patch-package` during installation. See [native Windows setup and release gates](#native-windows-experimental) for the experimental Windows integration.
+Requires pi >=1.5.0. Load the local package, or install `npm:@strayge/pi-permissions` when available. On Linux, install bubblewrap (with FD bind-mount support), socat, and ripgrep using your system package manager. On macOS, scoped access requires APFS and Apple's `/usr/bin/sandbox-exec`; search uses Homebrew ripgrep (`brew install ripgrep`). No bubblewrap or socat is needed on macOS. The runtime dependency is pinned and patched by `patch-package` during installation. See [native Windows setup and release gates](#native-windows-experimental) for the experimental Windows integration.
 
 The only policy source is `<agent-dir>/permissions/config.json`, normally `~/.pi/agent/permissions/config.json`. Missing configuration uses shipped defaults. Private state and the shared writer lock live beside it as `state-v4.json` and `.authority.lock`. Repository permission policies and other state filenames are ignored.
 

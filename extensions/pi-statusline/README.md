@@ -22,7 +22,7 @@ extension changes nothing until you edit the layout.
 pi install npm:@strayge/pi-statusline
 ```
 
-Requires Node.js >=22.19.0 and pi >=1.0.2.
+Requires Node.js >=22.19.0 and pi >=1.5.0.
 
 For development, load this checkout directly:
 
