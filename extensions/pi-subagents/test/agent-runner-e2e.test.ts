@@ -27,7 +27,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type AgentSession, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, createEventBus, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { extensionCanonicalName, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
@@ -124,6 +124,82 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     }
     return active;
   }
+
+  it("scopes metadata-only child identity through real shared-bus loading, nesting, reload and disposal", async () => {
+    const eventBus = createEventBus();
+    const pi = { ...makePi(), events: eventBus };
+    const model = faux.getModel();
+    const modelRegistry: any = {
+      find: () => model, getAll: () => [model], getAvailable: () => [model],
+      hasConfiguredAuth: () => true, isUsingOAuth: () => false,
+      getApiKeyAndHeaders: async () => ({ apiKey: "faux", headers: {} }),
+      registerProvider: () => {}, unregisterProvider: () => {},
+    };
+    const sessions: AgentSession[] = [];
+    const probe = join(cwd, "identity-probe.mjs");
+    writeFileSync(probe, `export default function(pi) {
+      pi.on("session_start", (_event, ctx) => {
+        pi.events.emit("intercom:session-identity", {
+          version: 1, sessionId: ctx.sessionManager.getSessionId(),
+          claim: (id, relationship) => pi.appendEntry("identity-probe", { id, ...relationship })
+        });
+      });
+    }`);
+    const claims = (sessionId: string) => {
+      const result: unknown[] = [];
+      eventBus.emit("intercom:session-identity", { version: 1, sessionId, claim: (...value: unknown[]) => result.push(value) });
+      return result;
+    };
+    const spawnChild = async (parentSessionId: string, agentId: string, isolated: boolean) => {
+      registerAgents(new Map([["identity", {
+        name: "identity", description: "identity", builtinToolNames: ["read"],
+        extensions: [probe], skills: false, systemPrompt: "No model calls.", promptMode: "replace",
+        inheritContext: false, runInBackground: false, isolated: false, persistSession: false,
+      } as AgentConfig]]));
+      const ctx: any = {
+        cwd, getSystemPrompt: () => "PARENT", model, modelRegistry,
+        sessionManager: { getSessionId: () => parentSessionId },
+      };
+      return (await runAgent(ctx, "identity", "go", {
+        pi, model, agentId, isolated, nested: true,
+        onSessionCreated: (session) => {
+          sessions.push(session);
+          vi.spyOn(session, "prompt").mockResolvedValue(undefined);
+        },
+      })).session;
+    };
+    try {
+      const first = await spawnChild("current-root", "stable-first", false);
+      const second = await spawnChild("other-root", "stable-second", true);
+      const nested = await spawnChild(first.sessionId, "stable-nested", true);
+      expect(first.sessionFile).toBeUndefined();
+      expect(claims(first.sessionId)).toEqual([["stable-first", { parentSessionId: "current-root" }]]);
+      expect(claims(second.sessionId)).toEqual([["stable-second", { parentSessionId: "other-root" }]]);
+      expect(claims(nested.sessionId)).toEqual([["stable-nested", { parentSessionId: first.sessionId }]]);
+      expect(claims("unrelated")).toEqual([]);
+      expect(first.sessionManager.getEntries().filter((entry) => entry.type === "custom" && entry.customType === "identity-probe")).toHaveLength(1);
+      expect(second.getAllTools().map((tool) => tool.name)).toEqual(["read"]);
+      await first.reload();
+      expect(claims(first.sessionId)).toEqual([["stable-first", { parentSessionId: "current-root" }]]);
+      const previousSessionId = first.sessionId;
+      first.sessionManager.newSession();
+      expect(first.sessionId).not.toBe(previousSessionId);
+      expect(claims(previousSessionId)).toEqual([]);
+      expect(claims(first.sessionId)).toEqual([["stable-first", { parentSessionId: "current-root" }]]);
+      await first.reload();
+      expect(claims(first.sessionId)).toEqual([["stable-first", { parentSessionId: "current-root" }]]);
+      expect(first.sessionManager.getEntries().filter((entry) => entry.type === "custom" && entry.customType === "identity-probe")).toHaveLength(1);
+      first.dispose();
+      expect(claims(first.sessionId)).toEqual([]);
+      expect(claims(second.sessionId)).toHaveLength(1);
+      second.dispose();
+      nested.dispose();
+      expect(claims(second.sessionId)).toEqual([]);
+      expect(claims(nested.sessionId)).toEqual([]);
+    } finally {
+      for (const session of sessions) session.dispose();
+    }
+  });
 
   it("real pi-mono admits an extension-registered tool when it's in the allowlist (#47)", async () => {
     const active = await activeToolsFor({ extensions: [FIXTURE] });

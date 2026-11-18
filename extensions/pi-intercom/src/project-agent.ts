@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "child_process";
 import { realpathSync, statSync } from "fs";
 import { resolve } from "path";
 import { sameCwd } from "./cwd.ts";
-import type { SessionInfo } from "./types.ts";
+import { RESERVED_DESTINATIONS, type SessionInfo } from "./types.ts";
 
 const DEFAULT_PROJECT_AGENT_TIMEOUT_MS = 20_000;
 const DEFAULT_PROJECT_AGENT_POLL_MS = 250;
@@ -40,7 +40,7 @@ export interface ProjectTargetResolution {
 }
 
 export interface ListSessionsClient {
-  listSessions(options?: { timeoutMs?: number }): Promise<SessionInfo[]>;
+  listSessions(options?: { timeoutMs?: number; resolve?: string }): Promise<SessionInfo[]>;
 }
 
 function error(code: HerdrErrorCode, message: string, details?: unknown): HerdrResult<never> {
@@ -180,12 +180,13 @@ function resolveProjectRoot(cwd: string): string {
   return realpathSync(resolved);
 }
 
-export function resolveTargetInCwd(input: {
+/** Directory filtering must not turn an exact identity into a local display-name fallback. */
+export async function resolveTargetInCwd(client: ListSessionsClient, input: {
   sessions: SessionInfo[];
   currentSessionId: string;
   targetCwd: string;
   to?: string;
-}): ProjectTargetResolution {
+}): Promise<ProjectTargetResolution> {
   const inCwd = input.sessions.filter((session) => sameCwd(session.cwd, input.targetCwd));
   const target = input.to?.trim();
 
@@ -200,22 +201,27 @@ export function resolveTargetInCwd(input: {
     throw new Error(`Multiple intercom sessions are connected in ${input.targetCwd}: ${formatSessionRefs(candidates)}. Specify 'to'.`);
   }
 
-  const byId = inCwd.find((session) => session.id === target);
-  if (byId) return { kind: "found", session: byId, targetCwd: input.targetCwd };
-
-  const lowerName = target.toLowerCase();
-  const byName = inCwd.filter((session) => session.name?.toLowerCase() === lowerName);
-  if (byName.length === 1) return { kind: "found", session: byName[0], targetCwd: input.targetCwd };
-  if (byName.length > 1) {
-    throw new Error(`Multiple intercom sessions named "${target}" are connected in ${input.targetCwd}: ${formatSessionRefs(byName)}. Address one by session ID.`);
+  if (RESERVED_DESTINATIONS.has(target)) throw new Error(`Reserved destination "${target}" is not a direct peer target.`);
+  const matches = await client.listSessions({ resolve: target });
+  const exact = matches.filter((session) => session.id === target);
+  if (exact.length > 1) throw new Error(`Ambiguous session ID "${target}" across pools; use a unique full session ID.`);
+  const peer = exact[0];
+  if (peer && !sameCwd(peer.cwd, input.targetCwd)) {
+    throw new Error(`Session "${target}" is in ${peer.cwd}, not the requested cwd ${input.targetCwd}.`);
   }
-
-  const byIdPrefix = inCwd.filter((session) => session.id.startsWith(target));
-  if (byIdPrefix.length === 1) return { kind: "found", session: byIdPrefix[0], targetCwd: input.targetCwd };
-  if (byIdPrefix.length > 1) {
-    throw new Error(`Multiple intercom sessions in ${input.targetCwd} match ID prefix "${target}". Use a longer session ID prefix.`);
+  let candidates = exact.filter((session) => session.endpointEpoch);
+  // Keep the broker's full-UUID rule ahead of any directory-scoped alias fallback.
+  if (!peer && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target)) {
+    const lowerName = target.toLowerCase();
+    const named = inCwd.filter((session) => !RESERVED_DESTINATIONS.has(session.name?.toLowerCase() ?? ""));
+    const names = named.filter((session) => session.name?.toLowerCase() === lowerName);
+    const ids = inCwd.filter((session) => session.id.startsWith(target));
+    candidates = names.length > 0 ? names : ids.length > 0 ? ids : named.filter((session) => session.name?.toLowerCase().startsWith(lowerName));
   }
-
+  if (candidates.length === 1) return { kind: "found", session: candidates[0], targetCwd: input.targetCwd };
+  if (candidates.length > 1) {
+    throw new Error(`Multiple intercom sessions matching "${target}" are connected in ${input.targetCwd}: ${formatSessionRefs(candidates)}. Address one by session ID.`);
+  }
   return { kind: "missing", targetCwd: input.targetCwd, reason: `No intercom session matching "${target}" is connected in ${input.targetCwd}.` };
 }
 
@@ -265,7 +271,7 @@ export async function waitForProjectSession(client: ListSessionsClient, input: {
     const sessions = await client.listSessions({ timeoutMs: Math.min(5_000, timeoutMs) });
 
     if (input.to?.trim()) {
-      const resolved = resolveTargetInCwd({
+      const resolved = await resolveTargetInCwd(client, {
         sessions,
         currentSessionId: input.currentSessionId,
         targetCwd: input.projectRoot,

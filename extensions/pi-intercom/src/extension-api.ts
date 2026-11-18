@@ -1,4 +1,4 @@
-import type { SessionInfo } from "./types.ts";
+import type { DeliveryDetails, SessionInfo } from "./types.ts";
 
 export const INTERCOM_EXTENSION_REGISTER_EVENT = "intercom:extension-register";
 export const INTERCOM_EXTENSION_REGISTRY_READY_EVENT = "intercom:extension-registry-ready";
@@ -7,16 +7,16 @@ export const INTERCOM_OUTBOX_RESULT_EVENT = "intercom:outbox-result";
 export const INTERCOM_SESSION_IDENTITY_EVENT = "intercom:session-identity";
 
 /**
- * Emitted on the session's own event bus at session start, before the intercom
- * ID is chosen. An extension that owns this session's routing address (for
- * example a subagent launcher) calls `claim` synchronously; the first non-empty
- * claim becomes this session's intercom ID and wins over `PI_INTERCOM_STABLE_ID`
- * and `stableId`, which are process- and machine-wide. The session name stays
- * free for a human-readable label.
+ * Emitted before choosing the intercom ID. The bus may be shared by SDK sessions:
+ * providers must match sessionId to the exact canonical child they own before
+ * claiming. Claims override process/machine-wide routing configuration. Parent
+ * metadata describes this launch, not the ancestry of a resumed transcript.
+ * Conflicting claims fail rather than selecting another runtime's relationship.
  */
 export interface IntercomSessionIdentityRequestV1 {
   version: 1;
-  claim(stableId: string): void;
+  sessionId: string;
+  claim(stableId: string, relationship?: { parentSessionId?: string }): void;
 }
 
 export type IntercomOutboxResultStatus = "sent" | "rejected" | "blocked" | "failed";
@@ -31,7 +31,8 @@ export type IntercomOutboxResultCode =
   | "target_not_found"
   | "target_ambiguous"
   | "self_target"
-  | "delivery_failed";
+  | "delivery_failed"
+  | "delivery_unknown";
 
 export interface IntercomOutboxRequestV1 {
   version: 1;
@@ -44,7 +45,7 @@ export interface IntercomOutboxRequestV1 {
 
 export type IntercomOutboxRequest = IntercomOutboxRequestV1;
 
-export interface IntercomOutboxResultV1 {
+export interface IntercomOutboxResultV1 extends Partial<DeliveryDetails> {
   version: 1;
   requestId: string;
   status: IntercomOutboxResultStatus;
@@ -52,6 +53,7 @@ export interface IntercomOutboxResultV1 {
   extensionId?: string;
   extensionName?: string;
   messageId?: string;
+  targetId?: string;
   detail?: string;
 }
 

@@ -36,6 +36,10 @@ function isHerdrLocation(value: unknown): boolean {
 
 function isMessageReceiptStatus(value: unknown): value is MessageReceiptStatus {
   return value === "receiver_received"
+    || value === "accepted"
+    || value === "failed"
+    || value === "rejected"
+    || value === "unsupported"
     || value === "queued"
     || value === "injected"
     || value === "acknowledged"
@@ -144,6 +148,9 @@ export function isMessage(value: unknown): value is Message {
   if (value.expectsReply !== undefined && typeof value.expectsReply !== "boolean") {
     return false;
   }
+  if (value.quiet !== undefined && typeof value.quiet !== "boolean") {
+    return false;
+  }
 
   if (value.provenance !== undefined && !isMessageProvenance(value.provenance)) {
     return false;
@@ -168,6 +175,7 @@ export function messageDeliveryFingerprint(message: Message, targetId: string): 
     attachments: message.content.attachments,
     replyTo: message.replyTo,
     expectsReply: message.expectsReply,
+    quiet: message.quiet ?? false,
     supersedes: message.supersedes,
     retryOf: message.retryOf,
     provenance: message.provenance,
@@ -175,8 +183,18 @@ export function messageDeliveryFingerprint(message: Message, targetId: string): 
   });
 }
 
+function hasValidSessionIdentity(value: Record<string, unknown>): boolean {
+  if (value.role !== undefined && value.role !== "agent" && value.role !== "transport") return false;
+  for (const key of ["canonicalSessionId", "parentSessionId"] as const) {
+    const id = value[key];
+    if (id !== undefined && (!isSessionId(id) || id !== id.trim())) return false;
+  }
+  if (value.parentSessionId !== undefined && (!value.canonicalSessionId || value.role !== "agent" || value.parentSessionId === value.canonicalSessionId)) return false;
+  return value.role !== "transport" || value.canonicalSessionId === undefined;
+}
+
 export function isSessionInfo(value: unknown): value is SessionInfo {
-  if (!isRecord(value)) {
+  if (!isRecord(value) || !hasValidSessionIdentity(value)) {
     return false;
   }
 
@@ -235,7 +253,7 @@ export function isSessionId(value: unknown): value is string {
 }
 
 export function isSessionRegistration(value: unknown): value is SessionRegistration {
-  if (!isRecord(value)) {
+  if (!isRecord(value) || !hasValidSessionIdentity(value)) {
     return false;
   }
 
@@ -253,6 +271,9 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
     return false;
   }
   if (value.runtimeFallbackAlias !== undefined && typeof value.runtimeFallbackAlias !== "boolean") {
+    return false;
+  }
+  if (value.features !== undefined && (!Array.isArray(value.features) || !value.features.every((feature) => typeof feature === "string"))) {
     return false;
   }
   if (value.extensions !== undefined && !Array.isArray(value.extensions)) {

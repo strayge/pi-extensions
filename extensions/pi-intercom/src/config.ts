@@ -31,9 +31,6 @@ export function setIntercomScopeId(scopeId: string | undefined): void {
   process.env[INTERCOM_SCOPE_ID_ENV] = scopeId ?? "";
 }
 
-export type InboundTriggerPolicy = "always" | "replies" | "never";
-export type BusyDeliveryPolicy = "steer" | "human-first";
-
 export interface CrossMachineConfig {
   /** Name peers use for this host in their Herdr saved-machine lists. */
   machineName: string;
@@ -50,12 +47,6 @@ export interface IntercomConfig {
 
   /** Require confirmation before non-reply sends from interactive sessions */
   confirmSend: boolean;
-
-  /** Controls whether inbound broker messages may automatically trigger a model turn */
-  inboundTrigger: InboundTriggerPolicy;
-
-  /** Delivery priority for peers arriving during interactive agent runs */
-  busyDelivery: BusyDeliveryPolicy;
 
   /** Optional custom status suffix shown after automatic lifecycle status */
   status?: string;
@@ -81,8 +72,6 @@ const defaults: IntercomConfig = {
   brokerCommand: "npx",
   brokerArgs: ["--no-install", "tsx"],
   confirmSend: false,
-  inboundTrigger: "always",
-  busyDelivery: "steer",
   enabled: true,
   replyHint: true,
   crossMachine: {
@@ -149,22 +138,10 @@ export function loadConfig(): IntercomConfig {
       config.enabled = parsedConfig.enabled;
     }
 
-    if (Object.hasOwn(parsedConfig, "inboundTrigger")) {
-      if (
-        parsedConfig.inboundTrigger !== "always"
-        && parsedConfig.inboundTrigger !== "replies"
-        && parsedConfig.inboundTrigger !== "never"
-      ) {
-        throw new Error(`"inboundTrigger" must be "always", "replies", or "never"`);
+    for (const key of ["inboundTrigger", "busyDelivery"]) {
+      if (Object.hasOwn(parsedConfig, key)) {
+        throw new Error(`"${key}" is no longer supported. Remove it and use per-send quiet: true for next-turn delivery or quiet: false (the direct-message default) for active delivery.`);
       }
-      config.inboundTrigger = parsedConfig.inboundTrigger;
-    }
-
-    if (Object.hasOwn(parsedConfig, "busyDelivery")) {
-      if (parsedConfig.busyDelivery !== "steer" && parsedConfig.busyDelivery !== "human-first") {
-        throw new Error(`"busyDelivery" must be "steer" or "human-first"`);
-      }
-      config.busyDelivery = parsedConfig.busyDelivery;
     }
 
     if (Object.hasOwn(parsedConfig, "replyHint")) {

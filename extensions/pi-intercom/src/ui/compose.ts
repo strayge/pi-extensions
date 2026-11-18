@@ -81,6 +81,7 @@ export class ComposeOverlay implements Component {
 
     try {
       const result = await this.client.send(this.target.id, {
+        target: this.target,
         text: this.inputBuffer.trim(),
       });
       

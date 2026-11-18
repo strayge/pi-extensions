@@ -1,3 +1,5 @@
+import { RESERVED_DESTINATIONS } from "./types.ts";
+
 const FULL_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION_ID_IN_PATH = /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 export const DISCOVERY_TIMEOUT_MS = 5_000;
@@ -80,6 +82,7 @@ export function parseCrossMachineTarget(target: string): { agentTarget: string; 
   if (parts.length !== 2 || parts.some((part) => !part || /\s/.test(part))) {
     throw new Error(`Invalid remote target "${target}"; expected name@machine or full-session-uuid@machine.`);
   }
+  if (RESERVED_DESTINATIONS.has(parts[0]!)) throw new Error(`Built-in destination "${parts[0]}" does not support SSH routing`);
   return { agentTarget: parts[0]!, machineLabel: parts[1]! };
 }
 

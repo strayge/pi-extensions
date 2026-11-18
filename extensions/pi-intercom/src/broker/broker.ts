@@ -1,5 +1,5 @@
 import net from "net";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
+import { writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { createHash, randomUUID } from "crypto";
 import { writeMessage, createMessageReader, MAX_FRAME_BYTES } from "./framing.ts";
@@ -9,16 +9,13 @@ import {
   getBrokerListenTarget,
   getBrokerPortFilePath,
   getIntercomDirPath,
-  INTERCOM_DIR_MODE,
   INTERCOM_PROTOCOL_NAME,
   INTERCOM_PROTOCOL_VERSION,
   INTERCOM_RUNTIME_FILE_MODE,
   restrictIntercomRuntimeFile,
   type BrokerConnectTarget,
 } from "./paths.ts";
-import { getAskTimeoutMs } from "../config.ts";
-import { sameCwd } from "../cwd.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_HELD_ERROR_CODE } from "../types.ts";
+import { BROADCAST_AUDIENCE_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, PARENT_IDENTITY_FEATURE, RESERVED_DESTINATIONS, SESSION_HELD_ERROR_CODE, UNIFIED_MESSAGING_FEATURE } from "../types.ts";
 import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
@@ -28,7 +25,6 @@ const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
 const PID_PATH = join(INTERCOM_DIR, "broker.pid");
 const PORT_PATH = getBrokerPortFilePath(INTERCOM_DIR);
-const PENDING_ASKS_DIR = join(INTERCOM_DIR, "pending-asks");
 const BROKER_STATE_ID = randomUUID();
 const MAX_SESSIONS = 128;
 const MAX_UNREGISTERED_CONNECTIONS = 32;
@@ -47,7 +43,8 @@ const DELIVERY_RECORD_RETENTION_MS = 60 * 60 * 1000;
 const MAX_DELIVERY_RECORDS = 4096;
 // Must stay below the client's 10s send timeout, so an unconfirmed send resolves as unknown instead of throwing.
 const RECEIPT_TIMEOUT_MS = readPositiveIntEnv(process.env.PI_INTERCOM_RECEIPT_TIMEOUT_MS, 5000, 10_000);
-const RECEIPT_PROOF_STATUSES = new Set<MessageReceiptStatus>(["receiver_received", "acknowledged", "queued", "injected"]);
+const RECEIPT_PROOF_STATUSES = new Set<MessageReceiptStatus>(["accepted", "acknowledged", "queued", "injected"]);
+const RECEIPT_FAILURE_STATUSES = new Set<MessageReceiptStatus>(["failed", "rejected", "unsupported", "expired", "cancelled", "superseded"]);
 const LIVENESS_MISSED_INTERVALS = 3;
 const LIVENESS_SWEEP_MS = readPositiveIntEnv(process.env.PI_INTERCOM_LIVENESS_SWEEP_MS, 10_000);
 const TCP_KEEPALIVE_DELAY_MS = 30_000;
@@ -77,7 +74,7 @@ interface ConnectedSession {
   /** Stable Pi session identity used only for live Herdr snapshot joins. This
    * is a self-asserted local-client hint, not authenticated location evidence. */
   herdrSessionPath?: string;
-  acknowledgesReceipts: boolean;
+  unifiedMessaging: boolean;
   /** Heartbeat interval the client promised; absent for clients that never heartbeat. */
   livenessIntervalMs?: number;
   lastInboundAt: number;
@@ -89,8 +86,6 @@ interface PendingReceipt {
   fromKey: string;
   messageId: string;
   targetSocket: net.Socket;
-  scopeId?: string;
-  replyTo?: string;
   timer: NodeJS.Timeout;
 }
 
@@ -118,21 +113,9 @@ interface ConnectionState {
   lastRefillAt: number;
 }
 
-interface AskEdge {
+interface WaitEdge {
   from: string;
   to: string;
-  scopeId?: string;
-  createdAt: number;
-}
-
-interface PendingAskRecord {
-  askId: string;
-  messageId: string;
-  asker: { sessionId: string; name: string | null };
-  target: { sessionId: string; name: string | null };
-  question: string;
-  createdAt: number;
-  expiresAt: number;
 }
 
 interface MessageReceiptRoute {
@@ -143,6 +126,7 @@ interface MessageReceiptRoute {
 
 interface DisconnectedSession {
   info: SessionInfo;
+  unifiedMessaging: boolean;
   key: string;
   scopeId?: string;
   disconnectedAt: number;
@@ -151,10 +135,7 @@ interface DisconnectedSession {
 interface MailboxMessage {
   from: SessionInfo;
   fromKey: string;
-  fromScopeId?: string;
-  target: SessionInfo;
   targetKey: string;
-  targetScopeId?: string;
   message: Message;
   queuedAt: number;
 }
@@ -201,50 +182,13 @@ function scopedExtensionStateNamespace(scopeId: string | undefined, namespace: s
   return JSON.stringify(["scope", createHash("sha256").update(scopeId).digest("hex"), namespace]);
 }
 
-function scopedPendingAskRecordPath(scopeId: string | undefined, messageId: string): string {
-  if (!scopeId) {
-    return pendingAskRecordPath(messageId);
-  }
-  const scopeHash = createHash("sha256").update(scopeId).digest("hex");
-  return join(PENDING_ASKS_DIR, `${scopeHash}-${encodeURIComponent(messageId)}.json`);
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isPendingAskRecord(value: unknown): value is PendingAskRecord {
-  if (!isRecord(value) || !isRecord(value.asker) || !isRecord(value.target)) {
-    return false;
-  }
-  return typeof value.askId === "string"
-    && typeof value.messageId === "string"
-    && typeof value.asker.sessionId === "string"
-    && (typeof value.asker.name === "string" || value.asker.name === null)
-    && typeof value.target.sessionId === "string"
-    && (typeof value.target.name === "string" || value.target.name === null)
-    && typeof value.question === "string"
-    && typeof value.createdAt === "number"
-    && Number.isSafeInteger(value.createdAt)
-    && typeof value.expiresAt === "number"
-    && Number.isSafeInteger(value.expiresAt)
-    && value.expiresAt >= value.createdAt;
-}
-
-function pendingAskRecordPath(messageId: string): string {
-  return join(PENDING_ASKS_DIR, `${encodeURIComponent(messageId)}.json`);
-}
-
-function ensurePendingAskRecordDir(): void {
-  mkdirSync(PENDING_ASKS_DIR, { recursive: true, mode: INTERCOM_DIR_MODE });
-  if (process.platform !== "win32") {
-    chmodSync(PENDING_ASKS_DIR, INTERCOM_DIR_MODE);
-  }
-}
-
 class IntercomBroker {
   private sessions = new Map<string, ConnectedSession>();
-  private askEdges = new Map<string, AskEdge>();
+  private waits = new Map<string, WaitEdge>();
   private messageReceiptRoutes = new Map<string, MessageReceiptRoute>();
   private disconnectedSessions = new Map<string, DisconnectedSession>();
   private mailboxMessages: MailboxMessage[] = [];
@@ -255,7 +199,6 @@ class IntercomBroker {
   private server: net.Server;
   private lastLivenessSweepAt = Date.now();
   private shutdownTimer: NodeJS.Timeout | null = null;
-  private readonly askTimeoutMs = getAskTimeoutMs();
   private namespaceOwners = new Map<string, NamespaceOwner>();
   private nextOwnerOrder = 1;
   private extensionStateManager: ExtensionStateManager;
@@ -263,8 +206,6 @@ class IntercomBroker {
   constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
     assertNoLiveBroker(PID_PATH);
-    ensurePendingAskRecordDir();
-    this.prunePendingAskRecords();
     this.extensionStateManager = new ExtensionStateManager(INTERCOM_DIR);
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {
@@ -513,6 +454,11 @@ class IntercomBroker {
           }
           id = clientMessage.sessionId;
         }
+        if (RESERVED_DESTINATIONS.has(id)) {
+          writeMessage(socket, { type: "error", code: "E_RESERVED_ID", error: `Reserved routing ID "${id}"; configure a different session ID` });
+          socket.end();
+          break;
+        }
         const scopeId = normalizeScopeId(clientMessage.scopeId);
         const key = scopedSessionKey(scopeId, id);
         const session = clientMessage.session;
@@ -557,6 +503,9 @@ class IntercomBroker {
         const info: SessionInfo = {
           id,
           endpointEpoch: randomUUID(),
+          ...(session.role !== undefined ? { role: session.role } : {}),
+          ...(session.canonicalSessionId !== undefined ? { canonicalSessionId: session.canonicalSessionId } : {}),
+          ...(session.parentSessionId !== undefined ? { parentSessionId: session.parentSessionId } : {}),
           ...(session.name !== undefined ? { name: session.name } : {}),
           ...(session.runtimeFallbackAlias !== undefined ? { runtimeFallbackAlias: session.runtimeFallbackAlias } : {}),
           cwd: session.cwd,
@@ -579,7 +528,7 @@ class IntercomBroker {
           ownerOrder: previous?.ownerOrder ?? this.nextOwnerOrder++,
           extensions,
           ...(session.herdrSessionPath ? { herdrSessionPath: session.herdrSessionPath } : {}),
-          acknowledgesReceipts: session.acknowledgesReceipts === true,
+          unifiedMessaging: session.features?.includes(UNIFIED_MESSAGING_FEATURE) === true,
           ...(session.livenessIntervalMs !== undefined ? { livenessIntervalMs: session.livenessIntervalMs } : {}),
           lastInboundAt: Date.now(),
         };
@@ -597,7 +546,7 @@ class IntercomBroker {
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE],
+          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, UNIFIED_MESSAGING_FEATURE, PARENT_IDENTITY_FEATURE, BROADCAST_AUDIENCE_FEATURE],
         });
         this.broadcast({ type: "session_joined", session: info }, key, scopeId);
 
@@ -632,7 +581,31 @@ class IntercomBroker {
         }
         const existing = this.sessions.get(currentKey);
         if (existing?.socket === socket) {
-          this.rememberDisconnectedSession(existing);
+          let retained = existing;
+          if (clientMessage.moveToScopeId !== undefined) {
+            const scopeId = clientMessage.moveToScopeId === null ? undefined : normalizeScopeId(clientMessage.moveToScopeId);
+            const key = scopedSessionKey(scopeId, existing.info.id);
+            // Only an explicit request from this identity's owner may move its retained mailbox.
+            if (key !== currentKey && !this.sessions.has(key) && !this.disconnectedSessions.has(key)) {
+              retained = { ...existing, key, scopeId };
+              for (const edge of this.waits.values()) {
+                if (edge.to === currentKey) edge.to = key;
+              }
+              for (const entry of this.mailboxMessages) {
+                if (entry.targetKey === currentKey) entry.targetKey = key;
+                if (entry.fromKey === currentKey) {
+                  entry.fromKey = key;
+                  const oldRecordKey = this.deliveryRecordKey(currentKey, entry.message.id);
+                  const record = this.deliveryRecords.get(oldRecordKey);
+                  if (record) {
+                    this.deliveryRecords.delete(oldRecordKey);
+                    this.deliveryRecords.set(this.deliveryRecordKey(key, entry.message.id), record);
+                  }
+                }
+              }
+            }
+          }
+          this.rememberDisconnectedSession(retained);
           this.sessions.delete(currentKey);
           this.clearMessageReceiptRoutesForSession(currentKey);
           this.broadcast({ type: "session_left", sessionId: existing.info.id }, currentKey, existing.scopeId);
@@ -691,6 +664,25 @@ class IntercomBroker {
         if (!requester || requester.socket !== socket) {
           throw new Error("List session not found");
         }
+        if (clientMessage.audience !== undefined) {
+          if ((clientMessage.audience !== "workspace" && clientMessage.audience !== "global") || clientMessage.resolve !== undefined) throw new Error("Invalid broadcast audience request");
+          const sessions = Array.from(this.sessions.values())
+            .filter(session => session.key !== requester.key
+              && session.info.role === "agent"
+              && !session.info.parentSessionId
+              && (clientMessage.audience === "global" || sameScope(session.scopeId, requester.scopeId)))
+            .map(session => session.info);
+          writeMessage(socket, { type: "sessions", requestId: clientMessage.requestId, sessions });
+          break;
+        }
+        if (clientMessage.resolve !== undefined) {
+          if (typeof clientMessage.resolve !== "string" || (RESERVED_DESTINATIONS.has(clientMessage.resolve) && clientMessage.resolve !== "parent")) throw new Error("Invalid direct peer destination");
+          const targets = clientMessage.resolve === "parent"
+            ? this.resolveParent(requester)
+            : this.resolveTargets(clientMessage.resolve, requester.scopeId);
+          writeMessage(socket, { type: "sessions", requestId: clientMessage.requestId, sessions: targets.map((target) => this.sessions.has(target.key) ? target.info : { ...target.info, endpointEpoch: undefined }) });
+          break;
+        }
         const sessions = Array.from(this.sessions.values())
           .filter(session => sameScope(session.scopeId, requester.scopeId))
           .map(s => s.info);
@@ -734,35 +726,49 @@ class IntercomBroker {
           break;
         }
 
+        if (!fromSession.unifiedMessaging) {
+          this.writeDeliveryFailure(socket, message.id, "Sender requires a coordinated intercom upgrade and reload", "E_INCOMPATIBLE_CLIENT");
+          break;
+        }
+        if (RESERVED_DESTINATIONS.has(clientMessage.to)) {
+          this.writeDeliveryFailure(socket, message.id, "Reserved destination is not available for direct peer routing", "E_RESERVED_TARGET");
+          break;
+        }
         const brokerReceivedAt = Date.now();
-        this.pruneAskEdges();
         this.pruneMessageReceiptRoutes(brokerReceivedAt);
-        const replyEdge = message.replyTo ? this.askEdges.get(message.replyTo) : undefined;
 
         const hasTargetId = clientMessage.targetId !== undefined;
         const hasTargetEpoch = clientMessage.targetEpoch !== undefined;
         if (
-          hasTargetId !== hasTargetEpoch
+          (hasTargetEpoch && !hasTargetId)
           || (hasTargetId && (typeof clientMessage.targetId !== "string" || clientMessage.targetId.length === 0))
           || (hasTargetEpoch && (typeof clientMessage.targetEpoch !== "string" || clientMessage.targetEpoch.length === 0))
         ) {
-          this.writeDeliveryFailure(socket, message.id, "Exact target requires an id and endpoint epoch", "E_INVALID_TARGET");
+          this.writeDeliveryFailure(socket, message.id, "Exact target requires a valid id and optional endpoint epoch", "E_INVALID_TARGET");
           break;
         }
-        if (hasTargetId && hasTargetEpoch) {
+        const resolved = hasTargetId
+          ? this.exactTargets(clientMessage.targetId as string)
+          : this.resolveTargets(clientMessage.to as string, fromSession.scopeId);
+        if (resolved.length > 1) {
+          this.writeDeliveryFailure(socket, message.id, "Ambiguous session target; use a unique full session ID", "E_AMBIGUOUS_TARGET");
+          break;
+        }
+        if (hasTargetId) {
           const targetId = clientMessage.targetId as string;
-          const targetEpoch = clientMessage.targetEpoch as string;
+          const targetEpoch = clientMessage.targetEpoch as string | undefined;
           const fingerprint = messageDeliveryFingerprint(message, targetId);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;
           }
-          const exactTarget = this.sessions.get(scopedSessionKey(fromSession.scopeId, targetId));
+          const exactTarget = resolved[0];
           if (!exactTarget) {
             this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Session not found", "E_TARGET_NOT_FOUND");
             this.writeDeliveryFailure(socket, message.id, "Session not found", "E_TARGET_NOT_FOUND");
             break;
           }
-          if (exactTarget.info.endpointEpoch !== targetEpoch) {
+          const liveEpoch = this.sessions.get(exactTarget.key)?.info.endpointEpoch;
+          if (liveEpoch !== targetEpoch) {
             this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
             this.writeDeliveryFailure(socket, message.id, "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
             break;
@@ -770,13 +776,16 @@ class IntercomBroker {
           clientMessage.to = targetId;
         }
 
-        const targets = this.findSessions(clientMessage.to as string, fromSession.scopeId);
-        if (targets.length === 1) {
-          if (message.replyTo && !replyEdge) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
+        if (message.quiet && message.expectsReply) {
+          this.writeDeliveryFailure(socket, message.id, "wait: true cannot be combined with quiet: true", "E_WAIT_QUIET");
+          break;
+        }
+        const target = resolved[0] ? this.sessions.get(resolved[0].key) : undefined;
+        if (target) {
+          if (!target.unifiedMessaging) {
+            this.writeDeliveryFailure(socket, message.id, "Receiver requires a coordinated intercom upgrade and reload", "E_INCOMPATIBLE_RECEIVER");
             break;
           }
-          const target = targets[0]!;
           const fingerprint = messageDeliveryFingerprint(message, target.info.id);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;
@@ -788,23 +797,16 @@ class IntercomBroker {
               break;
             }
           }
-          if (replyEdge && (replyEdge.to !== currentKey || replyEdge.from !== target.key)) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match the pending ask", "E_REPLY_TARGET");
-            break;
-          }
           if (message.expectsReply) {
-            const reverseEdge = Array.from(this.askEdges.entries()).find(([edgeMessageId, edge]) => edgeMessageId !== message.replyTo && edge.from === target.key && edge.to === currentKey);
-            if (reverseEdge) {
-              this.writeDeliveryFailure(socket, message.id, "Mutual ask refused: target session is already waiting for a reply from this session.", "E_MUTUAL_ASK");
+            if (Array.from(this.waits.values()).some((edge) => edge.from === currentKey)) {
+              this.writeDeliveryFailure(socket, message.id, "Already waiting for a reply", "E_ALREADY_WAITING");
               break;
             }
-            this.writePendingAskRecord(message, fromSession, target.info, brokerReceivedAt);
-            this.askEdges.set(message.id, {
-              from: currentKey,
-              to: target.key,
-              ...(fromSession.scopeId ? { scopeId: fromSession.scopeId } : {}),
-              createdAt: brokerReceivedAt,
-            });
+            if (Array.from(this.waits.values()).some((edge) => edge.from === target.key && edge.to === currentKey)) {
+              this.writeDeliveryFailure(socket, message.id, "Mutual wait refused: target is already waiting for this session", "E_MUTUAL_WAIT");
+              break;
+            }
+            this.waits.set(this.deliveryRecordKey(currentKey, message.id), { from: currentKey, to: target.key });
           }
           const deliveredMessage: Message = {
             ...message,
@@ -831,22 +833,12 @@ class IntercomBroker {
             from: fromSession.info,
             message: deliveredMessage,
           });
-          this.completeSocketDelivery(socket, currentKey, fromSession.scopeId, target, message, fingerprint);
+          this.completeSocketDelivery(socket, currentKey, target, message, fingerprint);
           break;
         }
 
-        if (targets.length > 1) {
-          this.writeDeliveryFailure(socket, message.id, `Multiple sessions named \"${clientMessage.to}\" are connected. Use the session ID instead.`, "E_AMBIGUOUS_TARGET");
-          break;
-        }
-
-        const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to as string, fromSession.scopeId);
-        if (disconnectedTargets.length === 1) {
-          if (message.replyTo && !replyEdge) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
-            break;
-          }
-          const disconnectedTarget = disconnectedTargets[0]!;
+        const disconnectedTarget = resolved[0] ? this.disconnectedSessions.get(resolved[0].key) : undefined;
+        if (disconnectedTarget) {
           const target = disconnectedTarget.info;
           const fingerprint = messageDeliveryFingerprint(message, target.id);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
@@ -856,39 +848,17 @@ class IntercomBroker {
             this.writeDeliveryFailure(socket, message.id, "Supersede target is not connected", "E_SUPERSEDE_TARGET");
             break;
           }
-          if (replyEdge && (replyEdge.to !== currentKey || replyEdge.from !== disconnectedTarget.key)) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match the pending ask", "E_REPLY_TARGET");
-            break;
-          }
           if (message.expectsReply) {
-            this.writeDeliveryFailure(socket, message.id, "Target session is not currently connected; blocking asks are not queued", "E_TARGET_DISCONNECTED");
+            this.writeDeliveryFailure(socket, message.id, "Target session is not currently connected; waiting sends are not queued", "E_TARGET_DISCONNECTED");
             break;
           }
-          const liveMailboxTarget = this.findUniqueLiveSessionForDisconnectedSession(disconnectedTarget, currentKey);
-          if (liveMailboxTarget) {
-            const deliveredMessage: Message = {
-              ...message,
-              brokerReceivedAt,
-              brokerDeliveredAt: Date.now(),
-            };
-            this.messageReceiptRoutes.set(message.id, { from: currentKey, to: liveMailboxTarget.key, createdAt: brokerReceivedAt });
-            writeMessage(liveMailboxTarget.socket, {
-              type: "message",
-              from: fromSession.info,
-              message: deliveredMessage,
-            });
-            this.completeSocketDelivery(socket, currentKey, fromSession.scopeId, liveMailboxTarget, message, fingerprint);
+          if (!disconnectedTarget.unifiedMessaging) {
+            this.writeDeliveryFailure(socket, message.id, "Receiver requires a coordinated intercom upgrade and reload", "E_INCOMPATIBLE_RECEIVER");
             break;
           }
           this.queueMailboxMessage(fromSession, disconnectedTarget, message, brokerReceivedAt);
-          this.releaseReplyEdge(message.replyTo, fromSession.scopeId);
           this.recordDelivery(currentKey, message.id, fingerprint, "queued");
           this.writeDeliverySuccess(socket, message.id, "queued");
-          break;
-        }
-
-        if (disconnectedTargets.length > 1) {
-          this.writeDeliveryFailure(socket, message.id, `Multiple disconnected sessions named \"${clientMessage.to}\" can receive queued mail. Use the session ID instead.`, "E_AMBIGUOUS_TARGET");
           break;
         }
 
@@ -907,8 +877,21 @@ class IntercomBroker {
         const route = this.messageReceiptRoutes.get(clientMessage.receipt.messageId);
         const receiver = this.sessions.get(currentKey);
         const sender = route ? this.sessions.get(route.from) : undefined;
-        if (route?.to === currentKey && receiver?.socket === socket && RECEIPT_PROOF_STATUSES.has(clientMessage.receipt.status)) {
-          this.confirmPendingReceipt(this.deliveryRecordKey(route.from, clientMessage.receipt.messageId), socket);
+        if (route?.to === currentKey && receiver?.socket === socket) {
+          const key = this.deliveryRecordKey(route.from, clientMessage.receipt.messageId);
+          if (RECEIPT_PROOF_STATUSES.has(clientMessage.receipt.status)) {
+            if (this.deliveryRecords.get(key)?.state !== "failed") {
+              this.updateDeliveryRecord(route.from, clientMessage.receipt.messageId, "socket_delivered");
+            }
+            this.confirmPendingReceipt(key, socket);
+            if (this.deliveryRecords.get(key)?.state === "failed") break;
+          } else if (RECEIPT_FAILURE_STATUSES.has(clientMessage.receipt.status)) {
+            const reason = clientMessage.receipt.detail ?? `Receiver reported ${clientMessage.receipt.status}`;
+            const code = `E_RECEIVER_${clientMessage.receipt.status.toUpperCase()}`;
+            this.updateDeliveryRecord(route.from, clientMessage.receipt.messageId, "failed", reason, code);
+            // A late failure need not settle the owner's waiter; cancel_ask owns that cleanup.
+            this.failPendingReceipt(key, reason, code, true);
+          }
         }
         if (route?.to === currentKey && receiver?.socket === socket && sender) {
           writeMessage(sender.socket, {
@@ -934,11 +917,7 @@ class IntercomBroker {
         if (queuedIndex >= 0 && sender?.socket === socket) {
           this.mailboxMessages.splice(queuedIndex, 1);
           this.updateDeliveryRecord(currentKey, clientMessage.messageId, "failed", "Sender cancelled the queued delivery", "E_DELIVERY_CANCELLED");
-          const edge = this.askEdges.get(clientMessage.messageId);
-          if (edge?.from === currentKey) {
-            this.askEdges.delete(clientMessage.messageId);
-            this.removePendingAskRecord(clientMessage.messageId, sender.scopeId);
-          }
+          this.waits.delete(this.deliveryRecordKey(currentKey, clientMessage.messageId));
           writeMessage(socket, { type: "delivered", messageId: clientMessage.messageId });
           break;
         }
@@ -961,11 +940,7 @@ class IntercomBroker {
             timestamp: Date.now(),
           },
         });
-        const edge = this.askEdges.get(clientMessage.messageId);
-        if (edge?.from === currentKey) {
-          this.askEdges.delete(clientMessage.messageId);
-          this.removePendingAskRecord(clientMessage.messageId, sender.scopeId);
-        }
+        this.waits.delete(this.deliveryRecordKey(currentKey, clientMessage.messageId));
         this.updateDeliveryRecord(currentKey, clientMessage.messageId, "failed", "Sender cancelled the delivery", "E_DELIVERY_CANCELLED");
         writeMessage(socket, { type: "delivered", messageId: clientMessage.messageId });
         break;
@@ -979,10 +954,8 @@ class IntercomBroker {
           throw new Error("Invalid cancel_ask message");
         }
         const session = this.sessions.get(currentKey);
-        const edge = this.askEdges.get(clientMessage.messageId);
-        if (session?.socket === socket && edge?.from === currentKey) {
-          this.askEdges.delete(clientMessage.messageId);
-          this.removePendingAskRecord(clientMessage.messageId, session.scopeId);
+        if (session?.socket === socket) {
+          this.waits.delete(this.deliveryRecordKey(currentKey, clientMessage.messageId));
         }
         break;
       }
@@ -1091,6 +1064,7 @@ class IntercomBroker {
   private rememberDisconnectedSession(session: ConnectedSession, now = Date.now()): void {
     this.disconnectedSessions.set(session.key, {
       info: { ...session.info },
+      unifiedMessaging: session.unifiedMessaging,
       key: session.key,
       ...(session.scopeId ? { scopeId: session.scopeId } : {}),
       disconnectedAt: now,
@@ -1110,10 +1084,6 @@ class IntercomBroker {
     for (let index = this.mailboxMessages.length - 1; index >= 0; index -= 1) {
       const entry = this.mailboxMessages[index]!;
       if (now - entry.queuedAt > MAILBOX_MESSAGE_RETENTION_MS) {
-        if (entry.message.expectsReply) {
-          this.askEdges.delete(entry.message.id);
-          this.removePendingAskRecord(entry.message.id, entry.fromScopeId);
-        }
         this.messageReceiptRoutes.delete(entry.message.id);
         this.updateDeliveryRecord(entry.fromKey, entry.message.id, "failed", "Mailbox delivery expired", "E_DELIVERY_EXPIRED");
         this.mailboxMessages.splice(index, 1);
@@ -1126,20 +1096,13 @@ class IntercomBroker {
     while (this.mailboxMessages.length >= MAX_MAILBOX_MESSAGES) {
       const evicted = this.mailboxMessages.shift();
       if (!evicted) break;
-      if (evicted.message.expectsReply) {
-        this.askEdges.delete(evicted.message.id);
-        this.removePendingAskRecord(evicted.message.id, evicted.fromScopeId);
-      }
       this.messageReceiptRoutes.delete(evicted.message.id);
       this.updateDeliveryRecord(evicted.fromKey, evicted.message.id, "failed", "Mailbox capacity evicted the delivery", "E_DELIVERY_EVICTED");
     }
     this.mailboxMessages.push({
       from: { ...from.info },
       fromKey: from.key,
-      ...(from.scopeId ? { fromScopeId: from.scopeId } : {}),
-      target: { ...target.info },
       targetKey: target.key,
-      ...(target.scopeId ? { targetScopeId: target.scopeId } : {}),
       message: { ...message, brokerReceivedAt },
       queuedAt: brokerReceivedAt,
     });
@@ -1153,25 +1116,12 @@ class IntercomBroker {
     writeMessage(socket, { type: "delivery_failed", messageId, reason, delivery: "failed", code, retryable, outcomeKnown: true });
   }
 
-  private releaseReplyEdge(replyTo: string | undefined, scopeId: string | undefined): void {
-    if (!replyTo) return;
-    this.askEdges.delete(replyTo);
-    this.removePendingAskRecord(replyTo, scopeId);
-  }
-
-  // A receiver that promised receipts must confirm before the sender hears "delivered":
-  // a socket whose process died still accepts writes.
-  private completeSocketDelivery(senderSocket: net.Socket, fromKey: string, scopeId: string | undefined, target: ConnectedSession, message: Message, fingerprint: string): void {
-    if (!target.acknowledgesReceipts) {
-      this.releaseReplyEdge(message.replyTo, scopeId);
-      this.recordDelivery(fromKey, message.id, fingerprint, "socket_delivered");
-      this.writeDeliverySuccess(senderSocket, message.id, "socket_delivered");
-      return;
-    }
+  // Socket writes and transport receipts cannot prove a receiver selected a delivery path.
+  private completeSocketDelivery(senderSocket: net.Socket, fromKey: string, target: ConnectedSession, message: Message, fingerprint: string): void {
     const key = this.deliveryRecordKey(fromKey, message.id);
     this.recordDelivery(fromKey, message.id, fingerprint, "unknown");
     const timer = setTimeout(() => {
-      this.failPendingReceipt(key, `Receiver did not confirm receipt within ${RECEIPT_TIMEOUT_MS}ms`, "E_RECEIPT_TIMEOUT");
+      this.failPendingReceipt(key, `Receiver did not confirm acceptance within ${RECEIPT_TIMEOUT_MS}ms`, "E_RECEIPT_TIMEOUT");
     }, RECEIPT_TIMEOUT_MS);
     timer.unref();
     this.pendingReceipts.set(key, {
@@ -1179,8 +1129,6 @@ class IntercomBroker {
       fromKey,
       messageId: message.id,
       targetSocket: target.socket,
-      ...(scopeId ? { scopeId } : {}),
-      ...(message.replyTo ? { replyTo: message.replyTo } : {}),
       timer,
     });
   }
@@ -1191,23 +1139,22 @@ class IntercomBroker {
     clearTimeout(pending.timer);
     this.pendingReceipts.delete(key);
     // A cancel or supersede may already have settled the record while the receipt was in flight.
-    if (this.deliveryRecords.get(key)?.state === "unknown") {
-      this.updateDeliveryRecord(pending.fromKey, pending.messageId, "socket_delivered");
+    const record = this.deliveryRecords.get(key);
+    if (record?.state === "failed") {
+      if (pending.senderSocket.writable) this.writeDeliveryFailure(pending.senderSocket, pending.messageId, record.reason ?? "Delivery failed", record.code ?? "E_DELIVERY_FAILED");
+      return;
     }
-    // Release the answered ask only now, so a retry of an unconfirmed reply still matches it.
-    this.releaseReplyEdge(pending.replyTo, pending.scopeId);
+    this.updateDeliveryRecord(pending.fromKey, pending.messageId, "socket_delivered");
     if (pending.senderSocket.writable) this.writeDeliverySuccess(pending.senderSocket, pending.messageId, "socket_delivered");
   }
 
-  private failPendingReceipt(key: string, reason: string, code: string): void {
+  private failPendingReceipt(key: string, reason: string, code: string, outcomeKnown = false): void {
     const pending = this.pendingReceipts.get(key);
     if (!pending) return;
     clearTimeout(pending.timer);
     this.pendingReceipts.delete(key);
-    // An unconfirmed ask keeps its edge, so a receiver that was only slow can still
-    // reply. pruneAskEdges expires it after the ask timeout if no reply comes.
     if (pending.senderSocket.writable) {
-      writeMessage(pending.senderSocket, { type: "delivery_failed", messageId: pending.messageId, reason, delivery: "unknown", code, retryable: true, outcomeKnown: false });
+      writeMessage(pending.senderSocket, { type: "delivery_failed", messageId: pending.messageId, reason, delivery: outcomeKnown ? "failed" : "unknown", code, retryable: false, outcomeKnown });
     }
   }
 
@@ -1240,9 +1187,8 @@ class IntercomBroker {
         pending.senderSocket = socket;
         return true;
       }
-      // Receivers drop duplicate message ids, so a retry of an unconfirmed delivery is safe.
-      this.deliveryRecords.delete(key);
-      return false;
+      writeMessage(socket, { type: "delivery_failed", messageId, reason: "Previous delivery acceptance is unknown; not redispatched", delivery: "unknown", code: "E_RECEIPT_TIMEOUT", retryable: false, outcomeKnown: false });
+      return true;
     }
     if (record.code === "E_TARGET_REBOUND" && record.retryable) {
       return false;
@@ -1289,30 +1235,9 @@ class IntercomBroker {
 
   private flushMailboxForSession(session: ConnectedSession, now = Date.now()): void {
     this.pruneMailboxMessages(now);
-    const sessionName = session.info.name?.toLowerCase();
-    const uniqueMailboxIdentity = this.findLiveSessionsSharingMailboxIdentity(session).length === 1;
-
     for (let index = 0; index < this.mailboxMessages.length;) {
       const entry = this.mailboxMessages[index]!;
-      if (!sameScope(entry.targetScopeId, session.scopeId)) {
-        index += 1;
-        continue;
-      }
-      const matchesId = entry.targetKey === session.key;
-      const matchesSenderIdentity = Boolean(
-        sessionName
-        && sameScope(entry.fromScopeId, session.scopeId)
-        && entry.from.name?.toLowerCase() === sessionName
-        && sameCwd(entry.from.cwd, session.info.cwd),
-      );
-      const matchesUniqueName = Boolean(
-        uniqueMailboxIdentity
-        && sessionName
-        && !matchesSenderIdentity
-        && entry.target.name?.toLowerCase() === sessionName
-        && sameCwd(entry.target.cwd, session.info.cwd),
-      );
-      if (!matchesId && !matchesUniqueName) {
+      if (entry.targetKey !== session.key || !session.unifiedMessaging) {
         index += 1;
         continue;
       }
@@ -1325,10 +1250,6 @@ class IntercomBroker {
       }
 
       this.mailboxMessages.splice(index, 1);
-      const edge = this.askEdges.get(entry.message.id);
-      if (edge?.to === entry.targetKey) {
-        edge.to = session.key;
-      }
       const deliveredMessage: Message = {
         ...entry.message,
         brokerDeliveredAt: Date.now(),
@@ -1343,72 +1264,7 @@ class IntercomBroker {
         to: session.key,
         createdAt: entry.message.brokerReceivedAt ?? entry.queuedAt,
       });
-      this.updateDeliveryRecord(entry.fromKey, entry.message.id, "socket_delivered");
-    }
-  }
-
-  private pruneAskEdges(now = Date.now()): void {
-    this.prunePendingAskRecords(now);
-    for (const [messageId, edge] of this.askEdges) {
-      if (now - edge.createdAt > this.askTimeoutMs) {
-        this.askEdges.delete(messageId);
-        this.removePendingAskRecord(messageId, edge.scopeId);
-      }
-    }
-  }
-
-  private clearAskEdgesForSession(sessionKey: string): void {
-    for (const [messageId, edge] of this.askEdges) {
-      if (edge.from === sessionKey || edge.to === sessionKey) {
-        this.askEdges.delete(messageId);
-        this.removePendingAskRecord(messageId, edge.scopeId);
-      }
-    }
-  }
-
-  private writePendingAskRecord(message: Message, from: ConnectedSession, target: SessionInfo, createdAt: number): void {
-    ensurePendingAskRecordDir();
-    const record: PendingAskRecord = {
-      askId: message.id,
-      messageId: message.id,
-      asker: { sessionId: from.info.id, name: from.info.name ?? null },
-      target: { sessionId: target.id, name: target.name ?? null },
-      question: message.content.text,
-      createdAt,
-      expiresAt: createdAt + this.askTimeoutMs,
-    };
-    const filePath = scopedPendingAskRecordPath(from.scopeId, message.id);
-    writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, { mode: INTERCOM_RUNTIME_FILE_MODE });
-    restrictIntercomRuntimeFile(filePath);
-  }
-
-  private removePendingAskRecord(messageId: string, scopeId?: string): void {
-    try {
-      unlinkSync(scopedPendingAskRecordPath(scopeId, messageId));
-    } catch (error) {
-      if (!isRecord(error) || error.code !== "ENOENT") {
-        throw error;
-      }
-    }
-  }
-
-  private prunePendingAskRecords(now = Date.now()): void {
-    ensurePendingAskRecordDir();
-    for (const entry of readdirSync(PENDING_ASKS_DIR, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) {
-        continue;
-      }
-      const filePath = join(PENDING_ASKS_DIR, entry.name);
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(readFileSync(filePath, "utf-8"));
-      } catch {
-        unlinkSync(filePath);
-        continue;
-      }
-      if (!isPendingAskRecord(parsed) || now > parsed.expiresAt) {
-        unlinkSync(filePath);
-      }
+      this.updateDeliveryRecord(entry.fromKey, entry.message.id, "unknown");
     }
   }
 
@@ -1421,6 +1277,10 @@ class IntercomBroker {
   }
 
   private clearMessageReceiptRoutesForSession(sessionKey: string): void {
+    // A recipient reconnect does not end the originating session's local waiter.
+    for (const [key, edge] of this.waits) {
+      if (edge.from === sessionKey) this.waits.delete(key);
+    }
     for (const [messageId, route] of this.messageReceiptRoutes) {
       if (route.from === sessionKey || route.to === sessionKey) {
         this.messageReceiptRoutes.delete(messageId);
@@ -1428,69 +1288,34 @@ class IntercomBroker {
     }
   }
 
-  private findSessions(nameOrId: string, scopeId: string | undefined): ConnectedSession[] {
-    const byId = this.sessions.get(scopedSessionKey(scopeId, nameOrId));
-    if (byId) {
-      return [byId];
-    }
-
-    const lowerName = nameOrId.toLowerCase();
-    const byName = Array.from(this.sessions.values()).filter(session => sameScope(session.scopeId, scopeId) && session.info.name?.toLowerCase() === lowerName);
-    if (byName.length > 0) {
-      return byName;
-    }
-
-    return Array.from(this.sessions.entries())
-      .filter(([, session]) => sameScope(session.scopeId, scopeId) && session.info.id.startsWith(nameOrId))
-      .map(([, session]) => session);
-  }
-
-  private findDisconnectedSessions(nameOrId: string, scopeId: string | undefined): DisconnectedSession[] {
+  private exactTargets(id: string): Array<ConnectedSession | DisconnectedSession> {
     this.pruneDisconnectedSessions();
-    const byId = this.disconnectedSessions.get(scopedSessionKey(scopeId, nameOrId));
-    if (byId) {
-      return [byId];
-    }
+    return [...this.sessions.values(), ...this.disconnectedSessions.values()].filter((session) => session.info.id === id);
+  }
 
+  private resolveParent(requester: ConnectedSession): Array<ConnectedSession | DisconnectedSession> {
+    const parentId = requester.info.parentSessionId;
+    if (requester.info.role !== "agent" || !parentId) return [];
+    this.pruneDisconnectedSessions();
+    // A current endpoint supersedes historical routing aliases for the same Pi runtime.
+    const live = [...this.sessions.values()].filter((session) => session.info.role === "agent" && session.info.canonicalSessionId === parentId);
+    if (live.length > 0) return live;
+    return [...this.disconnectedSessions.values()].filter((session) => session.info.role === "agent" && session.info.canonicalSessionId === parentId);
+  }
+
+  private resolveTargets(nameOrId: string, scopeId: string | undefined): Array<ConnectedSession | DisconnectedSession> {
+    const exact = this.exactTargets(nameOrId);
+    if (exact.length > 0) return exact;
+    // A full UUID is an identity, never a display-name or prefix suggestion.
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(nameOrId)) return [];
+    const local = [...this.sessions.values()].filter((session) => sameScope(session.scopeId, scopeId));
     const lowerName = nameOrId.toLowerCase();
-    const byName = Array.from(this.disconnectedSessions.values()).filter(session => sameScope(session.scopeId, scopeId) && session.info.name?.toLowerCase() === lowerName);
-    if (byName.length > 0) {
-      return byName;
-    }
-
-    return Array.from(this.disconnectedSessions.entries())
-      .filter(([, session]) => sameScope(session.scopeId, scopeId) && session.info.id.startsWith(nameOrId))
-      .map(([, session]) => session);
-  }
-
-  private findUniqueLiveSessionForDisconnectedSession(disconnected: DisconnectedSession, senderKey?: string): ConnectedSession | null {
-    const matches = this.findLiveSessionsSharingMailboxIdentity(disconnected)
-      .filter((session) => session.key !== senderKey);
-    return matches.length === 1 ? matches[0]! : null;
-  }
-
-  /**
-   * Mailbox identity is an explicit name plus directory, never name alone. A
-   * runtime fallback alias is derived from the session id rather than chosen as
-   * a durable identity, so it must not transfer mail to another process. This
-   * also prevents two unnamed UUIDv7 sessions started close together from
-   * inheriting each other's mailbox through a shared short alias.
-   *
-   * Directories compare through sameCwd so a relaunch that reports the same
-   * directory differently (trailing slash, "."/"..", or a symlink such as macOS
-   * /tmp vs /private/tmp) still matches.
-   */
-  private findLiveSessionsSharingMailboxIdentity(sessionInfo: ConnectedSession | DisconnectedSession): ConnectedSession[] {
-    const lowerName = sessionInfo.info.name?.toLowerCase();
-    if (!lowerName || sessionInfo.info.runtimeFallbackAlias) {
-      return [];
-    }
-    return Array.from(this.sessions.values()).filter(session =>
-      sameScope(session.scopeId, sessionInfo.scopeId)
-      && !session.info.runtimeFallbackAlias
-      && session.info.name?.toLowerCase() === lowerName
-      && sameCwd(session.info.cwd, sessionInfo.info.cwd)
-    );
+    const named = local.filter((session) => !RESERVED_DESTINATIONS.has(session.info.name?.toLowerCase() ?? ""));
+    const names = named.filter((session) => session.info.name?.toLowerCase() === lowerName);
+    if (names.length > 0) return names;
+    const ids = local.filter((session) => session.info.id.startsWith(nameOrId));
+    if (ids.length > 0) return ids;
+    return named.filter((session) => session.info.name?.toLowerCase().startsWith(lowerName));
   }
 
   private broadcast(msg: BrokerMessage, exclude?: string, scopeId?: string): void {
@@ -1875,7 +1700,7 @@ class IntercomBroker {
       session.socket.end();
     }
     this.sessions.clear();
-    this.askEdges.clear();
+    this.waits.clear();
     this.messageReceiptRoutes.clear();
     this.disconnectedSessions.clear();
     this.mailboxMessages.length = 0;

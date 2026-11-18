@@ -5,7 +5,7 @@ import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
 import { getIntercomScopeId } from "../config.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_HELD_ERROR_CODE, type DeliveryDetails } from "../types.ts";
+import { BROADCAST_AUDIENCE_FEATURE, EXTENSION_BUS_FEATURE, PARENT_IDENTITY_FEATURE, RESERVED_DESTINATIONS, SESSION_HELD_ERROR_CODE, UNIFIED_MESSAGING_FEATURE, type BroadcastDestination, type DeliveryDetails } from "../types.ts";
 import type {
   Attachment,
   BrokerMessage,
@@ -25,17 +25,22 @@ interface SendOptions {
   attachments?: Attachment[];
   replyTo?: string;
   expectsReply?: boolean;
+  quiet?: boolean;
   messageId?: string;
   supersedes?: string;
   retryOf?: string;
   provenance?: MessageProvenance;
   crossMachine?: CrossMachineProvenance;
+  /** An already resolved identity; never re-resolved after waiter installation. */
+  target?: SessionInfo;
+  signal?: AbortSignal;
 }
 
 export interface SendResult extends DeliveryDetails {
   id: string;
   delivered: boolean;
   reason?: string;
+  targetId?: string;
 }
 
 function toError(error: unknown): Error {
@@ -79,6 +84,7 @@ export class IntercomClient extends EventEmitter {
   private socket: net.Socket | null = null;
   private _sessionId: string | null = null;
   private _features = new Set<string>();
+  private parentSessionId: string | undefined;
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
   private nextSenderSequence = 1;
@@ -176,6 +182,7 @@ export class IntercomClient extends EventEmitter {
     if (this.socket) {
       return Promise.reject(new Error("Already connected"));
     }
+    this.parentSessionId = session.role === "agent" ? session.parentSessionId : undefined;
 
     return new Promise((resolve, reject) => {
       let socket: net.Socket;
@@ -302,7 +309,7 @@ export class IntercomClient extends EventEmitter {
         const scopeId = getIntercomScopeId();
         writeMessage(socket, {
           type: "register",
-          session: { ...session, livenessIntervalMs: getLivenessIntervalMs() },
+          session: { ...session, features: [...new Set([...(session.features ?? []), UNIFIED_MESSAGING_FEATURE])], livenessIntervalMs: getLivenessIntervalMs() },
           ...(sessionId ? { sessionId } : {}),
           ...(scopeId ? { scopeId } : {}),
           ...(typeof target === "string" ? {} : { stateId: target.stateId }),
@@ -347,8 +354,12 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid registered features");
         }
 
+        const features = (brokerMessage.features as string[] | undefined) ?? [];
+        if (!features.includes(UNIFIED_MESSAGING_FEATURE)) {
+          throw new Error(`Broker does not support ${UNIFIED_MESSAGING_FEATURE}. Upgrade clients and broker together, then explicitly restart the broker and reload sessions.`);
+        }
         this._sessionId = brokerMessage.sessionId;
-        this._features = new Set((brokerMessage.features as string[] | undefined) ?? []);
+        this._features = new Set(features);
         const registered: BrokerMessage = {
           type: "registered",
           sessionId: brokerMessage.sessionId,
@@ -552,7 +563,7 @@ export class IntercomClient extends EventEmitter {
     }
   }
 
-  async disconnect(): Promise<void> {
+  async disconnect(options: { moveToScopeId?: string | null } = {}): Promise<void> {
     const socket = this.socket;
     if (!socket) {
       return;
@@ -587,7 +598,7 @@ export class IntercomClient extends EventEmitter {
       socket.once("error", onError);
 
       try {
-        writeMessage(socket, { type: "unregister" });
+        writeMessage(socket, { type: "unregister", ...options });
         socket.end();
       } catch {
         // Disconnect should still finish even if the unregister write fails.
@@ -602,9 +613,13 @@ export class IntercomClient extends EventEmitter {
     writeMessage(socket, { type: "extension_capabilities_update", extensions: extensions ?? [] });
   }
 
-  listSessions(options: { timeoutMs?: number } = {}): Promise<SessionInfo[]> {
+  listSessions(options: { timeoutMs?: number; resolve?: string; audience?: BroadcastDestination } = {}): Promise<SessionInfo[]> {
     let socket: net.Socket;
     try {
+      if (options.audience !== undefined) {
+        if (options.resolve !== undefined) throw new Error("Cannot combine direct resolution with a broadcast audience");
+        if (!this.supportsFeature(BROADCAST_AUDIENCE_FEATURE)) throw new Error("Broadcast audience resolution requires a coordinated intercom broker upgrade and reload");
+      }
       socket = this.requireActiveSocket();
     } catch (error) {
       return Promise.reject(toError(error));
@@ -628,7 +643,7 @@ export class IntercomClient extends EventEmitter {
       }, options.timeoutMs ?? 5000);
       this.pendingLists.set(requestId, { resolve: wrappedResolve, reject: wrappedReject });
       try {
-        writeMessage(socket, { type: "list", requestId });
+        writeMessage(socket, { type: "list", requestId, ...(options.resolve !== undefined ? { resolve: options.resolve } : {}), ...(options.audience !== undefined ? { audience: options.audience } : {}) });
       } catch (error) {
         clearTimeout(timeout);
         this.pendingLists.delete(requestId);
@@ -637,7 +652,24 @@ export class IntercomClient extends EventEmitter {
     });
   }
 
+  async resolveTarget(to: string, options: { requireLive?: boolean } = {}): Promise<SessionInfo | null> {
+    if (RESERVED_DESTINATIONS.has(to) && to !== "parent") {
+      throw new Error(`Reserved destination "${to}" is not available for direct peer routing`);
+    }
+    if (to === "parent") {
+      if (!this.parentSessionId) throw new Error("No current parent metadata; this session has no parent destination");
+      if (!this.supportsFeature(PARENT_IDENTITY_FEATURE)) throw new Error("Parent routing requires a coordinated intercom broker upgrade and reload");
+    }
+    const matches = await this.listSessions({ resolve: to });
+    if (matches.length > 1) throw new Error(to === "parent" ? `Ambiguous parent identity "${this.parentSessionId}"; no message sent` : `Ambiguous session target "${to}"; use a unique full session ID`);
+    const target = matches[0] ?? null;
+    if (to === "parent" && !target) throw new Error(`Parent identity "${this.parentSessionId}" is unavailable; no exact endpoint or retained identity found`);
+    if (options.requireLive && target && !target.endpointEpoch) throw new Error(`Session "${to}" is disconnected; waiting sends require a live peer`);
+    return target;
+  }
+
   async send(to: string, options: SendOptions): Promise<SendResult> {
+    if (options.expectsReply && options.quiet) throw new Error("wait: true cannot be combined with quiet: true");
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();
@@ -646,6 +678,14 @@ export class IntercomClient extends EventEmitter {
     }
     
     const messageId = options.messageId ?? randomUUID();
+    if (options.signal?.aborted) throw new Error("Cancelled before dispatch");
+    if (RESERVED_DESTINATIONS.has(to) && to !== "parent") throw new Error(`Reserved destination "${to}" is not available for direct peer routing`);
+    if (to === "parent" && !this.parentSessionId) throw new Error("No current parent metadata; this session has no parent destination");
+    const target = options.target ?? await this.resolveTarget(to, { requireLive: options.expectsReply });
+    if (options.signal?.aborted) throw new Error("Cancelled before dispatch");
+    if (!target) return { id: messageId, delivered: false, delivery: "failed", code: "E_TARGET_NOT_FOUND", reason: "Session not found", retryable: false, outcomeKnown: true };
+    if (options.expectsReply && !target.endpointEpoch) throw new Error("Waiting sends require a live peer");
+    socket = this.requireActiveSocket();
     const message: Message = {
       id: messageId,
       timestamp: Date.now(),
@@ -654,6 +694,7 @@ export class IntercomClient extends EventEmitter {
       retryOf: options.retryOf,
       replyTo: options.replyTo,
       expectsReply: options.expectsReply,
+      quiet: options.quiet ?? false,
       provenance: options.provenance,
       crossMachine: options.crossMachine,
       content: {
@@ -665,22 +706,21 @@ export class IntercomClient extends EventEmitter {
     const sendOnce = (targetId?: string, targetEpoch?: string): Promise<SendResult> => new Promise((resolve, reject) => {
       const wrappedResolve = (result: SendResult) => {
         clearTimeout(timeout);
-        resolve(result);
+        resolve({ ...result, targetId: target.id });
       };
       const wrappedReject = (error: Error) => {
-        clearTimeout(timeout);
-        reject(error);
+        wrappedResolve({ id: messageId, delivered: false, delivery: "unknown", code: "E_SEND_INTERRUPTED", reason: `Send interrupted before receipt; delivery is unknown: ${error.message}`, retryable: false, outcomeKnown: false });
       };
       const timeout = setTimeout(() => {
         if (this.pendingSends.has(messageId)) {
           this.pendingSends.delete(messageId);
-          wrappedReject(new Error("Send timeout"));
+          wrappedResolve({ id: messageId, delivered: false, delivery: "unknown", code: "E_SEND_TIMEOUT", reason: "Send receipt timed out; delivery is unknown", retryable: false, outcomeKnown: false });
         }
       }, 10000);
       this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
 
       try {
-        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}) });
+        writeMessage(socket, { type: "send", to: to === "parent" ? target.id : to, message, ...(targetId ? { targetId, ...(targetEpoch ? { targetEpoch } : {}) } : {}) });
       } catch (error) {
         clearTimeout(timeout);
         this.pendingSends.delete(messageId);
@@ -688,26 +728,7 @@ export class IntercomClient extends EventEmitter {
       }
     });
 
-    if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo) {
-      return sendOnce();
-    }
-
-    const resolveTarget = async (): Promise<{ id: string; epoch: string } | null> => {
-      const sessions = await this.listSessions();
-      const byId = sessions.find((session) => session.id === to);
-      const byName = byId ? [] : sessions.filter((session) => session.name?.toLowerCase() === to.toLowerCase());
-      const byPrefix = byId || byName.length > 0 ? [] : sessions.filter((session) => session.id.startsWith(to));
-      const matches = byId ? [byId] : byName.length > 0 ? byName : byPrefix;
-      const target = matches.length === 1 ? matches[0]! : null;
-      return target?.endpointEpoch ? { id: target.id, epoch: target.endpointEpoch } : null;
-    };
-
-    const target = await resolveTarget();
-    if (!target) return sendOnce();
-    const result = await sendOnce(target.id, target.epoch);
-    if (result.code !== "E_TARGET_REBOUND") return result;
-    const reboundTarget = await resolveTarget();
-    return reboundTarget ? sendOnce(reboundTarget.id, reboundTarget.epoch) : result;
+    return sendOnce(target.id, target.endpointEpoch);
   }
 
   cancelMessage(messageId: string): Promise<SendResult> {

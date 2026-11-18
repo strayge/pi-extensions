@@ -4,13 +4,14 @@ import { randomUUID } from "crypto";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { IntercomClient, IntercomSessionHeldError, type SendResult } from "./broker/client.ts";
+import { formatBroadcastResult, isBroadcastDestination, sendBroadcast } from "./broadcast.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay, type SessionListSelection } from "./ui/session-list.ts";
 import { HandoverPicker, type HandoverPickerResult, type RemoteSessionLister } from "./ui/handover-picker.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, getIntercomScopeId, loadConfig, setIntercomScopeId, type IntercomConfig } from "./config.ts";
-import { EXTENSION_BUS_FEATURE } from "./types.ts";
+import { EXTENSION_BUS_FEATURE, RESERVED_DESTINATIONS } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
@@ -29,7 +30,7 @@ import {
   type IntercomOutboxResultV1,
   type IntercomSessionIdentityRequestV1,
 } from "./extension-api.ts";
-import { ReplyTracker } from "./reply-tracker.ts";
+import { ReplyWaiter } from "./reply-tracker.ts";
 import { homedir } from "node:os";
 import { join as joinPath, resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
@@ -49,25 +50,9 @@ const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delive
 const INBOUND_MESSAGE_DEDUPE_MAX = 1000;
 const INBOUND_MESSAGE_DEDUPE_RETENTION_MS = 60 * 60 * 1000;
 const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "subagent-chat";
-const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
-const SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV = "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID";
 const INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_SESSION_ID";
 const STABLE_INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_STABLE_ID";
 const NAME_POLL_MS_ENV = "PI_INTERCOM_NAME_POLL_MS";
-const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
-const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
-const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
-const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
-const SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV = "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR";
-
-interface ChildOrchestratorMetadata {
-  orchestratorTarget: string;
-  orchestratorSessionId?: string;
-  runId: string;
-  agent: string;
-  index: string;
-  sessionName?: string;
-}
 
 interface InboundMessageEntry {
   from: SessionInfo;
@@ -79,6 +64,7 @@ interface InboundMessageEntry {
 interface DeliveryTarget {
   id: string;
   label: string;
+  peer?: SessionInfo;
   projectPane?: ProjectPaneLaunch;
 }
 
@@ -92,8 +78,12 @@ interface DeliveryRequest {
   replyTo?: string;
   supersedes?: string;
   retryOf?: string;
+  wait?: boolean;
+  quiet?: boolean;
   /** Handovers are always new messages and are not sent once the signal aborts. */
   handover?: boolean;
+  /** Preserve an interactive selection through generation and editor delays. */
+  resolvedPeer?: SessionInfo;
 }
 
 interface IntercomToolResult {
@@ -101,28 +91,10 @@ interface IntercomToolResult {
   details: Record<string, unknown>;
 }
 
-/** `rawTo` is the string the caller addressed; pass "" to disable the name-prefix fallback. */
-interface PrefixTarget {
-  rawTo: string;
-  firstTarget: string;
-  display: string;
-}
-
-interface PrefixSend {
-  result: SendResult;
-  /** The resolved session name after a prefix retry, otherwise the caller's display. */
-  display: string;
-  /** ` ("<raw>" resolved to "<name>")` after a prefix retry, otherwise "". */
-  resolution: string;
-  /** Set when the broker refused the raw target and no connected name starts with it. */
-  noMatchText?: string;
-}
-
-const BLOCKING_ASK_GUIDANCE = "Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects.";
-
 interface OutboxTarget {
   id: string;
   label: string;
+  peer: SessionInfo;
 }
 
 interface OutboxRequestTrace {
@@ -136,33 +108,17 @@ interface OutboxRequestTrace {
 interface PendingOutboxRequest {
   generation: number;
   request: OutboxRequestTrace;
+  dispatchedTargetId?: string;
 }
 
-type ContactSupervisorReason = "need_decision" | "progress_update" | "interview_request";
-
-interface SupervisorInterviewQuestion extends Record<string, unknown> {
-  id: string;
-  type: "single" | "multi" | "text" | "image" | "info";
-  question: string;
-  options?: unknown[];
-}
-
-interface SupervisorInterviewRequest extends Record<string, unknown> {
-  title?: string;
-  description?: string;
-  questions: SupervisorInterviewQuestion[];
-}
-
-interface SupervisorInterviewReply {
-  responses: Array<{ id: string; value: unknown }>;
-}
+type OutboxResultOptions = Pick<IntercomOutboxResultV1, "code" | "detail" | "messageId" | "targetId" | "delivery" | "retryable" | "outcomeKnown">;
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-// Pi 1.2.0 runs before_agent_start for sendMessage({ triggerTurn: true }) turns (pi#5581) and marks
-// the session busy as soon as such a run starts. An unparseable version counts as older Pi.
+// Newer Pi custom-started runs use the normal prompt lifecycle and next-turn queue.
+// An unparseable version takes the older, user-prompt wake path.
 function triggerTurnRunsPromptLifecycle(piVersion: string): boolean {
   const match = /^(\d+)\.(\d+)\./.exec(piVersion);
   if (!match) return false;
@@ -198,12 +154,13 @@ function undeliveredText(target: string, result: SendResult): string {
 }
 
 function queuedText(target: string, what = "message"): string {
-  return `Session "${target}" is not connected. The ${what} is waiting in the broker mailbox until that session reconnects.`;
+  return `Session "${target}" is not connected. The ${what} was queued in a volatile broker mailbox for that exact identity; it may be lost if the broker restarts.`;
 }
 
 function deliveryDetails(result: SendResult): Record<string, unknown> {
   return {
     messageId: result.id,
+    ...(result.targetId ? { targetId: result.targetId } : {}),
     delivered: result.delivered,
     delivery: result.delivery,
     retryable: result.retryable,
@@ -227,279 +184,6 @@ function formatAttachments(attachments: Attachment[]): string {
     }
   }
   return text;
-}
-function readChildOrchestratorMetadata(): ChildOrchestratorMetadata | null {
-  const orchestratorTarget = process.env[SUBAGENT_ORCHESTRATOR_TARGET_ENV]?.trim();
-  const orchestratorSessionId = process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV]?.trim()
-    || process.env[INTERCOM_SESSION_ID_ENV]?.trim();
-  const runId = process.env[SUBAGENT_RUN_ID_ENV]?.trim();
-  const agent = process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim();
-  const index = process.env[SUBAGENT_CHILD_INDEX_ENV]?.trim();
-  if (!orchestratorTarget || !runId || !agent || !index) {
-    return null;
-  }
-  const sessionName = process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
-  return {
-    orchestratorTarget,
-    ...(orchestratorSessionId ? { orchestratorSessionId } : {}),
-    runId,
-    agent,
-    index,
-    ...(sessionName ? { sessionName } : {}),
-  };
-}
-function formatChildOrchestratorMessage(kind: "ask" | "update" | "interview", metadata: ChildOrchestratorMetadata, message: string): string {
-  const heading = kind === "ask"
-    ? "Subagent needs a supervisor decision."
-    : kind === "interview"
-      ? "Subagent requests a structured supervisor interview."
-      : "Subagent progress update.";
-  return [
-    heading,
-    `Run: ${metadata.runId}`,
-    `Agent: ${metadata.agent}`,
-    `Child index: ${metadata.index}`,
-    metadata.sessionName ? `Child intercom target: ${metadata.sessionName}` : undefined,
-    "",
-    message,
-  ].filter((line): line is string => line !== undefined).join("\n");
-}
-
-function validateSupervisorInterviewRequest(input: unknown): { ok: true; interview: SupervisorInterviewRequest } | { ok: false; error: string } {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    return { ok: false, error: "interview must be an object with a questions array" };
-  }
-
-  const raw = input as Record<string, unknown>;
-  if (raw.title !== undefined && typeof raw.title !== "string") {
-    return { ok: false, error: "interview.title must be a string when provided" };
-  }
-  if (raw.description !== undefined && typeof raw.description !== "string") {
-    return { ok: false, error: "interview.description must be a string when provided" };
-  }
-  if (!Array.isArray(raw.questions) || raw.questions.length === 0) {
-    return { ok: false, error: "interview.questions must be a non-empty array" };
-  }
-
-  const validTypes = new Set(["single", "multi", "text", "image", "info"]);
-  const ids = new Set<string>();
-  const questions: SupervisorInterviewQuestion[] = [];
-
-  for (let index = 0; index < raw.questions.length; index++) {
-    const questionInput = raw.questions[index];
-    if (!questionInput || typeof questionInput !== "object" || Array.isArray(questionInput)) {
-      return { ok: false, error: `interview.questions[${index}] must be an object` };
-    }
-    const question = questionInput as Record<string, unknown>;
-    if (typeof question.id !== "string" || question.id.trim() === "") {
-      return { ok: false, error: `interview.questions[${index}].id must be a non-empty string` };
-    }
-    const id = question.id.trim();
-    if (ids.has(id)) {
-      return { ok: false, error: `interview question id must be unique: ${id}` };
-    }
-    ids.add(id);
-
-    if (typeof question.type !== "string" || !validTypes.has(question.type)) {
-      return { ok: false, error: `interview.questions[${index}].type must be one of: single, multi, text, image, info` };
-    }
-    if (typeof question.question !== "string" || question.question.trim() === "") {
-      return { ok: false, error: `interview.questions[${index}].question must be a non-empty string` };
-    }
-    if (question.context !== undefined && typeof question.context !== "string") {
-      return { ok: false, error: `interview.questions[${index}].context must be a string when provided` };
-    }
-    let options: unknown[] | undefined;
-    if (question.options !== undefined) {
-      if (!Array.isArray(question.options)) {
-        return { ok: false, error: `interview.questions[${index}].options must be an array when provided` };
-      }
-      options = [];
-      for (let optionIndex = 0; optionIndex < question.options.length; optionIndex++) {
-        const option = question.options[optionIndex];
-        if (typeof option === "string") {
-          const label = option.trim();
-          if (!label) {
-            return { ok: false, error: `interview.questions[${index}].options[${optionIndex}] must not be empty` };
-          }
-          options.push(label);
-        } else if (!option || typeof option !== "object" || Array.isArray(option) || typeof (option as { label?: unknown }).label !== "string" || (option as { label: string }).label.trim() === "") {
-          return { ok: false, error: `interview.questions[${index}].options[${optionIndex}] must be a non-empty string or an object with a non-empty label` };
-        } else {
-          options.push({ ...option, label: (option as { label: string }).label.trim() });
-        }
-      }
-    }
-    if ((question.type === "single" || question.type === "multi") && (!options || options.length === 0)) {
-      return { ok: false, error: `interview.questions[${index}].options must be a non-empty array for ${question.type} questions` };
-    }
-    if (question.type !== "single" && question.type !== "multi" && options) {
-      return { ok: false, error: `interview.questions[${index}].options is only valid for single and multi questions` };
-    }
-
-    questions.push({
-      ...question,
-      id,
-      type: question.type as SupervisorInterviewQuestion["type"],
-      question: question.question.trim(),
-      ...(options ? { options } : {}),
-    });
-  }
-
-  return {
-    ok: true,
-    interview: {
-      ...raw,
-      ...(typeof raw.title === "string" ? { title: raw.title.trim() } : {}),
-      ...(typeof raw.description === "string" ? { description: raw.description.trim() } : {}),
-      questions,
-    },
-  };
-}
-
-function interviewOptionLabel(option: unknown): string {
-  return typeof option === "string" ? option : (option as { label: string }).label;
-}
-
-function interviewExampleValue(question: SupervisorInterviewQuestion): unknown {
-  if (question.type === "multi") {
-    return question.options?.slice(0, 2).map(interviewOptionLabel) ?? [];
-  }
-  if (question.type === "single") {
-    return question.options?.[0] !== undefined ? interviewOptionLabel(question.options[0]) : "option label";
-  }
-  if (question.type === "image") {
-    return "image/file reference or description";
-  }
-  return "answer text";
-}
-
-function formatSupervisorInterviewRequest(interview: SupervisorInterviewRequest, message?: string): string {
-  const lines: string[] = [];
-  const title = interview.title?.trim();
-  if (title) lines.push(`Interview: ${title}`);
-  const description = interview.description?.trim();
-  if (description) lines.push(description);
-  const note = message?.trim();
-  if (note) lines.push(`Child note: ${note}`);
-  if (lines.length > 0) lines.push("");
-
-  lines.push("Questions:");
-  interview.questions.forEach((question, index) => {
-    lines.push(`${index + 1}. [${question.id}] (${question.type}) ${question.question}`);
-    if (typeof question.context === "string" && question.context.trim()) {
-      lines.push(`   Context: ${question.context.trim()}`);
-    }
-    if (question.options?.length) {
-      lines.push("   Options:");
-      for (const option of question.options) {
-        lines.push(`   - ${interviewOptionLabel(option)}`);
-      }
-    }
-  });
-
-  const responseExample = {
-    responses: interview.questions
-      .filter((question) => question.type !== "info")
-      .map((question) => ({
-        id: question.id,
-        value: interviewExampleValue(question),
-      })),
-  };
-
-  lines.push(
-    "",
-    "Supervisor reply instructions:",
-    "Reply with plain JSON or a fenced ```json block using this stable shape. Use the question ids exactly. Info questions are context-only and do not need responses. For single questions, value is one option label. For multi questions, value is an array of option labels. For text/image questions, value is a string unless the question asks otherwise.",
-    "",
-    "```json",
-    JSON.stringify(responseExample, null, 2),
-    "```",
-  );
-
-  return lines.join("\n");
-}
-
-function validateSupervisorInterviewReply(value: unknown, interview: SupervisorInterviewRequest): SupervisorInterviewReply {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("reply JSON must be an object with a responses array");
-  }
-
-  const responsesInput = (value as Record<string, unknown>).responses;
-  if (!Array.isArray(responsesInput)) {
-    throw new Error("reply JSON must include a responses array");
-  }
-
-  const questionById = new Map(interview.questions
-    .filter((question) => question.type !== "info")
-    .map((question) => [question.id, question]));
-  const seenIds = new Set<string>();
-  const responses: SupervisorInterviewReply["responses"] = [];
-
-  for (let index = 0; index < responsesInput.length; index++) {
-    const response = responsesInput[index];
-    if (!response || typeof response !== "object" || Array.isArray(response)) {
-      throw new Error(`responses[${index}] must be an object`);
-    }
-
-    const raw = response as Record<string, unknown>;
-    if (typeof raw.id !== "string" || raw.id.trim() === "") {
-      throw new Error(`responses[${index}].id must be a non-empty string`);
-    }
-    const id = raw.id.trim();
-    const question = questionById.get(id);
-    if (!question) {
-      throw new Error(`responses[${index}].id must match a non-info interview question id`);
-    }
-    if (seenIds.has(id)) {
-      throw new Error(`responses[${index}].id is duplicated: ${id}`);
-    }
-    seenIds.add(id);
-    if (!Object.hasOwn(raw, "value")) {
-      throw new Error(`responses[${index}].value is required`);
-    }
-
-    const value = raw.value;
-    if (question.type === "single") {
-      if (typeof value !== "string") throw new Error(`responses[${index}].value must be a string for single questions`);
-      const optionLabels = new Set(question.options?.map(interviewOptionLabel));
-      if (!optionLabels.has(value.trim())) throw new Error(`responses[${index}].value must match one of the question options`);
-      responses.push({ id, value: value.trim() });
-      continue;
-    }
-
-    if (question.type === "multi") {
-      if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-        throw new Error(`responses[${index}].value must be an array of strings for multi questions`);
-      }
-      const optionLabels = new Set(question.options?.map(interviewOptionLabel));
-      const selected = value.map((item) => item.trim());
-      const invalid = selected.find((item) => !optionLabels.has(item));
-      if (invalid) throw new Error(`responses[${index}].value contains an option that is not in the question options: ${invalid}`);
-      responses.push({ id, value: selected });
-      continue;
-    }
-
-    if (typeof value !== "string") {
-      throw new Error(`responses[${index}].value must be a string for ${question.type} questions`);
-    }
-    responses.push({ id, value });
-  }
-
-  return { responses };
-}
-
-function parseStructuredSupervisorReply(text: string, interview: SupervisorInterviewRequest): { value?: SupervisorInterviewReply; error?: string } | undefined {
-  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = (fencedMatch?.[1] ?? text).trim();
-  if (!candidate.startsWith("{") && !candidate.startsWith("[")) {
-    return undefined;
-  }
-  try {
-    return { value: validateSupervisorInterviewReply(JSON.parse(candidate), interview) };
-  } catch (error) {
-    return { error: getErrorMessage(error) };
-  }
 }
 function duplicateSessionNames(sessions: SessionInfo[]): Set<string> {
   return new Set(
@@ -662,6 +346,7 @@ function formatMessageTimestamp(timestamp: number | undefined): string | undefin
 }
 function formatInboundDeliveryMetadata(message: Message): string {
   const parts = [`id ${message.id}`];
+  if (message.quiet) parts.push("quiet information; no acknowledgement requested");
   if (typeof message.senderSequence === "number") parts.push(`seq ${message.senderSequence}`);
   if (message.supersedes) parts.push(`supersedes ${message.supersedes}`);
   if (message.retryOf) parts.push(`retry of ${message.retryOf}`);
@@ -699,6 +384,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let runtimeContext: ExtensionContext | null = null;
   let currentSessionId: string | null = null;
   let currentIntercomSessionId: string | null = null;
+  let currentParentSessionId: string | undefined;
   let currentModel = "unknown";
   let sessionStartedAt: number | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
@@ -735,16 +421,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     clearHeldInboundTimer();
   }
   const activeTools = new Map<string, string>();
-  const replyTracker = new ReplyTracker();
+  const replyWaiter = new ReplyWaiter(askTimeoutMs);
 
   const seenInboundMessages = new Map<string, number>();
   const latestOutboundReceipts = new Map<string, { status: MessageReceiptStatus; timestamp: number; detail?: string }>();
   const outboxRequestIds = new Set<string>();
   const pendingOutboxRequests = new Map<string, PendingOutboxRequest>();
-  function dismissIncomingAsk(messageId: string): void {
-    replyTracker.dismissPendingAsk(messageId);
-    dropHeldInboundMessage(messageId, { status: "acknowledged", detail: "answered before injection" });
-  }
   function hasSeenInboundMessage(from: SessionInfo, message: Message, now = Date.now()): boolean {
     for (const [key, seenAt] of seenInboundMessages) {
       if (now - seenAt > INBOUND_MESSAGE_DEDUPE_RETENTION_MS) {
@@ -776,7 +458,6 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
   }
   function handleMessageControl(control: MessageControl): void {
-    replyTracker.dismissPendingAsk(control.messageId);
     const supersededDetail = control.supersededBy ? `superseded by ${control.supersededBy}` : undefined;
     if (dropHeldInboundMessage(control.messageId, control.action === "cancel"
       ? { status: "cancelled", detail: "dropped before injection" }
@@ -794,53 +475,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     const receipt = latestOutboundReceipts.get(messageId);
     return receipt ? receipt.status : fallback;
   }
-  let replyWaiter: {
-    from: string;
-    replyTo: string;
-    resolve: (message: Message) => void;
-    reject: (error: Error) => void;
-  } | null = null;
-  function waitForReply(from: string, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown"): Promise<Message> {
-    if (replyWaiter) {
-      return Promise.reject(new Error("Already waiting for a reply"));
-    }
-    if (signal?.aborted) {
-      return Promise.reject(new Error("Cancelled"));
-    }
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        const timeoutDescription = askTimeoutMs % 60000 === 0 ? `${askTimeoutMs / 60000} minutes` : `${askTimeoutMs}ms`;
-        rejectReplyWaiter(new Error(`No reply from "${from}" for message ${replyTo} within ${timeoutDescription}. Last known delivery state: ${getDeliveryState()}. This waiter timeout is not cancellation; the delivered message may still be queued or actionable in the recipient session.`));
-      }, askTimeoutMs);
-      const cleanup = () => {
-        clearTimeout(timeout);
-        signal?.removeEventListener("abort", onAbort);
-        if (replyWaiter?.replyTo === replyTo) {
-          replyWaiter = null;
-        }
-      };
-      const onAbort = () => {
-        cancelOnAbort?.();
-        cleanup();
-        reject(new Error("Cancelled"));
-      };
-      signal?.addEventListener("abort", onAbort, { once: true });
-      replyWaiter = {
-        from,
-        replyTo,
-        resolve: (message) => {
-          cleanup();
-          resolve(message);
-        },
-        reject: (error) => {
-          cleanup();
-          reject(error);
-        },
-      };
-    });
-  }
   function rejectReplyWaiter(error: Error): void {
-    replyWaiter?.reject(error);
+    replyWaiter.reject(error);
   }
   function clearReconnectTimer(): void {
     if (!reconnectTimer) {
@@ -1006,6 +642,9 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     const herdrSessionPath = herdrPaneId ? liveContext.sessionManager.getSessionFile() : undefined;
     return {
       ...identity,
+      role: "agent",
+      canonicalSessionId: currentSessionId,
+      ...(currentParentSessionId ? { parentSessionId: currentParentSessionId } : {}),
       cwd: liveContext.cwd,
       model: currentModel,
       pid: process.pid,
@@ -1100,20 +739,14 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     return Boolean(resolvedTo && activeClient?.sessionId && resolvedTo === activeClient.sessionId)
       || targets.has(to.trim().toLowerCase());
   }
-  function buildOutboxResult(request: OutboxRequestTrace, status: IntercomOutboxResultStatus, options: {
-    code?: IntercomOutboxResultCode;
-    detail?: string;
-    messageId?: string;
-  } = {}): IntercomOutboxResultV1 {
+  function buildOutboxResult(request: OutboxRequestTrace, status: IntercomOutboxResultStatus, options: OutboxResultOptions = {}): IntercomOutboxResultV1 {
     return {
       version: 1,
       requestId: request.requestId,
       status,
-      ...(options.code ? { code: options.code } : {}),
       ...(request.extensionId ? { extensionId: request.extensionId } : {}),
       ...(request.extensionName ? { extensionName: request.extensionName } : {}),
-      ...(options.messageId ? { messageId: options.messageId } : {}),
-      ...(options.detail ? { detail: options.detail } : {}),
+      ...options,
     };
   }
   function emitOutboxResult(result: IntercomOutboxResultV1, request: OutboxRequestTrace): void {
@@ -1125,11 +758,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     });
     pi.events.emit(INTERCOM_OUTBOX_RESULT_EVENT, result);
   }
-  function settleOutboxRequest(requestId: string, status: IntercomOutboxResultStatus, options: {
-    code?: IntercomOutboxResultCode;
-    detail?: string;
-    messageId?: string;
-  } = {}): boolean {
+  function settleOutboxRequest(requestId: string, status: IntercomOutboxResultStatus, options: OutboxResultOptions = {}): boolean {
     const pending = pendingOutboxRequests.get(requestId);
     if (!pending) {
       return false;
@@ -1141,16 +770,14 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   function failPendingOutboxRequests(generation: number, code: IntercomOutboxResultCode, detail: string): void {
     for (const [requestId, pending] of [...pendingOutboxRequests]) {
       if (pending.generation === generation) {
-        settleOutboxRequest(requestId, "failed", { code, detail });
+        settleOutboxRequest(requestId, "failed", pending.dispatchedTargetId
+          ? { code: "delivery_unknown", detail: `${detail} during delivery; outcome is unknown. Do not automatically retry.`, messageId: requestId, targetId: pending.dispatchedTargetId, delivery: "unknown", outcomeKnown: false, retryable: false }
+          : { code, detail });
       }
     }
   }
   function resolveOutboxTarget(sessions: SessionInfo[], currentId: string, to: string): { ok: true; target: OutboxTarget } | { ok: false; code: "target_not_found" | "target_ambiguous" | "self_target"; detail: string } {
-    const byId = sessions.find((session) => session.id === to);
-    const lowerName = to.toLowerCase();
-    const byName = byId ? [] : sessions.filter((session) => session.name?.toLowerCase() === lowerName);
-    const byPrefix = byId || byName.length > 0 ? [] : sessions.filter((session) => session.id.startsWith(to));
-    const matches = byId ? [byId] : byName.length > 0 ? byName : byPrefix;
+    const matches = sessions;
     if (matches.length === 0) {
       return { ok: false, code: "target_not_found", detail: `Session "${to}" is not currently connected.` };
     }
@@ -1161,7 +788,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (target.id === currentId) {
       return { ok: false, code: "self_target", detail: "Cannot message the current session." };
     }
-    return { ok: true, target: { id: target.id, label: target.name || target.id } };
+    return { ok: true, target: { id: target.id, label: target.name || target.id, peer: target } };
   }
   function handleOutboxRequest(payload: unknown): void {
     const parsed = parseOutboxRequestPayload(payload);
@@ -1220,7 +847,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       let target: OutboxTarget;
       try {
         const currentClientSessionId = activeClient.sessionId;
-        const sessions = await activeClient.listSessions();
+        if (RESERVED_DESTINATIONS.has(request.to)) throw new Error("Extension outbox requires a direct peer destination");
+        const sessions = await activeClient.listSessions({ resolve: request.to });
         if (!currentClientSessionId) {
           settleOutboxRequest(request.requestId, "failed", { code: "session_unavailable", detail: "Current session is not registered with intercom" });
           return;
@@ -1266,7 +894,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           settleOutboxRequest(request.requestId, "failed", { code: "session_ended", detail: "Session ended before delivery" });
           return;
         }
-        const result = await activeClient.send(target.id, {
+        const sending = activeClient.send(target.id, {
+          target: target.peer,
           messageId: request.requestId,
           text: request.message,
           provenance: {
@@ -1276,23 +905,25 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
             requestId: request.requestId,
           },
         });
-        if (!getLiveContext(liveContext, outboxGeneration)) {
-          settleOutboxRequest(request.requestId, "failed", { code: "session_ended", detail: "Session ended during delivery" });
-          return;
-        }
+        const pending = pendingOutboxRequests.get(request.requestId);
+        if (pending) pending.dispatchedTargetId = target.id;
+        const result = await sending;
+        if (pendingOutboxRequests.get(request.requestId)?.generation !== outboxGeneration) return;
+        const metadata = { messageId: result.id, targetId: result.targetId ?? target.id, delivery: result.delivery, retryable: result.retryable, outcomeKnown: result.outcomeKnown };
         if (!result.delivered) {
-          settleOutboxRequest(request.requestId, "failed", { code: "delivery_failed", messageId: result.id, detail: result.reason ?? "Delivery failed" });
+          settleOutboxRequest(request.requestId, "failed", { ...metadata, code: result.delivery === "unknown" ? "delivery_unknown" : "delivery_failed", detail: result.reason ?? "Delivery failed" });
           return;
         }
-        pi.appendEntry("intercom_sent", {
+        if (getLiveContext(liveContext, outboxGeneration)) pi.appendEntry("intercom_sent", {
           to: target.label,
           message: { text: request.message },
           messageId: result.id,
           timestamp: Date.now(),
           extension: { id: request.extensionId, name: request.extensionName, requestId: request.requestId },
         });
-        settleOutboxRequest(request.requestId, "sent", { messageId: result.id });
+        settleOutboxRequest(request.requestId, "sent", metadata);
       } catch (error) {
+        if (pendingOutboxRequests.get(request.requestId)?.generation !== outboxGeneration) return;
         const live = getLiveContext(liveContext, outboxGeneration);
         settleOutboxRequest(request.requestId, "failed", {
           code: live ? "session_unavailable" : "session_ended",
@@ -1301,92 +932,54 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       }
     })();
   }
-  function shouldTriggerInboundMessage(entry: InboundMessageEntry, forceTrigger = false): boolean {
-    if (forceTrigger) {
-      return true;
-    }
-    if (config.inboundTrigger === "always") {
-      return true;
-    }
-    if (config.inboundTrigger === "replies") {
-      return Boolean(entry.message.replyTo);
-    }
-    return false;
-  }
-  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
+  function sendIncomingMessage(entry: InboundMessageEntry, generation = runtimeGeneration): boolean {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       emitMessageReceipt(entry.message.id, "expired", "session context no longer active before injection");
-      return;
+      return false;
     }
-    const injectedMessage = { ...entry.message, injectedAt: Date.now() };
-    const replyCommand = delivery === "steer" && entry.replyCommand && entry.message.expectsReply
-      ? `intercom({ action: "reply", replyTo: ${JSON.stringify(entry.message.id)}, message: "..." })`
-      : entry.replyCommand;
-    const deliveredEntry = { ...entry, message: injectedMessage, replyCommand };
-    replyTracker.queueTurnContext({ from: entry.from, message: injectedMessage, receivedAt: Date.now() });
-    const senderDisplay = injectedMessage.crossMachine
-      ? `${relaySenderName(injectedMessage.crossMachine.origin)} · unverified cross-machine`
+    const replyCommand = entry.replyCommand;
+    const senderDisplay = entry.message.crossMachine
+      ? `${relaySenderName(entry.message.crossMachine.origin)} · unverified cross-machine`
       : entry.from.name || entry.from.id.slice(0, 8);
     const replyInstruction = replyCommand ? `\n\nTo reply, use the intercom tool: ${replyCommand}` : "";
-    const deliveryMetadata = formatInboundDeliveryMetadata(injectedMessage);
-    const trigger = delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger);
-    const triggerContext = trigger ? getLiveContext(runtimeContext, generation) : undefined;
-    const startTurn = wakeWithTriggerTurn && triggerContext?.isIdle() === true;
-    pi.sendMessage(
-      {
-        customType: "intercom_message",
-        content: `**From ${senderDisplay}** (${entry.from.cwd})${replyInstruction}\n\n_${deliveryMetadata}_\n\n${entry.bodyText}`,
-        display: true,
-        details: deliveredEntry,
-      },
-      startTurn ? { triggerTurn: true } : trigger ? undefined : { deliverAs: "steer" }
-    );
-    // Pi before 1.2.0 skips before_agent_start for sendMessage({ triggerTurn: true }) turns (pi#5581),
-    // so wake an idle session there with a user prompt that runs the normal prompt lifecycle.
-    if (!wakeWithTriggerTurn && triggerContext?.isIdle() && !isIdleWakePending(triggerContext.sessionManager)) {
-      reserveIdleWake(triggerContext.sessionManager);
-      pi.sendUserMessage("New intercom message above.", { deliverAs: "steer" });
+    const deliveryMetadata = formatInboundDeliveryMetadata(entry.message);
+    const activeContext = getLiveContext(runtimeContext, generation);
+    try {
+      pi.sendMessage(
+        {
+          customType: "intercom_message",
+          content: `**From ${senderDisplay}** (session ID: ${entry.from.id}; ${entry.from.cwd})${replyInstruction}\n\n_${deliveryMetadata}_\n\n${entry.bodyText}`,
+          display: true,
+          details: entry,
+        },
+        entry.message.quiet
+          ? { deliverAs: "nextTurn" }
+          : { deliverAs: "steer", ...(wakeWithTriggerTurn && activeContext?.isIdle() ? { triggerTurn: true } : {}) },
+      );
+      // Older Pi custom-started runs skip the normal prompt lifecycle and next-turn queue.
+      if (!entry.message.quiet && !wakeWithTriggerTurn && activeContext?.isIdle() && !isIdleWakePending(activeContext.sessionManager)) {
+        reserveIdleWake(activeContext.sessionManager);
+        pi.sendUserMessage("New intercom message above.", { deliverAs: "steer" });
+      }
+      // The public API returns void: this proves handoff, not consumption or async run success.
+      emitMessageReceipt(entry.message.id, "accepted", entry.message.quiet
+        ? "handed to native next-turn queue (volatile; not read)"
+        : "handed to native active delivery (not read or processed)");
+      return true;
+    } catch (error) {
+      emitMessageReceipt(entry.message.id, "failed", getErrorMessage(error));
+      return false;
     }
-    emitMessageReceipt(injectedMessage.id, "injected");
-  }
-  function sendIncomingBrokerMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration): void {
-    sendIncomingMessage(entry, delivery, generation);
   }
   function deliverIncomingBrokerMessage(entry: InboundMessageEntry, ctx: ExtensionContext, generation: number): void {
-    const activeContext = getLiveContext(ctx, generation);
-    if (!activeContext) return;
-    if (!activeContext.isIdle()) {
-      if (!activeContext.hasUI) {
-        const activeClient = client;
-        if (!entry.message.replyTo && activeClient?.isConnected()) {
-          void (async () => {
-            try {
-              const result = await activeClient.send(entry.from.id, {
-                text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
-                replyTo: entry.message.id,
-              });
-              if (result.delivered && getLiveContext(ctx, generation)) dismissIncomingAsk(entry.message.id);
-            } catch {
-              // Best-effort reply; keep the busy non-interactive session running either way.
-            }
-          })();
-        }
-        return;
-      }
-      sendIncomingBrokerMessage(entry, "steer", generation);
+    if (!getLiveContext(ctx, generation)) {
+      emitMessageReceipt(entry.message.id, "expired", "session context no longer active before delivery");
       return;
     }
-    sendIncomingBrokerMessage(entry, "trigger", generation);
+    sendIncomingMessage(entry, generation);
   }
   function flushHeldInboundMessages(ctx: ExtensionContext, generation: number): void {
     if (!getLiveContext(ctx, generation)) return;
-    if (config.busyDelivery === "human-first" && ctx.hasUI) {
-      if (ctx.isIdle() && !isIdleWakePending(ctx.sessionManager) && heldInboundMessages.length > 0) {
-        deliverIncomingBrokerMessage(heldInboundMessages.shift()!, ctx, generation);
-      }
-      if (heldInboundMessages.length === 0) clearHeldInboundTimer();
-      return;
-    }
     while (heldInboundMessages.length > 0 && (ctx.isIdle() || agentRunning) && getLiveContext(ctx, generation)) {
       deliverIncomingBrokerMessage(heldInboundMessages.shift()!, ctx, generation);
     }
@@ -1413,36 +1006,27 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
     const receiverReceivedAt = Date.now();
     if (hasSeenInboundMessage(from, message, receiverReceivedAt)) {
-      emitMessageReceipt(message.id, "acknowledged", "duplicate message id suppressed");
+      emitMessageReceipt(message.id, "receiver_received", "duplicate suppressed; original acceptance is not reasserted");
       return;
     }
     const receivedMessage = { ...message, receiverReceivedAt };
     emitMessageReceipt(receivedMessage.id, "receiver_received");
-    if (replyWaiter) {
-      const senderTarget = from.name || from.id;
-      const fromMatches = senderTarget.toLowerCase() === replyWaiter.from.toLowerCase()
-        || from.id === replyWaiter.from;
-      const replyMatches = receivedMessage.replyTo === replyWaiter.replyTo;
-      if (fromMatches && replyMatches) {
-        emitMessageReceipt(receivedMessage.id, "acknowledged", "matched reply waiter");
-        replyWaiter.resolve(receivedMessage);
-        return;
-      }
+    if (replyWaiter.receive(from.id, receivedMessage)) {
+      emitMessageReceipt(receivedMessage.id, "acknowledged", "matched reply waiter");
+      return;
     }
     const attachmentText = receivedMessage.content.attachments?.length
       ? formatAttachments(receivedMessage.content.attachments)
       : "";
     const bodyText = `${receivedMessage.content.text}${attachmentText}`;
-    const replyCommand = config.replyHint && receivedMessage.crossMachine
-      ? `intercom({ action: "send", to: ${JSON.stringify(relaySenderName(receivedMessage.crossMachine.origin))}, message: "..." })`
-      : config.replyHint && receivedMessage.expectsReply
-        ? `intercom({ action: "reply", message: "..." })`
-        : undefined;
-    replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
-    emitMessageReceipt(receivedMessage.id, "acknowledged", "accepted by receiver");
+    const replyCommand = !receivedMessage.quiet && config.replyHint
+      ? receivedMessage.crossMachine
+        ? `intercom({ action: "send", to: ${JSON.stringify(relaySenderName(receivedMessage.crossMachine.origin))}, message: "..." })`
+        : `intercom({ action: "send", to: ${JSON.stringify(from.id)}, replyTo: ${JSON.stringify(receivedMessage.id)}, message: "..." })`
+      : undefined;
     const entry = { from, message: receivedMessage, replyCommand, bodyText };
     // Busy without an agent run cannot steer; manual compaction can discard an appended custom entry.
-    if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || (config.busyDelivery === "human-first" && liveContext.hasUI)))) {
+    if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && !agentRunning)) {
       holdIncomingBrokerMessage(entry, liveContext, messageGeneration);
     } else {
       deliverIncomingBrokerMessage(entry, liveContext, messageGeneration);
@@ -1592,9 +1176,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (!config.enabled) {
       throw new Error("Intercom disabled");
     }
-    if (disposed || shuttingDown) {
+    if (shuttingDown) {
       throw new Error("Intercom shutting down");
     }
+    if (disposed) throw new Error("Intercom runtime not initialized");
     if (client && client.isConnected()) {
       return client;
     }
@@ -1652,83 +1237,32 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     reconnectPromiseGeneration = generationAtStart;
     return nextReconnectPromise;
   }
-  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
-    const sessions = await activeClient.listSessions();
-    const byId = sessions.find(s => s.id === nameOrId);
-    if (byId) {
-      return byId.id;
-    }
-    const lowerName = nameOrId.toLowerCase();
-    const byName = sessions.filter(s => s.name?.toLowerCase() === lowerName);
-    if (byName.length > 1) {
-      const prefixes = sessionIdPrefixes(sessions);
-      const ids = byName.map((session) => prefixes.get(session.id)!).join(", ");
-      throw new Error(`Multiple sessions named "${nameOrId}" are connected. Address one by the id shown in parentheses by "list" (${ids}).`);
-    }
-    if (byName.length === 1) {
-      return byName[0]!.id;
-    }
-
-    const byIdPrefix = sessions.filter(s => s.id.startsWith(nameOrId));
-    if (byIdPrefix.length === 1) {
-      return byIdPrefix[0]!.id;
-    }
-    if (byIdPrefix.length > 1) {
-      throw new Error(`Multiple sessions match ID prefix "${nameOrId}". Use a longer session ID prefix.`);
-    }
-    return null;
-  }
-  /**
-   * Sends to `firstTarget` and, only when that is the raw unresolved string and the broker answered
-   * E_TARGET_NOT_FOUND for it, retries once with the unique connected session whose name starts with
-   * it. Raw-first lets the broker queue for (send) or refuse (ask) an offline session addressed by its
-   * exact name before a connected session whose name merely extends it can capture the message.
-   * `attempt` must use a fresh message id per call. Throws when several connected names share the prefix.
-   */
-  async function sendWithNamePrefixFallback(activeClient: IntercomClient, target: PrefixTarget, attempt: (target: string) => Promise<SendResult>): Promise<PrefixSend> {
-    const { rawTo, firstTarget, display } = target;
-    const result = await attempt(firstTarget);
-    if (result.delivered || firstTarget !== rawTo || result.code !== "E_TARGET_NOT_FOUND") {
-      return { result, display, resolution: "" };
-    }
-    const sessions = await activeClient.listSessions();
-    const lowerName = rawTo.toLowerCase();
-    const byNamePrefix = sessions.filter(s => s.name?.toLowerCase().startsWith(lowerName) ?? false);
-    if (byNamePrefix.length > 1) {
-      const prefixes = sessionIdPrefixes(sessions);
-      const candidates = byNamePrefix.map((session) => `"${session.name}" (${prefixes.get(session.id)!})`).join(", ");
-      throw new Error(`Multiple session names start with "${rawTo}": ${candidates}. Use the full name or the id shown in parentheses by "list".`);
-    }
-    const match = byNamePrefix[0];
-    if (!match || match.id === activeClient.sessionId) {
-      return { result, display, resolution: "", noMatchText: describeNoSessionMatch(sessions, rawTo) };
-    }
-    return { result: await attempt(match.id), display: match.name!, resolution: ` ("${rawTo}" resolved to "${match.name}")` };
-  }
-  /** Blocking variant: each attempt registers its reply waiter before sending and releases it when refused, so a retry can register its own. */
-  async function askWithNamePrefixFallback(activeClient: IntercomClient, target: PrefixTarget, payload: Omit<Parameters<IntercomClient["send"]>[1], "messageId" | "expectsReply">, wait: {
+  /** Pin a live endpoint before registering the single waiter, then dispatch without re-resolution. */
+  async function sendAndWait(activeClient: IntercomClient, targetId: string, payload: Omit<Parameters<IntercomClient["send"]>[1], "messageId" | "expectsReply">, wait: {
     signal: AbortSignal | undefined;
-    onAttempt: (askId: string) => void;
+    onAttempt: (messageId: string) => void;
     deliveryState: () => string;
-  }): Promise<PrefixSend & { reply: Promise<Message> }> {
-    let reply!: Promise<Message>;
-    const sent = await sendWithNamePrefixFallback(activeClient, target, async (attemptTo) => {
-      // The listSessions round trip before a retry can outlive an abort; never send an ask nobody can cancel.
-      if (wait.signal?.aborted) {
-        throw new Error("Cancelled");
-      }
-      const askId = randomUUID();
-      wait.onAttempt(askId);
-      reply = waitForReply(attemptTo, askId, wait.signal, () => activeClient.cancelAsk(askId), wait.deliveryState);
-      reply.catch(() => undefined);
-      const result = await activeClient.send(attemptTo, { ...payload, messageId: askId, expectsReply: true });
-      if (!result.delivered) {
-        rejectReplyWaiter(new Error(undeliveredText(attemptTo, result)));
-        await reply.catch(() => undefined);
-      }
-      return result;
-    });
-    return { ...sent, reply };
+  }): Promise<{ result: SendResult; display: string; reply: Promise<Message> }> {
+    const peer = payload.target ?? await activeClient.resolveTarget(targetId, { requireLive: true });
+    if (peer && !peer.endpointEpoch) throw new Error("Waiting sends require a live peer");
+    if (!peer) throw new Error(`No connected peer matches "${targetId}". Waiting sends require a live peer.`);
+    if (peer.id === activeClient.sessionId) throw new Error("Cannot message the current session");
+    if (replyWaiter.active) throw new Error("Already waiting for a reply");
+    if (wait.signal?.aborted) throw new Error("Cancelled before dispatch");
+    const messageId = randomUUID();
+    wait.onAttempt(messageId);
+    const reply = replyWaiter.wait(peer.id, messageId, { signal: wait.signal, onFinish: () => activeClient.cancelAsk(messageId), deliveryState: wait.deliveryState });
+    reply.catch(() => undefined);
+    try {
+      const result = await activeClient.send(peer.id, { ...payload, target: peer, messageId, expectsReply: true, signal: wait.signal });
+      if (!result.delivered && result.delivery !== "unknown") replyWaiter.reject(new Error(undeliveredText(peer.id, result)), messageId);
+      return { result, display: peer.id, reply };
+    } catch (error) {
+      replyWaiter.reject(toError(error), messageId);
+      // A response accepted before a transport interruption still satisfies this wait.
+      await reply;
+      return { result: { id: messageId, targetId: peer.id, delivered: false, delivery: "unknown", retryable: false, outcomeKnown: false, reason: getErrorMessage(error) }, display: peer.id, reply };
+    }
   }
   function editDistance(a: string, b: string): number {
     let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
@@ -1747,7 +1281,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     let best: SessionInfo | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
     for (const session of sessions) {
-      if (!session.name) {
+      if (!session.name || RESERVED_DESTINATIONS.has(session.name.toLowerCase())) {
         continue;
       }
       const candidate = session.name.toLowerCase();
@@ -1767,15 +1301,6 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       return `No connected session matches "${to}". Nearest name: "${nearest.name}" (${prefixes.get(nearest.id)!}). Run intercom list and address the session by its full name or the id shown in parentheses.`;
     }
     return `No connected session matches "${to}". Run intercom list for connected sessions.`;
-  }
-  async function resolveSupervisorTarget(activeClient: IntercomClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
-    if (metadata.orchestratorSessionId) {
-      const bySessionId = await resolveSessionTarget(activeClient, metadata.orchestratorSessionId);
-      if (bySessionId) {
-        return bySessionId;
-      }
-    }
-    return resolveSessionTarget(activeClient, metadata.orchestratorTarget);
   }
   async function resolveCwdDeliveryTarget(activeClient: IntercomClient, options: {
     to?: string;
@@ -1797,14 +1322,14 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     const targetCwd = options.cwd && options.cwd !== "."
       ? resolvePath(currentSession.cwd, options.cwd)
       : currentSession.cwd;
-    const existing = resolveTargetInCwd({
+    const existing = await resolveTargetInCwd(activeClient, {
       sessions,
       currentSessionId,
       targetCwd,
       ...(options.to ? { to: options.to } : {}),
     });
     if (existing.kind === "found" && existing.session) {
-      return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id };
+      return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id, peer: existing.session };
     }
     if (!options.openProjectPaneIfMissing) {
       throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} Pass openProjectPaneIfMissing: true to open a Herdr project pane and start Pi there.`);
@@ -1819,7 +1344,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       ...(options.to ? { to: options.to } : {}),
       signal: options.signal,
     });
-    return { id: session.id, label: session.name || session.id, projectPane };
+    return { id: session.id, label: session.name || session.id, peer: session, projectPane };
   }
   /** Shared by send, handover, and /handover. Never throws; failures are returned as error results. */
   async function deliverMessage(
@@ -1828,9 +1353,33 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     signal: AbortSignal | undefined,
     request: DeliveryRequest,
   ): Promise<IntercomToolResult> {
-    const { to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf } = request;
+    const { to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, quiet } = request;
     try {
+      if (request.wait && quiet) throw new Error("wait: true cannot be combined with quiet: true");
+      if (isBroadcastDestination(to)) {
+        if (request.handover) throw new Error("Handover requires a direct recipient, not a broadcast");
+        if (request.wait || replyTo !== undefined) throw new Error("Broadcasts do not support wait: true or replyTo");
+        if (cwd !== undefined || openProjectPaneIfMissing !== undefined || focus !== undefined) throw new Error("Broadcast destinations cannot be combined with cwd or project-pane options");
+        if (supersedes !== undefined || retryOf !== undefined) throw new Error("Broadcasts are new messages; supersedes and retryOf require a direct recipient");
+        if (signal?.aborted) throw new Error("Cancelled before dispatch");
+        const snapshot = await connectedClient.listSessions({ audience: to });
+        if (signal?.aborted) throw new Error("Cancelled before dispatch");
+        if (config.confirmSend && ctx.hasUI) {
+          const audience = snapshot.map(peer => `${peer.name ?? "(unnamed)"} (${peer.id})`).join("\n") || "zero recipients";
+          const confirmed = await ctx.ui.confirm("Send broadcast", `Send to ${to} (${snapshot.length} recipients):\n${audience}\n\n${message}${attachments?.length ? formatAttachments(attachments) : ""}`, { signal });
+          if (!confirmed) return { content: [{ type: "text", text: "Broadcast cancelled by user; no messages dispatched" }], details: { destination: to, cancelled: true, delivered: false } };
+        }
+        const result = await sendBroadcast(connectedClient, to, snapshot, { text: message, attachments, quiet, signal });
+        for (const recipient of result.recipients) {
+          if ("delivered" in recipient && recipient.delivered) pi.appendEntry("intercom_sent", { to: recipient.targetId, message: { text: message, attachments }, messageId: recipient.id, timestamp: Date.now(), broadcast: to });
+        }
+        return { content: [{ type: "text", text: formatBroadcastResult(result) }], details: { ...result, delivered: result.ok, error: !result.ok } };
+      }
+      if (to === "parent" && (cwd !== undefined || openProjectPaneIfMissing !== undefined || focus !== undefined)) throw new Error("The parent destination cannot be combined with cwd or project-pane options");
+      if (replyTo && !to) throw new Error("Threaded sends require an explicit 'to' recipient");
       const crossMachineTarget = Boolean(to?.includes("@"));
+      if (crossMachineTarget && (request.wait || quiet)) throw new Error("Cross-machine sends do not support wait: true or quiet: true");
+      if (request.wait && replyWaiter.active) throw new Error("Already waiting for a reply");
       const crossMachineRestriction = explicitCrossMachineSendRestriction({
         to, cwd, openProjectPaneIfMissing, attachments, replyTo, supersedes, retryOf,
       });
@@ -1910,9 +1459,11 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           };
         }
       }
+      const peer = cwd ? undefined : request.resolvedPeer ?? await connectedClient.resolveTarget(to!, { requireLive: request.wait });
+      if (!cwd && !peer) throw new Error(describeNoSessionMatch(await connectedClient.listSessions(), to!));
       const target: DeliveryTarget = cwd
         ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal })
-        : { id: (await resolveSessionTarget(connectedClient, to!)) ?? to!, label: to! };
+        : { id: peer?.id ?? to!, label: to!, ...(peer ? { peer } : {}) };
       const sendTo = target.id;
       const targetDisplay = target.projectPane ? target.label : to ?? target.label;
       if (sendTo === connectedClient.sessionId) {
@@ -1921,16 +1472,6 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           details: { error: true },
         };
       }
-      const activeReplyMismatch = replyTo ? null : replyTracker.findActiveReplyTargetMismatch(sendTo);
-      if (activeReplyMismatch) {
-        const senderLabel = activeReplyMismatch.from.name || activeReplyMismatch.from.id;
-        return {
-          content: [{ type: "text", text: `This turn is responding to an intercom ask from "${senderLabel}". Use intercom({ action: "reply", message: "..." }) or set replyTo: "${activeReplyMismatch.message.id}". Refusing non-reply send to "${targetDisplay}" to avoid a misdirected reply.` }],
-          details: { error: true, replyTo: activeReplyMismatch.message.id },
-        };
-      }
-      const inferredAsk = replyTo || request.handover ? null : replyTracker.findUniquePendingAskFrom(sendTo);
-      const effectiveReplyTo = replyTo ?? inferredAsk?.message.id;
       if (confirmSend && !(cwd && openProjectPaneIfMissing)) {
         const confirmed = await ctx.ui.confirm(
           "Send message",
@@ -1946,40 +1487,58 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       if (request.handover && signal?.aborted) {
         return { content: [{ type: "text", text: "Handover was cancelled before delivery." }], details: { error: true } };
       }
-      const { result, display, resolution, noMatchText } = await sendWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, (attemptTo) => connectedClient.send(attemptTo, {
-        text: message,
-        attachments,
-        replyTo: effectiveReplyTo,
-        supersedes,
-        retryOf,
-      }));
+      if (signal?.aborted) throw new Error("Cancelled before dispatch");
+      if (request.wait) {
+        let messageId: string | null = null;
+        let deliveryState = "created";
+        const sent = await sendAndWait(connectedClient, sendTo, { text: message, attachments, replyTo, supersedes, retryOf, target: target.peer }, {
+          signal,
+          onAttempt: (id) => { messageId = id; },
+          deliveryState: () => latestDeliveryState(messageId, deliveryState),
+        });
+        deliveryState = sent.result.delivery;
+        if (sent.result.delivered) pi.appendEntry("intercom_sent", { to: sent.display, message: { text: message, attachments, replyTo }, messageId: sent.result.id, timestamp: Date.now() });
+        try {
+          const answer = await sent.reply;
+          const text = answer.content.text + (answer.content.attachments?.length ? formatAttachments(answer.content.attachments) : "");
+          pi.appendEntry("intercom_received", { from: sent.display, message: answer.content, messageId: answer.id, timestamp: answer.timestamp });
+          return { content: [{ type: "text", text: `**Reply from ${sent.display}:**\n${text}` }], details: { messageId: sent.result.id, targetId: sent.display, replyMessageId: answer.id, outboundDelivery: deliveryDetails(sent.result) } };
+        } catch (error) {
+          return { content: [{ type: "text", text: getErrorMessage(error) }], details: { error: true, ...deliveryDetails(sent.result), targetId: sent.display, deliveryState: latestDeliveryState(messageId, deliveryState) } };
+        }
+      }
+      const result = await connectedClient.send(sendTo, {
+        text: message, attachments, replyTo, supersedes, retryOf, quiet, target: target.peer, signal,
+      });
+      const noMatchText = result.code === "E_TARGET_NOT_FOUND"
+        ? describeNoSessionMatch(await connectedClient.listSessions(), sendTo)
+        : undefined;
       if (!result.delivered) {
         return {
-          content: [{ type: "text", text: noMatchText ?? `${undeliveredText(display, result)}${resolution}` }],
+          content: [{ type: "text", text: noMatchText ?? undeliveredText(targetDisplay, result) }],
           details: { ...deliveryDetails(result), ...(noMatchText ? { error: true } : {}) },
         };
       }
       pi.appendEntry("intercom_sent", {
-        to: display,
-        message: { text: message, attachments, replyTo: effectiveReplyTo, supersedes, retryOf },
+        to: targetDisplay,
+        message: { text: message, attachments, replyTo, supersedes, retryOf },
         messageId: result.id,
         timestamp: Date.now(),
       });
-      if (effectiveReplyTo) {
-        dismissIncomingAsk(effectiveReplyTo);
-      }
+      if (replyTo) dropHeldInboundMessage(replyTo, { status: "acknowledged", detail: "answered before injection" });
       return {
         content: [{
           type: "text",
           text: result.delivery === "queued"
-            ? queuedText(display, inferredAsk ? "reply (inferred from pending ask)" : "message")
+            ? queuedText(result.targetId ?? targetDisplay, "message")
             : target.projectPane
               ? `Opened Herdr project pane ${target.projectPane.paneId} for ${target.projectPane.projectRoot} and sent message to ${targetDisplay}`
-              : inferredAsk ? `Reply sent to ${targetDisplay} (inferred from pending ask)` : `Message sent to ${display}${resolution}`,
+              : `Message sent to ${result.targetId ?? targetDisplay}`,
         }],
         details: {
           ...deliveryDetails(result),
-          ...(effectiveReplyTo ? { replyTo: effectiveReplyTo } : {}),
+          targetId: result.targetId,
+          ...(replyTo ? { replyTo } : {}),
           ...(target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {}),
         },
       };
@@ -2012,10 +1571,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       body,
     });
   }
-  function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string): void {
+  function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string): boolean {
     const liveContext = getLiveContext();
     const now = Date.now();
-    sendIncomingMessage({
+    return sendIncomingMessage({
       from: {
         id: sender,
         name: sender,
@@ -2032,7 +1591,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         content: { text: messageText },
       },
       bodyText: messageText,
-    }, "trigger", runtimeGeneration, true);
+    }, runtimeGeneration);
   }
   function recordSubagentDeliveryError(entryType: string, to: string, message: string, error: unknown): void {
     pi.appendEntry(entryType, {
@@ -2046,7 +1605,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     const previousClient = client;
     failPendingOutboxRequests(runtimeGeneration, "session_ended", "Session replaced");
     shuttingDown = false;
-    disposed = false;
+    disposed = true;
     runtimeStarted = true;
     runtimeGeneration += 1;
     outboxRequestIds.clear();
@@ -2055,32 +1614,57 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     clearReconnectTimer();
     clearStartupConnectTimer();
     clearNamePollTimer();
-    rejectReplyWaiter(new Error("Session replaced"));
-    replyTracker.reset();
+    rejectReplyWaiter(new Error("Session replaced; waiting interrupted"));
+    agentRunning = false;
+    expireHeldInboundMessages("session replaced before injection");
+    activeTools.clear();
+    runtimeContext = null;
+    currentSessionId = null;
+    currentIntercomSessionId = null;
+    currentParentSessionId = undefined;
+    sessionStartedAt = null;
     if (previousClient) {
       client = null;
       void previousClient.disconnect().catch(() => undefined);
     }
-    runtimeContext = ctx;
-    currentSessionId = ctx.sessionManager.getSessionId();
+    const sessionId = ctx.sessionManager.getSessionId();
     let claimedIntercomSessionId: string | undefined;
+    let claimedParentSessionId: string | undefined;
+    let identityError: string | undefined;
+    let acceptingClaims = true;
     const identityRequest: IntercomSessionIdentityRequestV1 = {
       version: 1,
-      claim: (stableId) => {
-        claimedIntercomSessionId ??= (typeof stableId === "string" && stableId.trim()) || undefined;
+      sessionId,
+      claim: (stableId, relationship) => {
+        if (!acceptingClaims || typeof stableId !== "string" || !stableId.trim()) return;
+        const parentId = relationship?.parentSessionId;
+        if (parentId !== undefined && (typeof parentId !== "string" || !parentId.trim() || parentId !== parentId.trim() || parentId === sessionId)) {
+          identityError = "Invalid current parent canonical session identity";
+          return;
+        }
+        if (claimedIntercomSessionId !== undefined && (claimedIntercomSessionId !== stableId.trim() || claimedParentSessionId !== parentId)) {
+          identityError = "Conflicting session-scoped intercom identity claims";
+          return;
+        }
+        claimedIntercomSessionId = stableId.trim();
+        claimedParentSessionId = parentId;
       },
     };
     pi.events.emit(INTERCOM_SESSION_IDENTITY_EVENT, identityRequest);
-    currentIntercomSessionId = claimedIntercomSessionId ?? resolveConfiguredIntercomSessionId(currentSessionId, config);
-    publishIntercomSessionId(currentIntercomSessionId);
+    acceptingClaims = false;
+    if (identityError) throw new Error(identityError);
+    const intercomSessionId = claimedIntercomSessionId ?? resolveConfiguredIntercomSessionId(sessionId, config);
+    runtimeContext = ctx;
+    currentSessionId = sessionId;
+    currentIntercomSessionId = intercomSessionId;
+    currentParentSessionId = claimedParentSessionId;
+    publishIntercomSessionId(intercomSessionId);
     currentModel = ctx.model?.id ?? "unknown";
     sessionStartedAt = Date.now();
     const initialPresenceIdentity = buildPresenceIdentity(pi, currentIntercomSessionId);
     lastPresenceName = initialPresenceIdentity.name;
     lastPresenceRuntimeFallbackAlias = initialPresenceIdentity.runtimeFallbackAlias;
-    agentRunning = false;
-    expireHeldInboundMessages("session replaced before injection");
-    activeTools.clear();
+    disposed = false;
     startNamePoll();
     const startupGeneration = runtimeGeneration;
     startupConnectTimer = setTimeout(() => {
@@ -2120,16 +1704,18 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         return;
       }
       if (currentSessionTargetMatches(parsed.to)) {
-        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
-        if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
+        const delivered = deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
+        if (options.acknowledge) emitResultDelivery(parsed.requestId, delivered, delivered ? undefined : "Native delivery handoff failed");
         return;
       }
 
       let activeClient: IntercomClient;
-      let target: string;
+      let target: SessionInfo;
       try {
         activeClient = await ensureConnected("background");
-        target = await resolveSessionTarget(activeClient, parsed.to) ?? parsed.to;
+        const peer = await activeClient.resolveTarget(parsed.to);
+        if (!peer) throw new Error(`No intercom session matches "${parsed.to}".`);
+        target = peer;
       } catch (error) {
         if (!relayStillLive()) return;
         recordSubagentDeliveryError(options.errorEntryType, parsed.to, parsed.message, error);
@@ -2140,14 +1726,14 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       if (!relayStillLive()) {
         return;
       }
-      if (currentSessionTargetMatches(parsed.to, target, activeClient)) {
-        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
-        if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
+      if (currentSessionTargetMatches(parsed.to, target.id, activeClient)) {
+        const delivered = deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
+        if (options.acknowledge) emitResultDelivery(parsed.requestId, delivered, delivered ? undefined : "Native delivery handoff failed");
         return;
       }
 
       try {
-        const { result } = await sendWithNamePrefixFallback(activeClient, { rawTo: parsed.to, firstTarget: target, display: parsed.to }, (attemptTo) => activeClient.send(attemptTo, { text: parsed.message }));
+        const result = await activeClient.send(target.id, { text: parsed.message, target });
         if (!relayStillLive()) return;
         if (!result.delivered) {
           const error = new Error(result.reason ?? "Session may not exist or has disconnected.");
@@ -2217,8 +1803,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     clearReconnectTimer();
     clearNamePollTimer();
     restoreIntercomSessionId();
-    rejectReplyWaiter(new Error("Session shutting down"));
-    replyTracker.reset();
+    rejectReplyWaiter(new Error("Session shutting down; waiting interrupted"));
     agentRunning = false;
     expireHeldInboundMessages("session shut down before injection");
     activeTools.clear();
@@ -2231,19 +1816,21 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     currentIntercomSessionId = null;
     sessionStartedAt = null;
   });
-  pi.on("turn_end", (event, ctx) => {
-    if (!getLiveContext()) {
-      return;
+  pi.on("before_agent_start", (_event, ctx) => {
+    const generation = runtimeGeneration;
+    if (!getLiveContext(ctx, generation)) return;
+    // Quiet queue insertion is safe even when compaction notifications lag behind native state.
+    // Native next-turn messages drain before agent_start. Active holds must not wake reentrantly.
+    for (let index = 0; index < heldInboundMessages.length && getLiveContext(ctx, generation);) {
+      const entry = heldInboundMessages[index]!;
+      if (!entry.message.quiet) {
+        index += 1;
+        continue;
+      }
+      heldInboundMessages.splice(index, 1);
+      deliverIncomingBrokerMessage(entry, ctx, generation);
     }
-    replyTracker.endTurn();
-    // Aborted/error turns cannot consume a steer; leave their peers for the idle trigger.
-    if (config.busyDelivery === "human-first" && ctx.hasUI && event.message.role === "assistant"
-      && event.message.stopReason !== "aborted" && event.message.stopReason !== "error"
-      && heldInboundMessages.length > 0 && agentRunning
-      && !ctx.isIdle() && !ctx.hasPendingMessages() && getLiveContext(ctx)) {
-      sendIncomingBrokerMessage(heldInboundMessages.shift()!, "steer", runtimeGeneration);
-      if (heldInboundMessages.length === 0) clearHeldInboundTimer();
-    }
+    if (heldInboundMessages.length === 0) clearHeldInboundTimer();
   });
   pi.on("agent_start", (_event, ctx) => {
     releaseIdleWake(ctx.sessionManager);
@@ -2284,14 +1871,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         return;
       }
       startSessionRuntime(ctx);
-      replyTracker.beginTurn();
       return;
     }
     if (!getLiveContext(ctx)) {
       return;
     }
     syncPresenceIdentity(sessionId);
-    replyTracker.beginTurn();
   });
   pi.on("model_select", (event, ctx) => {
     if (!getLiveContext(ctx)) {
@@ -2325,7 +1910,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   });
 
   pi.on("tool_result", (event) => {
-    if (event.toolName !== "intercom" && event.toolName !== "contact_supervisor") {
+    if (event.toolName !== INTERCOM_TOOL_NAME) {
       return;
     }
     if (!event.details || typeof event.details !== "object") {
@@ -2338,277 +1923,18 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
   });
 
-  const childOrchestratorMetadata = readChildOrchestratorMetadata();
-  const nativeSupervisorChannelAvailable = Boolean(process.env[SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV]?.trim());
-  if (childOrchestratorMetadata && !nativeSupervisorChannelAvailable) {
-    pi.registerTool(defineTool({
-      name: "contact_supervisor",
-      label: "Contact Supervisor",
-      description: "Subagent-only tool for contacting the supervisor agent that delegated this task. Use need_decision when blocked, uncertain, needing approval, or facing a product/API/scope decision before continuing; this waits for the supervisor's reply. Use interview_request when multiple structured questions need supervisor answers; this also waits for a reply. Use progress_update only for meaningful progress or unexpected discoveries that change the plan; this does not wait for a reply. Do not use for routine completion handoffs.",
-      promptSnippet: "Subagent-only: contact the supervisor for decisions, structured interviews, or meaningful plan-changing updates. Do not use for routine completion handoffs.",
-      promptGuidelines: [
-        "Use contact_supervisor with reason='need_decision' when a subagent is blocked, uncertain, needs approval, or faces a product/API/scope decision before continuing.",
-        "Use contact_supervisor with reason='interview_request' when the child needs multiple structured answers from the supervisor in one blocking exchange.",
-        "Use contact_supervisor with reason='progress_update' only for meaningful progress or unexpected discoveries that change the plan.",
-        "Do not use contact_supervisor for routine completion handoffs; return the final subagent result normally.",
-      ],
-      parameters: Type.Object({
-        reason: StringEnum(["need_decision", "progress_update", "interview_request"] as const, {
-          description: "Contact reason: 'need_decision' waits for a reply; 'interview_request' sends structured questions and waits for a reply; 'progress_update' sends a non-blocking update",
-        }),
-        message: Type.Optional(Type.String({
-          description: "Decision request, optional interview note, or meaningful progress update for the supervisor",
-        })),
-        interview: Type.Optional(Type.Object({
-          title: Type.Optional(Type.String()),
-          description: Type.Optional(Type.String()),
-          questions: Type.Array(Type.Object({
-            id: Type.String(),
-            type: StringEnum(["single", "multi", "text", "image", "info"] as const, {
-              description: "Question type: single, multi, text, image, or info",
-            }),
-            question: Type.String(),
-            options: Type.Optional(Type.Array(Type.Any())),
-            context: Type.Optional(Type.String()),
-          })),
-        }, { description: "Structured interview request for reason='interview_request'" })),
-      }),
-      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const reason = params.reason as ContactSupervisorReason;
-        if (reason !== "need_decision" && reason !== "progress_update" && reason !== "interview_request") {
-          return {
-            content: [{ type: "text", text: "Invalid reason. Use 'need_decision', 'interview_request', or 'progress_update'." }],
-            details: { error: true },
-          };
-        }
-        if ((reason === "need_decision" || reason === "progress_update") && typeof params.message !== "string") {
-          return {
-            content: [{ type: "text", text: `Missing 'message' parameter for reason '${reason}'.` }],
-            details: { error: true },
-          };
-        }
-        const interviewValidation = reason === "interview_request"
-          ? validateSupervisorInterviewRequest(params.interview)
-          : undefined;
-        if (interviewValidation?.ok === false) {
-          return {
-            content: [{ type: "text", text: `Invalid interview request: ${interviewValidation.error}` }],
-            details: { error: true },
-          };
-        }
-        const supervisorInterview = interviewValidation?.ok === true ? interviewValidation.interview : undefined;
-
-        let connectedClient: IntercomClient;
-        try {
-          connectedClient = await ensureConnected("tool");
-        } catch (error) {
-          return {
-            content: [{ type: "text", text: `Intercom not connected: ${getErrorMessage(error)}` }],
-            details: { error: true },
-          };
-        }
-
-        syncPresenceIdentity(ctx.sessionManager.getSessionId());
-
-        if (signal?.aborted) {
-          return {
-            content: [{ type: "text", text: "Cancelled" }],
-            details: { error: true },
-          };
-        }
-
-        const metadata = childOrchestratorMetadata;
-        let resolvedSupervisor: string | null;
-        try {
-          resolvedSupervisor = await resolveSupervisorTarget(connectedClient, metadata);
-        } catch (error) {
-          return {
-            content: [{ type: "text", text: `Failed to resolve supervisor target: ${getErrorMessage(error)}` }],
-            details: { error: true },
-          };
-        }
-        // A stable supervisor id is authoritative: an unresolved one goes to the broker raw, so its
-        // mailbox lookup by id applies, and never falls back to a name-prefix guess.
-        const sendTo = resolvedSupervisor ?? metadata.orchestratorSessionId ?? metadata.orchestratorTarget;
-        const supervisorTarget: PrefixTarget = {
-          rawTo: metadata.orchestratorSessionId ? "" : metadata.orchestratorTarget,
-          firstTarget: sendTo,
-          display: metadata.orchestratorTarget,
-        };
-        const supervisorFailureText = (sent: PrefixSend, blocking: boolean) => {
-          const guidance = blocking ? " Blocking requests are not queued; use a progress update or retry after the supervisor reconnects." : "";
-          if (sent.noMatchText) {
-            return `${sent.noMatchText}${guidance}`;
-          }
-          if (blocking && (sent.result.code === "E_TARGET_DISCONNECTED" || sent.result.code === "E_TARGET_NOT_FOUND")) {
-            return `Supervisor "${metadata.orchestratorTarget}" is not currently connected.${guidance}`;
-          }
-          return `${undeliveredText(sent.display, sent.result)}${sent.resolution}`;
-        };
-        if (signal?.aborted) {
-          return {
-            content: [{ type: "text", text: "Cancelled" }],
-            details: { error: true },
-          };
-        }
-        if (sendTo === connectedClient.sessionId) {
-          return {
-            content: [{ type: "text", text: "Cannot message the current session" }],
-            details: { error: true },
-          };
-        }
-
-        if (reason === "progress_update") {
-          const message = params.message as string;
-          try {
-            const sent = await sendWithNamePrefixFallback(connectedClient, supervisorTarget, (attemptTo) => connectedClient.send(attemptTo, {
-              text: formatChildOrchestratorMessage("update", metadata, message),
-            }));
-            const { result } = sent;
-            if (!result.delivered) {
-              return {
-                content: [{ type: "text", text: supervisorFailureText(sent, false) }],
-                details: deliveryDetails(result),
-              };
-            }
-            pi.appendEntry("intercom_sent", {
-              to: metadata.orchestratorTarget,
-              message: { text: message, reason },
-              messageId: result.id,
-              timestamp: Date.now(),
-              subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
-            });
-            return {
-              content: [{ type: "text", text: result.delivery === "queued" ? queuedText(metadata.orchestratorTarget, "progress update") : `Progress update sent to supervisor ${metadata.orchestratorTarget}${sent.resolution}` }],
-              details: { messageId: result.id, delivered: true },
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `Failed to send progress update: ${getErrorMessage(error)}` }],
-              details: { error: true },
-            };
-          }
-        }
-
-        if (replyWaiter) {
-          return {
-            content: [{ type: "text", text: "Already waiting for a reply" }],
-            details: { error: true },
-          };
-        }
-
-        let deliveryState = "created";
-        let questionId: string | null = null;
-        try {
-          if (signal?.aborted) {
-            return {
-              content: [{ type: "text", text: "Cancelled" }],
-              details: { error: true },
-            };
-          }
-          const requestText = reason === "interview_request"
-            ? formatChildOrchestratorMessage("interview", metadata, formatSupervisorInterviewRequest(supervisorInterview!, typeof params.message === "string" ? params.message : undefined))
-            : formatChildOrchestratorMessage("ask", metadata, params.message as string);
-          const sent = await askWithNamePrefixFallback(connectedClient, supervisorTarget, { text: requestText }, {
-            signal,
-            onAttempt: (askId) => { questionId = askId; },
-            deliveryState: () => latestDeliveryState(questionId, deliveryState),
-          });
-          const sendResult = sent.result;
-          deliveryState = sendResult.delivered ? "socket_delivered" : "delivery_failed";
-          if (!sendResult.delivered) {
-            return {
-              content: [{ type: "text", text: supervisorFailureText(sent, true) }],
-              details: { error: true },
-            };
-          }
-          pi.appendEntry("intercom_sent", {
-            to: metadata.orchestratorTarget,
-            message: {
-              text: reason === "interview_request" ? requestText : params.message,
-              reason,
-              ...(reason === "interview_request" ? { interview: supervisorInterview } : {}),
-            },
-            messageId: sendResult.id,
-            timestamp: Date.now(),
-            subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
-          });
-          const replyMessage = await sent.reply;
-          const replyText = replyMessage.content.text;
-          const replyAttachments = replyMessage.content.attachments?.length
-            ? formatAttachments(replyMessage.content.attachments)
-            : "";
-          const structuredReply = reason === "interview_request" ? parseStructuredSupervisorReply(replyText, supervisorInterview!) : undefined;
-          pi.appendEntry("intercom_received", {
-            from: metadata.orchestratorTarget,
-            message: { text: replyText, attachments: replyMessage.content.attachments },
-            messageId: replyMessage.id,
-            timestamp: replyMessage.timestamp,
-            subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
-          });
-          return {
-            content: [{ type: "text", text: `**Reply from supervisor${sent.resolution}:**\n${replyText}${replyAttachments}` }],
-            details: structuredReply
-              ? structuredReply.value !== undefined
-                ? { structuredReply: structuredReply.value }
-                : { structuredReplyParseError: structuredReply.error }
-              : {},
-          };
-        } catch (error) {
-          rejectReplyWaiter(toError(error));
-          return {
-            content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
-            details: { error: true, ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}) },
-          };
-        }
-      },
-      renderCall(args, theme, context) {
-        const reason = typeof args.reason === "string" ? args.reason : "contact";
-        const messageText = context.expanded && typeof args.message === "string"
-          ? args.message
-          : previewText(args.message, 96);
-        const interview = args.interview && typeof args.interview === "object" ? args.interview as { title?: unknown } : undefined;
-        let text = theme.fg("toolTitle", theme.bold("contact_supervisor "));
-        text += theme.fg(reason === "need_decision" ? "warning" : reason === "progress_update" ? "muted" : "accent", reason);
-        if (typeof interview?.title === "string" && interview.title.trim()) {
-          text += " " + theme.fg("accent", interview.title.trim());
-        }
-        if (messageText) {
-          text += "\n  " + theme.fg("dim", messageText);
-        }
-        return new Text(text, 0, 0);
-      },
-      renderResult(result, { isPartial }, theme, context) {
-        if (isPartial) {
-          return new Text(theme.fg("warning", "Waiting for supervisor..."), 0, 0);
-        }
-        const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; reason?: string; structuredReplyParseError?: string } | undefined;
-        const textContent = firstTextContent(result);
-        const failed = Boolean(context.isError || details?.error === true || details?.delivered === false);
-        const parseWarning = typeof details?.structuredReplyParseError === "string";
-        let text = failed
-          ? theme.fg("error", "✗ ")
-          : parseWarning
-            ? theme.fg("warning", "⚠ ")
-            : theme.fg("success", "✓ ");
-        text += theme.fg(failed ? "error" : "text", textContent);
-        if (parseWarning) {
-          text += "\n" + theme.fg("warning", `Structured reply parse issue: ${details.structuredReplyParseError}`);
-        }
-        return new Text(text, 0, 0);
-      },
-    }));
-  }
-
   pi.registerTool(defineTool({
     name: "intercom",
     label: "Intercom",
-    description: `Send a message to another pi session running on this machine.
-Use this to communicate findings, request help, or coordinate work with other sessions.
-
-Target a session by name, full session ID, or the short id shown in parentheses
-by "list" (a leading prefix of the ID is enough). Prefer the short id when two
-sessions share a name. Re-list before reusing a session ID; skip if it resolves to self.
+    description: `Coordinate with pi sessions on this broker using send, optionally with wait: true.
+Names, prefixes, and list discovery stay in the current pool; full session IDs route across pools.
+Use full sender IDs and explicit replyTo to answer any earlier message, even after a wait ends.
+The reserved destinations parent, workspace, and global are not peer names; use a full ID for colliding names.
+parent uses current launch metadata, not transcript ancestry. workspace means this pool (including named/default pools);
+global means this broker only. Broadcasts exclude self, all children, and CLI clients.
+Direct sends are active by default; broadcasts are quiet by default. Quiet uses volatile native next-turn delivery.
+Active sends wake idle peers or steer busy work without aborting it. Acceptance is not read or processing proof.
+Receipt timeout is unknown: do not automatically retry an uncertain send. Broadcast results can be partial.
 
 Usage:
   intercom({ action: "list" })                    → List active sessions
@@ -2616,25 +1942,33 @@ Usage:
   intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
-  intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
+  intercom({ action: "send", to: "name-or-id", message: "...", wait: true }) → Send and wait for the first exact-peer correlated response
+  intercom({ action: "send", to: "parent", message: "Need a decision", wait: true }) → Contact the immediate spawning session
+  intercom({ action: "send", to: "workspace", message: "Status update" }) → Quiet broadcast to top-level peers in this pool
+  intercom({ action: "send", to: "global", message: "Attention needed", quiet: false }) → Active broadcast across this broker
   intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
   intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
-  intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
-  intercom({ action: "pending" })                                      → List unresolved inbound asks
+  intercom({ action: "send", to: "full-sender-id", replyTo: "message-id", message: "..." }) → Send a threaded answer
   intercom({ action: "status" })                  → Show connection status`,
     promptSnippet:
-      "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
+      "Coordinate with pi peers: discover sessions, send updates or threaded answers, optionally wait, or broadcast to workspace/global.",
+    promptGuidelines: [
+      "Reply through intercom send with the full sender ID in to and the earlier message ID in replyTo; never infer a recipient or thread.",
+      "Use intercom send to parent for current-launch owner decisions; add wait: true only when blocked on a response. Routine child completion still uses its normal result path.",
+      "Intercom wait requires a live direct peer, cannot combine with quiet: true, and stops only waiting on timeout/cancellation. A quiet exact-peer correlated response satisfies that wait once instead of entering nextTurn.",
+      "Intercom workspace/global broadcasts default to quiet and report individual outcomes; they cannot use wait or replyTo. Do not automatically retry unknown delivery outcomes.",
+    ],
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
+      action: StringEnum(["list", "list-cwd", "send", "handover", "status", "cancel"] as const, {
+        description: "Action: 'list', 'list-cwd', 'send', 'handover', 'status', or 'cancel'. Use send with wait: true to wait for a response; always specify a recipient for threaded sends.",
       }),
       to: Type.Optional(Type.String({
-        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). Full IDs route across pools; names and prefixes are scoped to this pool. Use parent for the immediate spawning session (requires explicit launch metadata; supports wait). Use workspace for other connected top-level Pi agents in this pool, or global across this broker's pools; broadcasts exclude children and transport clients. Built-in destinations cannot combine with cwd/project-pane options. With cwd, omit to target the sole live session there.",
       })),
       message: Type.Optional(Type.String({
-        description: "Message to send (for 'send', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",
+        description: "Message to send. For 'handover', the optional next task for the receiver.",
       })),
       attachments: Type.Optional(Type.Array(Type.Object({
         type: StringEnum(["file", "snippet", "context"] as const),
@@ -2642,23 +1976,25 @@ Usage:
         content: Type.String(),
         language: Type.Optional(Type.String()),
       }))),
+      wait: Type.Optional(Type.Boolean({ description: "Wait for the first response from this exact live peer correlated by replyTo. Defaults to false; timeout or cancellation stops only waiting." })),
+      quiet: Type.Optional(Type.Boolean({ description: "Next-turn delivery without waking, steering, or conversational acknowledgement, except an exact correlated response to an active waiter goes once to that wait result instead. Defaults to false for direct sends and true for workspace/global broadcasts; explicit false makes a broadcast active. Volatile acceptance is not read proof. Cannot combine with wait: true; local send only." })),
       replyTo: Type.Optional(Type.String({
-        description: "Message ID to reply to (for threading or responding to an 'ask')",
+        description: "Earlier message ID for thread correlation. Requires an explicit recipient; no pending request is needed.",
       })),
       messageId: Type.Optional(Type.String({
         description: "Message ID for actions that operate on an existing message, such as 'cancel'.",
       })),
       supersedes: Type.Optional(Type.String({
-        description: "Previous message ID this send/ask explicitly supersedes. Only works for the same sender and receiver.",
+        description: "Previous message ID this send explicitly supersedes. Only works for the same sender and receiver.",
       })),
       retryOf: Type.Optional(Type.String({
-        description: "Previous message ID this send/ask is a user-authored retry of. Retries always send a new message ID.",
+        description: "Previous message ID this send is a user-authored retry of. Retries always send a new message ID.",
       })),
       cwd: Type.Optional(Type.String({
-        description: "Working directory filter for 'list-cwd'. For send/ask/handover, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd.",
+        description: "Working directory filter for 'list-cwd'. For send/handover, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd.",
       })),
       openProjectPaneIfMissing: Type.Optional(Type.Boolean({
-        description: "For send/ask/handover with cwd, open a visible Herdr project pane and launch Pi there when no matching live session is connected.",
+        description: "For send/handover with cwd, open a visible Herdr project pane and launch Pi there when no matching live session is connected.",
       })),
       focus: Type.Optional(Type.Boolean({
         description: "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true.",
@@ -2666,6 +2002,8 @@ Usage:
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (params.wait && params.quiet) return { content: [{ type: "text", text: "wait: true cannot be combined with quiet: true" }], details: { error: true } };
+      if (params.quiet !== undefined && params.action !== "send") return { content: [{ type: "text", text: "quiet is only supported for send" }], details: { error: true } };
       let connectedClient: IntercomClient;
       try {
         connectedClient = await ensureConnected("tool");
@@ -2678,7 +2016,8 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus } = params;
+      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, wait, quiet } = params;
+      if (wait && action !== "send") return { content: [{ type: "text", text: "wait is only supported for send" }], details: { error: true } };
 
       switch (action) {
         case "list": {
@@ -2803,11 +2142,12 @@ Usage:
             };
           }
           return deliverMessage(connectedClient, ctx, _signal, {
-            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf,
+            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, wait, quiet,
           });
         }
 
         case "handover": {
+          if (isBroadcastDestination(to)) return { content: [{ type: "text", text: "Handover requires a direct recipient, not a broadcast" }], details: { error: true } };
           if (!to && !cwd) {
             return {
               content: [{ type: "text", text: "Missing 'to' or 'cwd' parameter" }],
@@ -2830,182 +2170,6 @@ Usage:
             };
           }
           return deliverMessage(connectedClient, ctx, _signal, { to, cwd, openProjectPaneIfMissing, focus, message: handoverText, handover: true });
-        }
-
-        case "ask": {
-          if ((!to && !cwd) || !message) {
-            return {
-              content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
-              details: { error: true },
-            };
-          }
-
-          if (replyWaiter) {
-            return {
-              content: [{ type: "text", text: "Already waiting for a reply" }],
-              details: { error: true },
-            };
-          }
-
-          if (_signal?.aborted) {
-            return {
-              content: [{ type: "text", text: "Cancelled" }],
-              details: { error: true },
-            };
-          }
-          let deliveryState = "created";
-          let questionId: string | null = null;
-
-          try {
-            if (openProjectPaneIfMissing && !cwd) {
-              return {
-                content: [{ type: "text", text: "openProjectPaneIfMissing requires a target cwd." }],
-                details: { error: true },
-              };
-            }
-            let target: DeliveryTarget;
-            if (cwd) {
-              target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
-            } else {
-              target = { id: (await resolveSessionTarget(connectedClient, to!)) ?? to!, label: to! };
-            }
-            const sendTo = target.id;
-            const targetDisplay = target.projectPane ? target.label : to ?? target.label;
-            if (_signal?.aborted) {
-              return {
-                content: [{ type: "text", text: "Cancelled" }],
-                details: { error: true },
-              };
-            }
-            if (sendTo === connectedClient.sessionId) {
-              return {
-                content: [{ type: "text", text: "Cannot message the current session" }],
-                details: { error: true },
-              };
-            }
-            if (replyWaiter) {
-              return {
-                content: [{ type: "text", text: "Already waiting for a reply" }],
-                details: { error: true },
-              };
-            }
-            const sent = await askWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, { text: message, attachments, replyTo, supersedes, retryOf }, {
-              signal: _signal,
-              onAttempt: (askId) => { questionId = askId; },
-              deliveryState: () => latestDeliveryState(questionId, deliveryState),
-            });
-            const { result: sendResult, display: askTarget, resolution } = sent;
-
-            deliveryState = sendResult.delivery;
-            if (!sendResult.delivered) {
-              const errorText = sent.noMatchText
-                ? `${sent.noMatchText} ${BLOCKING_ASK_GUIDANCE}`
-                : sendResult.code === "E_TARGET_DISCONNECTED"
-                  ? `Session "${askTarget}" is not currently connected. ${BLOCKING_ASK_GUIDANCE}`
-                  : `${undeliveredText(askTarget, sendResult)}${resolution}`;
-              return {
-                content: [{ type: "text", text: errorText }],
-                details: { error: true, ...deliveryDetails(sendResult) },
-              };
-            }
-            pi.appendEntry("intercom_sent", {
-              to: askTarget,
-              message: { text: message, attachments, replyTo, supersedes, retryOf },
-              messageId: sendResult.id,
-              timestamp: Date.now(),
-            });
-            const replyMessage = await sent.reply;
-            const replyText = replyMessage.content.text;
-            const replyAttachments = replyMessage.content.attachments?.length
-              ? formatAttachments(replyMessage.content.attachments)
-              : "";
-            pi.appendEntry("intercom_received", {
-              from: askTarget,
-              message: { text: replyText, attachments: replyMessage.content.attachments },
-              messageId: replyMessage.id,
-              timestamp: replyMessage.timestamp,
-            });
-            return {
-              content: [{ type: "text", text: `**Reply from ${askTarget}${resolution}:**\n${replyText}${replyAttachments}` }],
-              details: target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {},
-            };
-          } catch (error) {
-            rejectReplyWaiter(toError(error));
-            return {
-              content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
-              details: { error: true, ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}) },
-            };
-          }
-        }
-
-        case "reply": {
-          if (!message) {
-            return {
-              content: [{ type: "text", text: "Missing 'message' parameter" }],
-              details: { error: true },
-            };
-          }
-
-          try {
-            const target = replyTracker.resolveReplyTarget({ to, replyTo });
-            if (target.from.id === connectedClient.sessionId) {
-              return {
-                content: [{ type: "text", text: "Cannot message the current session" }],
-                details: { error: true },
-              };
-            }
-            const result = await connectedClient.send(target.from.id, {
-              text: message,
-              attachments,
-              replyTo: target.message.id,
-            });
-            if (!result.delivered) {
-              if (result.reason === "Session not found") {
-                dismissIncomingAsk(target.message.id);
-              }
-              return {
-                content: [{ type: "text", text: undeliveredText(target.from.name || target.from.id, result) }],
-                details: deliveryDetails(result),
-              };
-            }
-            dismissIncomingAsk(target.message.id);
-            pi.appendEntry("intercom_sent", {
-              to: target.from.name || target.from.id,
-              message: { text: message, attachments, replyTo: target.message.id },
-              messageId: result.id,
-              timestamp: Date.now(),
-            });
-            return {
-              content: [{ type: "text", text: result.delivery === "queued" ? queuedText(target.from.name || target.from.id, "reply") : `Reply sent to ${target.from.name || target.from.id}` }],
-              details: { ...deliveryDetails(result), replyTo: target.message.id },
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `Failed to reply: ${getErrorMessage(error)}` }],
-              details: { error: true },
-            };
-          }
-        }
-
-        case "pending": {
-          const pendingAsks = replyTracker.listPending();
-          if (pendingAsks.length === 0) {
-            return {
-              content: [{ type: "text", text: "No unresolved inbound asks." }],
-              details: {},
-            };
-          }
-
-          const now = Date.now();
-          const lines = pendingAsks.map(({ from, message, receivedAt }) => {
-            const preview = message.content.text.replace(/\s+/g, " ").slice(0, 80);
-            const elapsedSeconds = Math.max(0, Math.floor((now - receivedAt) / 1000));
-            return `- ${from.name || from.id} · ${message.id} · ${elapsedSeconds}s ago · ${preview}`;
-          });
-          return {
-            content: [{ type: "text", text: `**Pending asks:**\n${lines.join("\n")}` }],
-            details: {},
-          };
         }
 
         case "status": {
@@ -3032,7 +2196,7 @@ Usage:
 
         default:
           return {
-            content: [{ type: "text", text: `Unknown action: ${action}` }],
+            content: [{ type: "text", text: `Unknown action: ${action}. Use send with an explicit recipient; add wait: true to wait or replyTo to thread an answer.` }],
             details: { error: true },
           };
       }
@@ -3045,7 +2209,7 @@ Usage:
         : previewText(args.message, 96);
       const attachmentCount = Array.isArray(args.attachments) ? args.attachments.length : 0;
       let text = theme.fg("toolTitle", theme.bold("intercom "));
-      text += theme.fg(action === "ask" ? "warning" : action === "reply" ? "success" : "accent", action);
+      text += theme.fg(args.wait === true ? "warning" : "accent", action);
       if (target) {
         text += " " + theme.fg("muted", "→") + " " + theme.fg("accent", target);
       }
@@ -3183,9 +2347,9 @@ Usage:
       notifyCommand(liveContext, `Already in intercom pool: ${requested}`, "info", commandGeneration);
       return;
     }
-    if (replyWaiter) {
-      // The reply is routed inside the current pool and would be lost after the switch.
-      notifyCommand(liveContext, `Cannot switch intercom pool while waiting for a reply from "${replyWaiter.from}". Wait for the reply or cancel the ask first.`, "warning", commandGeneration);
+    if (replyWaiter.active) {
+      // Moving a waiter to another socket would silently abandon its response.
+      notifyCommand(liveContext, "Cannot switch intercom pool while waiting for a reply. Wait for the response or cancel waiting first.", "warning", commandGeneration);
       return;
     }
 
@@ -3194,7 +2358,7 @@ Usage:
     client = null;
     clearReconnectTimer();
     markLocalExtensionsDisconnected();
-    await previousClient?.disconnect().catch(() => undefined);
+    await previousClient?.disconnect({ moveToScopeId: nextPool ?? null }).catch(() => undefined);
     if (!getLiveContext(liveContext, commandGeneration)) return;
     try {
       await ensureConnected("background");
@@ -3267,7 +2431,7 @@ Usage:
 
     const { target, goal } = picked;
     if (target.kind === "local") {
-      await performHandover(ctx, generation, { to: target.session.id }, { goal, crossMachine: false });
+      await performHandover(ctx, generation, { to: target.session.id, resolvedPeer: target.session }, { goal, crossMachine: false });
       return;
     }
     if (target.kind === "remote") {
@@ -3286,7 +2450,7 @@ Usage:
   async function performHandover(
     ctx: ExtensionContext,
     generation: number,
-    request: Pick<DeliveryRequest, "to" | "cwd" | "openProjectPaneIfMissing">,
+    request: Pick<DeliveryRequest, "to" | "cwd" | "openProjectPaneIfMissing" | "resolvedPeer">,
     options: { goal?: string; crossMachine: boolean },
   ): Promise<void> {
     let handoverClient: IntercomClient;

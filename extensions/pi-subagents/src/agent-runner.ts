@@ -51,6 +51,7 @@ export const SUBAGENT_TOOL_NAMES = {
 /** Names of tools registered by this extension that subagents must NOT inherit. */
 const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
 const sessionPermissions = new WeakMap<AgentSession, PermissionAttachment>();
+const INTERCOM_IDENTITY_EXTENSION = "<inline:intercom-session-identity>";
 
 /**
  * Canonical name of an extension for `extensions: [...]` allowlist matching.
@@ -627,6 +628,20 @@ export async function runAgent(
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
+  const parentCanonicalSessionId = ctx.sessionManager?.getSessionId?.();
+  let getChildCanonicalSessionId: () => string | undefined = () => undefined;
+  let releaseIdentity = () => {};
+  const identityFactory = (pi: ExtensionAPI) => {
+    releaseIdentity();
+    const release = pi.events.on("intercom:session-identity", (payload) => {
+      const request = payload as { version?: number; sessionId?: string; claim?: (id: string, relationship: { parentSessionId?: string }) => void } | null;
+      const childCanonicalSessionId = getChildCanonicalSessionId();
+      if (!childCanonicalSessionId || request?.version !== 1 || request.sessionId !== childCanonicalSessionId || typeof request.claim !== "function") return;
+      request.claim(options.agentId?.trim() || childCanonicalSessionId, { parentSessionId: parentCanonicalSessionId });
+    });
+    releaseIdentity = release;
+    pi.on("session_shutdown", () => release());
+  };
   const permissionCancellation = new AbortController();
   const invocationModelProgressTimeoutMinutes = getModelProgressTimeoutMinutes();
   const config = getConfig(type);
@@ -772,11 +787,17 @@ export async function runAgent(
     eventBus: options.pi.events,
     noExtensions,
     additionalExtensionPaths,
-    extensionFactories: permission ? [{ name: "permission-policy-v2", hidden: true, factory: permission.factory }] : [],
+    extensionFactories: [
+      { name: "intercom-session-identity", hidden: true, factory: identityFactory },
+      ...(permission ? [{ name: "permission-policy-v2", hidden: true, factory: permission.factory }] : []),
+    ],
     extensionsOverride: (base) => {
       const filtered = extensionsOverride?.(base) ?? base;
       // Children inherit the parent's live policy or stay ungoverned; discovery cannot enable a separate policy.
-      const extensions = filtered.extensions.filter((extension) => extension.path !== PERMISSION_EXTENSION && !extensionCanonicalNames(extension.path).includes("pi-permissions"));
+      const extensions = filtered.extensions.filter((extension) => extension.path !== INTERCOM_IDENTITY_EXTENSION && extension.path !== PERMISSION_EXTENSION && !extensionCanonicalNames(extension.path).includes("pi-permissions"));
+      const identity = base.extensions.find((extension) => extension.path === INTERCOM_IDENTITY_EXTENSION);
+      if (!identity) throw new Error("Required child intercom identity provider failed to load");
+      extensions.push(identity);
       if (!permission) return { ...filtered, extensions };
       const mandatory = base.extensions.find((extension) => extension.path === PERMISSION_EXTENSION);
       if (!mandatory) throw new Error("Required child permission extension failed to load");
@@ -1007,6 +1028,9 @@ export async function runAgent(
         })
       : SessionManager.inMemory(effectiveCwd);
 
+  // The launcher owns this invocation, including resumed histories and in-memory children.
+  getChildCanonicalSessionId = () => sessionManager.getSessionId();
+
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
   // Pass both so the full supported Pi range retains the parent's providers.
@@ -1039,6 +1063,13 @@ export async function runAgent(
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
   permissionSession = session;
+  getChildCanonicalSessionId = () => session.sessionManager?.getSessionId() ?? sessionManager.getSessionId();
+  const disposeSession = session.dispose.bind(session);
+  // SDK disposal need not emit session_shutdown; resumable sessions keep this provider until disposal.
+  session.dispose = () => {
+    releaseIdentity();
+    disposeSession();
+  };
 
   const baseSessionName = agentConfig?.name ?? type;
   const sessionName = options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName;
@@ -1212,9 +1243,12 @@ export async function runAgent(
   };
   } finally {
     permission?.release();
-    if (permission && permissionSession && !sessionHandedOff) {
-      try { await permissionSession.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" }); }
-      finally { permissionSession.dispose(); }
+    if (!sessionHandedOff) {
+      releaseIdentity();
+      if (permissionSession) {
+        try { await permissionSession.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" }); }
+        finally { permissionSession.dispose(); }
+      }
     }
   }
 }

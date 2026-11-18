@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,9 +26,9 @@ const {
     },
   },
   getAgentDir: vi.fn(() => "/mock/agent-dir"),
-  sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager" })),
-  sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
-  sessionManagerOpen: vi.fn(() => ({ kind: "reopened-session-manager" })),
+  sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager", getSessionId: () => "memory-canonical" })),
+  sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager", getSessionId: () => "persistent-canonical" })),
+  sessionManagerOpen: vi.fn(() => ({ kind: "reopened-session-manager", getSessionId: () => "reopened-canonical" })),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
   settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
 }));
@@ -55,7 +56,10 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
         loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
       }
       for (const entry of this.opts.extensionFactories ?? []) {
-        entry.factory({});
+        entry.factory({
+          events: { on: () => () => {}, ...this.opts.eventBus },
+          on: () => () => {},
+        });
         loaderExtensionsRef.current.extensions.push({ path: `<inline:${entry.name}>`, tools: new Map() });
       }
       if (this.opts.extensionsOverride) {
@@ -268,8 +272,8 @@ describe("mandatory permission inheritance", () => {
     const emit = vi.fn();
     const parentCtx = { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "root" } };
     await runAgent(parentCtx, "Explore", "work", { pi: { events: { emit } } as any });
-    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/mock/pi-usage/index.ts"]);
-    expect(defaultResourceLoaderCtor.mock.calls[0][0].extensionFactories).toEqual([]);
+    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/mock/pi-usage/index.ts", "<inline:intercom-session-identity>"]);
+    expect(defaultResourceLoaderCtor.mock.calls[0][0].extensionFactories.map((entry: any) => entry.name)).toEqual(["intercom-session-identity"]);
     expect(emit.mock.calls.map(([channel]) => channel)).not.toContain("permission:attach:v2");
     expect(session.prompt).toHaveBeenCalledOnce();
   });
@@ -281,8 +285,8 @@ describe("mandatory permission inheritance", () => {
     createAgentSession.mockResolvedValue({ session });
     const result = await runAgent(ctx, "Explore", "work", { pi });
     expect(result.responseText).toBe("NO_PERMISSION_PACKAGE");
-    expect(loaderExtensionsRef.current.extensions).toEqual([]);
-    expect(defaultResourceLoaderCtor.mock.calls[0][0].extensionFactories).toEqual([]);
+    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["<inline:intercom-session-identity>"]);
+    expect(defaultResourceLoaderCtor.mock.calls[0][0].extensionFactories.map((entry: any) => entry.name)).toEqual(["intercom-session-identity"]);
     expect(session.prompt).toHaveBeenCalledOnce();
   });
 
@@ -295,7 +299,7 @@ describe("mandatory permission inheritance", () => {
     const factory = vi.fn(); const verify = vi.fn(); const release = vi.fn();
     const parentCtx = { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "root" } };
     await runAgent(parentCtx, "Explore", "work", { pi: parent({ factory, verify, release, resume: vi.fn() }) });
-    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/mock/pi-usage/index.ts", "<inline:permission-policy-v2>"]);
+    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/mock/pi-usage/index.ts", "<inline:intercom-session-identity>", "<inline:permission-policy-v2>"]);
     expect(factory).toHaveBeenCalledOnce(); expect(verify).toHaveBeenCalledOnce(); expect(release).toHaveBeenCalledOnce();
   });
 
@@ -303,9 +307,74 @@ describe("mandatory permission inheritance", () => {
     const { session } = createSession("UNREACHABLE");
     createAgentSession.mockResolvedValue({ session });
     const release = vi.fn();
+    const dispose = session.dispose;
     const parentCtx = { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "root" } };
     await expect(runAgent(parentCtx, "Explore", "work", { pi: parent({ factory: vi.fn(), verify: () => { throw new Error("required hooks missing"); }, release, resume: vi.fn() }) })).rejects.toThrow("required hooks missing");
-    expect(session.prompt).not.toHaveBeenCalled(); expect(session.dispose).toHaveBeenCalledOnce(); expect(release).toHaveBeenCalledOnce();
+    expect(session.prompt).not.toHaveBeenCalled(); expect(dispose).toHaveBeenCalledOnce(); expect(release).toHaveBeenCalledOnce();
+  });
+});
+
+describe("session-scoped intercom launch identity", () => {
+  function sharedBus() {
+    const emitter = new EventEmitter();
+    return {
+      emitter,
+      on: (event: string, handler: (payload: unknown) => void) => {
+        emitter.on(event, handler);
+        return () => { emitter.off(event, handler); };
+      },
+      emit: (event: string, payload: unknown) => { emitter.emit(event, payload); },
+    };
+  }
+  function claims(bus: ReturnType<typeof sharedBus>, sessionId: string) {
+    const result: unknown[] = [];
+    bus.emit("intercom:session-identity", { version: 1, sessionId, claim: (...value: unknown[]) => result.push(value) });
+    return result;
+  }
+
+  it("keeps sibling and resumed ownership exact until each runtime is disposed", async () => {
+    const bus = sharedBus();
+    const first = createSession("FIRST").session;
+    const second = createSession("SECOND").session;
+    createAgentSession.mockResolvedValueOnce({ session: first }).mockResolvedValueOnce({ session: second });
+    const root = { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "current-root" } };
+    first.bindExtensions.mockImplementation(async () => {
+      expect(claims(bus, "memory-canonical")).toEqual([["stable-first", { parentSessionId: "current-root" }]]);
+    });
+    await runAgent(root, "Explore", "first", { pi: { events: bus } as any, agentId: "stable-first", nested: true, isolated: true });
+    await runAgent({ ...root, sessionManager: { ...root.sessionManager, getSessionId: () => "new-launcher" } }, "Explore", "resumed", {
+      pi: { events: bus } as any, agentId: "stable-second", resumeSessionFile: "/historical/previous-parent.jsonl",
+    });
+    expect(claims(bus, "memory-canonical")).toEqual([["stable-first", { parentSessionId: "current-root" }]]);
+    expect(claims(bus, "reopened-canonical")).toEqual([["stable-second", { parentSessionId: "new-launcher" }]]);
+    expect(claims(bus, "unrelated")).toEqual([]);
+    first.dispose();
+    expect(claims(bus, "memory-canonical")).toEqual([]);
+    expect(bus.emitter.listenerCount("intercom:session-identity")).toBe(1);
+    const secondLoaderOpts = defaultResourceLoaderCtor.mock.calls[1][0];
+    const factory = secondLoaderOpts.extensionFactories.find((entry: any) => entry.name === "intercom-session-identity").factory;
+    let shutdown: (() => void) | undefined;
+    factory({ events: bus, on: (_event: string, handler: () => void) => { shutdown = handler; } });
+    expect(bus.emitter.listenerCount("intercom:session-identity")).toBe(1);
+    expect(claims(bus, "reopened-canonical")).toHaveLength(1);
+    shutdown?.();
+    expect(claims(bus, "reopened-canonical")).toEqual([]);
+    factory({ events: bus, on: () => {} });
+    second.dispose();
+    expect(bus.emitter.listenerCount("intercom:session-identity")).toBe(0);
+  });
+
+  it.each(["constructor", "bind"])("releases the shared-bus handler on %s failure", async (stage) => {
+    const bus = sharedBus();
+    const session = createSession("UNREACHABLE").session;
+    if (stage === "constructor") createAgentSession.mockRejectedValueOnce(new Error("startup failed"));
+    else {
+      createAgentSession.mockResolvedValueOnce({ session });
+      session.bindExtensions.mockRejectedValueOnce(new Error("startup failed"));
+    }
+    await expect(runAgent(ctx, "Explore", "fail", { pi: { events: bus } as any })).rejects.toThrow("startup failed");
+    expect(bus.emitter.listenerCount("intercom:session-identity")).toBe(0);
+    expect(session.prompt).not.toHaveBeenCalled();
   });
 });
 
@@ -1461,7 +1530,7 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerInMemory).not.toHaveBeenCalled();
     expect(sessionManagerCreate).toHaveBeenCalled();
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
-      sessionManager: { kind: "persistent-session-manager" },
+      sessionManager: expect.objectContaining({ kind: "persistent-session-manager" }),
     }));
   });
 
@@ -1549,7 +1618,7 @@ describe("agent-runner session persistence", () => {
       { parentSession: "/sessions/parent.jsonl" },
     );
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
-      sessionManager: { kind: "persistent-session-manager" },
+      sessionManager: expect.objectContaining({ kind: "persistent-session-manager" }),
     }));
   });
 
@@ -2426,7 +2495,7 @@ describe("agent-runner extension allowlist", () => {
     await runAgent(ctx, "Explore", "go", { pi });
 
     const opts = lastLoaderOpts();
-    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/ext/a.ts"]);
+    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/ext/a.ts", "<inline:intercom-session-identity>"]);
     expect(opts.additionalExtensionPaths).toBeUndefined();
     expect(lastToolsPassed()).toContain("tool_a");
   });
@@ -2691,7 +2760,7 @@ describe("agent-runner exclude_extensions", () => {
 
     await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
 
-    expect(loaderExtensionsRef.current.extensions).toEqual([]);
+    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["<inline:intercom-session-identity>"]);
     expect(extensionErrors(onToolActivity)).toEqual([
       expect.stringContaining("exclude_extensions has no effect"),
     ]);
@@ -2861,7 +2930,7 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).not.toContain("other_tool"); // loaded but muted
     expect(tools).not.toContain("read"); // tools: ext:foo → no built-ins
     // Tool narrowing leaves both ordinary extensions bound to the session.
-    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/ext/foo.ts", "/ext/other.ts"]);
+    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/ext/foo.ts", "/ext/other.ts", "<inline:intercom-session-identity>"]);
   });
 
   it("'*' alongside ext: keeps all built-ins while the flip still applies", async () => {
@@ -2945,7 +3014,7 @@ describe("agent-runner ext: tool selectors", () => {
 
     await runAgent(ctx, "Explore", "go", { pi });
 
-    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/ext/foo.ts", "/ext/other.ts"]);
+    expect(loaderExtensionsRef.current.extensions.map((extension) => extension.path)).toEqual(["/ext/foo.ts", "/ext/other.ts", "<inline:intercom-session-identity>"]);
     const tools = lastToolsPassed();
     expect(tools).toContain("bar");
     expect(tools).not.toContain("baz");

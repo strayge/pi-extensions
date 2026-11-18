@@ -1,8 +1,14 @@
 export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
 export const EXACT_SEND_FEATURE = "exact-send-v1";
+export const UNIFIED_MESSAGING_FEATURE = "unified-messaging-v2";
+export const PARENT_IDENTITY_FEATURE = "parent-identity-v1";
+export const BROADCAST_AUDIENCE_FEATURE = "broadcast-audience-v1";
+export type BroadcastDestination = "workspace" | "global";
+export const RESERVED_DESTINATIONS = new Set(["parent", "workspace", "global"]);
 /** Broker refused a register because another live process holds the session id. */
 export const SESSION_HELD_ERROR_CODE = "E_SESSION_HELD";
 
+/** `socket_delivered` is the wire name for receiver-path acceptance, never read/processing proof. */
 export type DeliveryState = "socket_delivered" | "queued" | "failed" | "unknown";
 
 export interface DeliveryDetails {
@@ -31,6 +37,12 @@ export type HerdrLocation =
 
 export interface SessionInfo {
   id: string;
+  /** Pi runtime identity, independent of a configured intercom routing ID. */
+  canonicalSessionId?: string;
+  /** Current immediate launcher's canonical Pi identity, never transcript ancestry. */
+  parentSessionId?: string;
+  /** Workers are agents with parentSessionId; CLI/relay participants are transport-only. */
+  role?: "agent" | "transport";
   /** Broker-owned lifetime of this live endpoint. */
   endpointEpoch?: string;
   name?: string;
@@ -93,6 +105,8 @@ export interface Message {
   retryOf?: string;
   replyTo?: string;
   expectsReply?: boolean;
+  /** Native next-turn delivery; false/omitted actively wakes or steers. */
+  quiet?: boolean;
   provenance?: MessageProvenance;
   crossMachine?: CrossMachineProvenance;
   content: {
@@ -115,7 +129,7 @@ export interface Attachment {
   language?: string;
 }
 
-export type MessageReceiptStatus = "receiver_received" | "queued" | "injected" | "acknowledged" | "expired" | "cancelled" | "superseded" | "cancellation_requested";
+export type MessageReceiptStatus = "receiver_received" | "accepted" | "queued" | "injected" | "acknowledged" | "failed" | "rejected" | "unsupported" | "expired" | "cancelled" | "superseded" | "cancellation_requested";
 
 export interface MessageReceipt {
   messageId: string;
@@ -141,9 +155,10 @@ export interface ExtensionCapability {
 
 export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal" | "herdrLocation"> & {
   extensions?: ExtensionCapability[];
+  features?: string[];
   /** Broker-only join hint; never returned in the public roster. */
   herdrSessionPath?: string;
-  /** The client sends `receiver_received` for every message it is handed, so the broker may wait for it before reporting delivery. */
+  /** The client emits delivery receipts. Socket receipt alone is never acceptance proof. */
   acknowledgesReceipts?: boolean;
   /** The client sends a frame at least this often, so the broker may drop it after several silent intervals. */
   livenessIntervalMs?: number;
@@ -151,9 +166,9 @@ export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "pe
 
 export type ClientMessage =
   | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; scopeId?: string }
-  | { type: "unregister" }
+  | { type: "unregister"; moveToScopeId?: string | null }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
-  | { type: "list"; requestId: string }
+  | { type: "list"; requestId: string; resolve?: string; audience?: BroadcastDestination }
   | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }
