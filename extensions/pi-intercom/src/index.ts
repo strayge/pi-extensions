@@ -278,9 +278,6 @@ function currentHerdrPane(): string | undefined {
   const pane = process.env.HERDR_PANE_ID?.trim();
   return pane ? pane : undefined;
 }
-function formatIntercomContactSnippet(sessionId: string): string {
-  return `Use pi-intercom: intercom({ action: "send", to: "${sessionId}", message: "..." })`;
-}
 function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): string {
   if (!session.name) {
     return session.id;
@@ -2089,16 +2086,7 @@ Usage:
     },
   }));
 
-  function insertIntoEditor(ctx: ExtensionContext, text: string): boolean {
-    if (!ctx.hasUI) return false;
-    const ui = ctx.ui as { getEditorText?: () => string; setEditorText?: (text: string) => void };
-    if (typeof ui.setEditorText !== "function") return false;
-    const existing = typeof ui.getEditorText === "function" ? ui.getEditorText() : "";
-    ui.setEditorText(existing.trim() ? `${existing.trimEnd()}\n\n${text}` : text);
-    return true;
-  }
-
-  async function insertIntercomId(ctx: ExtensionContext): Promise<void> {
+  async function showIntercomId(ctx: ExtensionContext): Promise<void> {
     const commandGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, commandGeneration);
     if (!liveContext) return;
@@ -2111,11 +2099,6 @@ Usage:
     }
     const sessionId = contactClient.sessionId;
     if (!sessionId || !getLiveContext(liveContext, commandGeneration)) return;
-    const snippet = formatIntercomContactSnippet(sessionId);
-    if (insertIntoEditor(liveContext, snippet)) {
-      notifyIfLive(liveContext, `Inserted intercom contact target: ${sessionId}`, "info", commandGeneration);
-      return;
-    }
     notifyIfLive(liveContext, `Intercom contact target: ${sessionId}`, "info", commandGeneration);
   }
 
@@ -2418,8 +2401,8 @@ Usage:
   });
 
   pi.registerCommand("intercom-id", {
-    description: "Insert a stable pi-intercom handoff snippet for this session into the editor",
-    handler: async (_args, ctx) => insertIntercomId(ctx),
+    description: "Show this session's full Intercom ID",
+    handler: async (_args, ctx) => showIntercomId(ctx),
   });
 
   pi.registerCommand("intercom-pool", {

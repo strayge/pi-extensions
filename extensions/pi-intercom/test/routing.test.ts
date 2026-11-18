@@ -1443,6 +1443,32 @@ test("unified direct messaging keeps discovery scoped and routing identity-bound
         }
       });
 
+      await st.test("intercom-id shows the full target without editing the prompt", async () => {
+        const previousUI = session.extensionRunner.getUIContext();
+        const notices: string[] = [];
+        let editorText = "Unsent draft";
+        session.extensionRunner.setUIContext(
+          {
+            ...previousUI,
+            notify: (message) => notices.push(message),
+            getEditorText: () => editorText,
+            setEditorText: (text) => {
+              editorText = text;
+            },
+          },
+          "tui",
+        );
+        try {
+          const command = session.extensionRunner.getCommand("intercom-id");
+          assert.ok(command);
+          await command.handler("", session.extensionRunner.createCommandContext());
+          assert.deepEqual(notices, ["Intercom contact target: entry-sender"]);
+          assert.equal(editorText, "Unsent draft");
+        } finally {
+          session.extensionRunner.setUIContext(previousUI, "tui");
+        }
+      });
+
       await st.test(
         "path handovers reject before opening generation or calling the model",
         async (ht) => {

@@ -21,7 +21,7 @@ not recipients. Missing recipients never infer a peer or broadcast.
 Use full session IDs from incoming messages/results for exact routing. Names and
 abbreviated IDs/names resolve only inside your pool; full IDs can cross pools on
 this broker. Never use terminal pane IDs as intercom addresses. `/alias <name>`
-gives your session a recognizable display name; `/intercom-id` inserts its target.
+gives your session a recognizable display name; `/intercom-id` shows its full ID.
 
 Pools are discovery groups, not delivery isolation. At launch they follow the
 wmux/cmux workspace, or canonical cwd outside both. Children inherit their parent's

@@ -14,7 +14,7 @@ Restart pi after installing. Do not load this package alongside another copy of 
 
 - Press **Alt+M** or run `/intercom` to choose a connected session and compose a message.
 - Use `/alias <name>` to give your session a recognizable name.
-- Use `/intercom-id` to insert your session's stable target into the editor.
+- Use `/intercom-id` to display your session's full Intercom ID without changing the prompt.
 - The `intercom` tool supports `list`, `send`, `status`, `cancel`, and `handover`. Discover peers with `list`, then specify an explicit `to` recipient. Use `send` with `wait: true` to wait for a direct response, or `send` with an explicit `to` and `replyTo` to answer any earlier message.
 - Children contact their immediate spawning session with `send` to `parent`, optionally with `wait: true`. This requires current-launch parent metadata (supplied by pi-subagents), not a name or saved transcript ancestor.
 - The bundled `pi-intercom` skill documents coordination workflows.
