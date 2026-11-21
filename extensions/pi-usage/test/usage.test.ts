@@ -234,7 +234,7 @@ test("OpenAI API keys and provider overrides never reach the ChatGPT usage endpo
   assert.equal(fetches, 0);
 });
 
-test("opening and closing usage history reuses the fetched live outcome", async (t) => {
+test("statistics collects only requested ranges and reuses loaded data and live usage", async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => {
     globalThis.fetch = originalFetch;
@@ -248,9 +248,12 @@ test("opening and closing usage history reuses the fetched live outcome", async 
   const choices = ["Statistics", "Close"];
   const mock = createMockPi();
   let shown = 0;
+  const loads: Array<{ durationMs?: number; now?: number }> = [];
+  const day = 24 * 60 * 60_000;
   usageExtension(mock.pi, {
     load: async (_ctx, options) => {
       assert.equal(options.signal?.aborted, false);
+      loads.push({ durationMs: options.durationMs, now: options.now });
       return emptyHistory;
     },
     show: async (_ctx, options) => {
@@ -261,6 +264,26 @@ test("opening and closing usage history reuses the fetched live outcome", async 
       assert.equal(options.live?.identity?.kind, "credential");
       assert.equal(options.live?.report.buckets[0]?.id, "credits");
       assert.equal(options.signal.aborted, false);
+      assert.deepEqual(
+        loads.map((load) => load.durationMs),
+        [day],
+      );
+      assert.ok(options.loadRange);
+      await options.loadRange(7 * day);
+      await options.loadRange(day);
+      await options.loadRange(7 * day);
+      assert.deepEqual(
+        loads.map((load) => load.durationMs),
+        [day, 7 * day],
+      );
+      await options.loadRange(30 * day);
+      await options.loadRange(14 * day);
+      assert.deepEqual(
+        loads.map((load) => load.durationMs),
+        [day, 7 * day, 30 * day],
+      );
+      assert.ok(loads[0]?.now);
+      assert.ok(loads.every((load) => load.now === loads[0]?.now));
     },
   });
   const command = mock.commands.get("usage");

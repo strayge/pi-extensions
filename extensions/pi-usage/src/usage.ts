@@ -24,7 +24,7 @@ import {
 import { awaitWithDeadline, errorMessage, sanitizeDisplayText, UsageCache } from "./core.ts";
 import { showDisplayMenu } from "./display-menu.ts";
 import { formatProviderState, formatUsageSegments, formatUsageStatusline } from "./format.ts";
-import { loadHistory } from "./history.ts";
+import { HISTORY_DEFAULT_RANGE_MS, type LoadedHistory, loadHistory } from "./history.ts";
 import { showUsageHistory } from "./history-menu.ts";
 import { isCodexProvider } from "./providers/codex.ts";
 import {
@@ -803,16 +803,33 @@ export default function usageExtension(
         }
         if (action === HISTORY) {
           try {
-            const loaded = await runWithLoader(
-              ctx,
-              "Loading usage history…",
-              controller.signal,
-              (signal) =>
-                history.load(ctx, {
-                  signal,
-                  extraSessionDirs: loadDisplayConfig().extraSessionDirs,
-                }),
-            );
+            const now = Date.now();
+            const extraSessionDirs = loadDisplayConfig().extraSessionDirs;
+            let loadedHistory: LoadedHistory | undefined;
+            let loadedDurationMs = 0;
+            const loadRange = async (durationMs: number): Promise<LoadedHistory | undefined> => {
+              if (controller.signal.aborted) return undefined;
+              if (loadedHistory && durationMs <= loadedDurationMs) return loadedHistory;
+              try {
+                const result = await runWithLoader(
+                  ctx,
+                  "Loading usage history…",
+                  controller.signal,
+                  (signal) => history.load(ctx, { signal, now, durationMs, extraSessionDirs }),
+                );
+                if (result && !controller.signal.aborted) {
+                  loadedHistory = result;
+                  loadedDurationMs = durationMs;
+                  return result;
+                }
+              } catch (error) {
+                if (!controller.signal.aborted && !isAbortError(error)) {
+                  ctx.ui.notify("Could not load usage history.", "warning");
+                }
+              }
+              return undefined;
+            };
+            const loaded = await loadRange(HISTORY_DEFAULT_RANGE_MS);
             if (!loaded) {
               if (controller.signal.aborted) return;
               continue;
@@ -826,7 +843,12 @@ export default function usageExtension(
                     report: outcome.state.report,
                   }
                 : undefined;
-            await history.show(ctx, { history: loaded, live, signal: controller.signal });
+            await history.show(ctx, {
+              history: loaded,
+              live,
+              signal: controller.signal,
+              loadRange,
+            });
           } catch (error) {
             if (controller.signal.aborted || isAbortError(error)) return;
             ctx.ui.notify("Could not load usage history.", "warning");

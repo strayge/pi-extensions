@@ -54,6 +54,8 @@ export interface ShowUsageHistoryOptions {
   history: LoadedHistory;
   live?: LiveQuotaContext;
   signal: AbortSignal;
+  /** Undefined means collection was cancelled or failed; keep the previous range. */
+  loadRange?: (durationMs: number) => Promise<LoadedHistory | undefined>;
   /** Test seam for proving range aggregation is not repeated during navigation. */
   deriveRange?: typeof deriveHistoryRange;
 }
@@ -880,6 +882,7 @@ export function updateHistoryMenuState(
   live?: LiveQuotaContext,
   getView: (durationMs: number) => HistoryRangeView = (durationMs) =>
     deriveHistoryRange(history, durationMs, { live }),
+  deferRangeChange = false,
 ): HistoryMenuState {
   const next = { ...state };
 
@@ -921,6 +924,9 @@ export function updateHistoryMenuState(
       ]?.label ?? "1d";
     next.scrollOffset = 0;
   }
+
+  // An unloaded range must be collected before deriving or rendering its totals.
+  if (deferRangeChange && next.range !== state.range) return next;
 
   const nextView = getView(rangeDefinition(next.range).durationMs);
   let rendered = renderUsageHistory(history, next, width, terminalHeight, {
@@ -968,8 +974,12 @@ export function createHistoryTuiComponent(
   theme: HistoryTheme,
   requestRender: () => void,
   done: () => void,
+  navigation?: {
+    initialState?: HistoryMenuState;
+    onRangeChange?: (next: HistoryMenuState) => void;
+  },
 ): HistoryTuiComponent {
-  let state = createHistoryMenuState();
+  let state = { ...(navigation?.initialState ?? createHistoryMenuState()) };
   let lastWidth = 80;
   const getView = historyViewCache(options);
   const component: HistoryTuiComponent = {
@@ -998,7 +1008,12 @@ export function createHistoryTuiComponent(
         HISTORY_PANEL_HEIGHT,
         options.live,
         getView,
+        !!navigation?.onRangeChange,
       );
+      if (next.range !== state.range && navigation?.onRangeChange) {
+        navigation.onRangeChange(next);
+        return;
+      }
       if (JSON.stringify(next) === JSON.stringify(state)) return;
       state = next;
       requestRender();
@@ -1015,24 +1030,43 @@ export async function showUsageHistory(
 ): Promise<void> {
   if (options.signal.aborted) return;
   if (ctx.mode !== "tui") return showUsageHistorySelect(ctx, options);
-  let cleanupAbort: (() => void) | undefined;
-  try {
-    await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-      const stop = () => done(undefined);
-      cleanupAbort = () => options.signal.removeEventListener("abort", stop);
-      options.signal.addEventListener("abort", stop, { once: true });
-      if (options.signal.aborted) stop();
-      const component = createHistoryTuiComponent(
-        options,
-        theme,
-        () => tui.requestRender(),
-        () => done(undefined),
-      );
-      component.dispose = cleanupAbort;
-      return component;
-    });
-  } finally {
-    cleanupAbort?.();
+  let state = createHistoryMenuState();
+  let history = options.history;
+  while (!options.signal.aborted) {
+    let cleanupAbort: (() => void) | undefined;
+    let next: HistoryMenuState | undefined;
+    try {
+      next = await ctx.ui.custom<HistoryMenuState | undefined>((tui, theme, _keybindings, done) => {
+        const stop = () => done(undefined);
+        cleanupAbort = () => options.signal.removeEventListener("abort", stop);
+        options.signal.addEventListener("abort", stop, { once: true });
+        if (options.signal.aborted) stop();
+        const component = createHistoryTuiComponent(
+          { ...options, history },
+          theme,
+          () => tui.requestRender(),
+          stop,
+          {
+            initialState: state,
+            onRangeChange: options.loadRange
+              ? (selected) => {
+                  state = component.getState();
+                  done(selected);
+                }
+              : undefined,
+          },
+        );
+        component.dispose = cleanupAbort;
+        return component;
+      });
+    } finally {
+      cleanupAbort?.();
+    }
+    if (!next || options.signal.aborted) return;
+    const loaded = await options.loadRange?.(rangeDefinition(next.range).durationMs);
+    if (!loaded || options.signal.aborted) continue;
+    history = loaded;
+    state = next;
   }
 }
 
@@ -1041,7 +1075,8 @@ async function showUsageHistorySelect(
   options: ShowUsageHistoryOptions,
 ): Promise<void> {
   const state = createHistoryMenuState();
-  const getView = historyViewCache(options);
+  let history = options.history;
+  let getView = historyViewCache(options);
   while (!options.signal.aborted) {
     const view = getView(rangeDefinition(state.range).durationMs);
     const actions = [
@@ -1058,7 +1093,18 @@ async function showUsageHistorySelect(
     });
     if (!choice || choice === "Back") return;
     if (choice.startsWith("Tab: ")) state.tab = choice.slice(5) as HistoryTab;
-    else if (choice.startsWith("Range: ")) state.range = choice.slice(7) as HistoryRangeLabel;
+    else if (choice.startsWith("Range: ")) {
+      const range = choice.slice(7) as HistoryRangeLabel;
+      if (options.loadRange) {
+        const loaded = await options.loadRange(rangeDefinition(range).durationMs);
+        if (!loaded || options.signal.aborted) continue;
+        if (history !== loaded) {
+          history = loaded;
+          getView = historyViewCache({ ...options, history });
+        }
+      }
+      state.range = range;
+    }
     state.scrollOffset = 0;
   }
 }

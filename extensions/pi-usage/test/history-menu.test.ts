@@ -2305,6 +2305,69 @@ test("focused history leaves the host component tree untouched", async () => {
   assert.deepEqual(host.children, originalChildren);
 });
 
+test("TUI loads a selected range before aggregation and preserves navigation on cancellation", async () => {
+  const day = HISTORY_RANGES[0].durationMs;
+  const history = fixture();
+  const loads: number[] = [];
+  const derivations: number[] = [];
+  let screen = 0;
+  let coverage = day;
+  const cancelled = new AbortController();
+  await showUsageHistory(
+    {
+      mode: "tui",
+      ui: {
+        custom: async (
+          factory: (...args: unknown[]) => ReturnType<typeof createHistoryTuiComponent>,
+        ) => {
+          let result: unknown;
+          const component = factory(
+            { requestRender() {} },
+            { fg: (_tone: string, value: string) => value, bold: (value: string) => value },
+            {},
+            (value: unknown) => {
+              result = value;
+            },
+          );
+          component.render(80);
+          if (screen === 0) {
+            assert.equal(component.getState().range, "1d");
+            component.handleInput?.("\t");
+            component.handleInput?.("5");
+          } else {
+            assert.equal(component.getState().tab, "Cache");
+            assert.equal(component.getState().range, screen < 3 ? "7d" : "30d");
+            component.handleInput?.(screen === 1 ? "3" : screen === 2 ? "7" : "\x1b");
+          }
+          screen += 1;
+          component.dispose?.();
+          return result;
+        },
+      },
+    } as never,
+    {
+      history,
+      signal: cancelled.signal,
+      loadRange: async (durationMs) => {
+        assert.equal(getEventListeners(cancelled.signal, "abort").length, 0);
+        loads.push(durationMs);
+        if (durationMs === 3 * day) return undefined;
+        coverage = durationMs;
+        return { ...history };
+      },
+      deriveRange: (loaded, durationMs, options) => {
+        assert.ok(durationMs <= coverage, "an unloaded range was aggregated");
+        derivations.push(durationMs);
+        return deriveHistoryRange(loaded, durationMs, options);
+      },
+    },
+  );
+  assert.equal(screen, 4);
+  assert.deepEqual(loads, [7 * day, 3 * day, 30 * day]);
+  assert.equal(derivations.includes(3 * day), false);
+  assert.equal(getEventListeners(cancelled.signal, "abort").length, 0);
+});
+
 test("history cancellation closes normally and removes its abort listener", async () => {
   const cancelled = new AbortController();
   const host = new TuiMainScreen({ columns: 40, rows: 10, hideCursor() {}, write() {} } as never);
@@ -2496,6 +2559,34 @@ test("tiny selectors remain width-safe with only two selected rows", () => {
       assert.equal(plain.filter((line) => line.startsWith("[")).length, 2);
     }
   }
+});
+
+test("non-TUI range cancellation retains its current tab and range", async () => {
+  const choices = ["Tab: Cache", "Range: 7d", "Range: 30d", "Back"];
+  const loads: number[] = [];
+  const ranges: string[] = [];
+  await showUsageHistory(
+    {
+      mode: "rpc",
+      ui: {
+        select: async (_title: string, actions: string[]) => {
+          assert.ok(actions.includes("Tab: Models") || choices[0] === "Tab: Cache");
+          ranges.push(actions.includes("Range: 1d") ? "7d" : "1d");
+          return choices.shift();
+        },
+      },
+    } as never,
+    {
+      history: fixture(),
+      signal: new AbortController().signal,
+      loadRange: async (durationMs) => {
+        loads.push(durationMs);
+        return durationMs === HISTORY_RANGES[4].durationMs ? fixture() : undefined;
+      },
+    },
+  );
+  assert.deepEqual(ranges, ["1d", "1d", "7d", "7d"]);
+  assert.deepEqual(loads, [HISTORY_RANGES[4].durationMs, HISTORY_RANGES[6].durationMs]);
 });
 
 test("non-TUI action loop changes tab and range before Back", async () => {

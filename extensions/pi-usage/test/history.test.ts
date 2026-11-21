@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import {
   appendFile,
   mkdir,
@@ -12,11 +13,15 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   CACHE_GAP_BUCKETS,
   callsInRange,
   deriveHistoryRange,
   fingerprintCall,
+  HISTORY_BOUNDARY_TOLERANCE_MS,
+  HISTORY_DEFAULT_RANGE_MS,
+  HISTORY_MAX_AGE_MS,
   type LoadedHistory,
   loadHistory,
   type NormalizedCall,
@@ -477,18 +482,161 @@ test("suppresses an incomplete terminal record only when the source actively cha
   );
 });
 
+test("defaults to day-scoped source reads and expands only for explicit 7/30-day ranges", async (t) => {
+  const root = await workspace(t);
+  const outputRoot = join(root, "outputs");
+  const sources: Array<{ path: string; ageDays: number }> = [];
+  assert.equal(HISTORY_DEFAULT_RANGE_MS, 24 * 60 * 60 * 1000);
+  for (const ageDays of [0.5, 3, 10, 31]) {
+    const at = NOW - ageDays * HISTORY_DEFAULT_RANGE_MS;
+    const call = assistant(`call-${ageDays}`, null, "provider-a", "model-a", at);
+    const session = join(root, `session-${ageDays}.jsonl`);
+    const output = join(outputRoot, "cwd", "root", "tasks", `agent-${ageDays}.output`);
+    await writeJsonl(session, [header(`session-${ageDays}`), call]);
+    await writeJsonl(output, [{ timestamp: at, message: call.message }]);
+    for (const path of [session, output]) {
+      await utimes(path, new Date(at), new Date(at));
+      sources.push({ path, ageDays });
+    }
+  }
+
+  for (const days of [undefined, 7, 30]) {
+    const reads: string[] = [];
+    const result = await loadHistory(context(manager({ dir: root })), {
+      now: NOW,
+      ...(days === undefined ? {} : { durationMs: days * HISTORY_DEFAULT_RANGE_MS }),
+      outputRoot,
+      listAll: async () =>
+        sources.filter(({ path }) => path.endsWith(".jsonl")).map(({ path }) => info(path)),
+      sourceReadStarted: (path) => {
+        reads.push(path);
+      },
+    });
+    const expected = sources.filter(({ ageDays }) => ageDays <= (days ?? 1));
+    assert.deepEqual(reads.sort(), expected.map(({ path }) => path).sort());
+    assert.equal(result.calls.length, expected.length);
+    assert.deepEqual(result.warnings, []);
+  }
+});
+
+test("default discovery includes global, linked, and custom sessions without parsing stale sources", async (t) => {
+  const root = await workspace(t);
+  const agentDir = join(root, "agent");
+  const project = join(agentDir, "sessions", "--project--");
+  const global = join(project, "global.jsonl");
+  const stale = join(project, "stale.jsonl");
+  const linked = join(root, "linked-target.jsonl");
+  const customDir = join(root, "custom");
+  const active = join(customDir, "active.jsonl");
+  const sibling = join(customDir, "sibling.jsonl");
+  for (const [path, id] of [
+    [global, "global"],
+    [stale, "stale"],
+    [linked, "linked"],
+    [sibling, "sibling"],
+  ] as const) {
+    await writeJsonl(path, [header(id), assistant(`${id}-call`, null)]);
+    await utimes(path, new Date(NOW), new Date(NOW));
+  }
+  await symlink(linked, join(project, "linked.jsonl"));
+  await writeJsonl(active, [header("active")]);
+  const staleTime = NOW - HISTORY_DEFAULT_RANGE_MS - HISTORY_BOUNDARY_TOLERANCE_MS - 1;
+  await utimes(stale, new Date(staleTime), new Date(staleTime));
+
+  const script = `
+    import { SessionManager } from ${JSON.stringify(import.meta.resolve("@earendil-works/pi-coding-agent"))};
+    import { loadHistory } from ${JSON.stringify(new URL("../src/history.ts", import.meta.url).href)};
+    SessionManager.listAll = async () => { throw new Error("Discovery must not parse sessions"); };
+    const ctx = {
+      cwd: "/project",
+      sessionManager: {
+        getHeader: () => (${JSON.stringify(header("active"))}),
+        getEntries: () => [],
+        getSessionFile: () => ${JSON.stringify(active)},
+        getSessionId: () => "active",
+        getSessionDir: () => ${JSON.stringify(customDir)},
+      },
+    };
+    const reads = [];
+    const options = { now: ${NOW}, outputRoot: ${JSON.stringify(join(root, "outputs"))} };
+    const populated = await loadHistory(ctx, {
+      ...options, sourceReadStarted: (path) => { reads.push(path); },
+    });
+    process.env.PI_CODING_AGENT_DIR = ${JSON.stringify(join(root, "missing-agent"))};
+    const missing = await loadHistory(ctx, options);
+    console.log(JSON.stringify({
+      callIds: populated.calls.map((call) => call.entryId).sort(),
+      reads: reads.sort(),
+      warnings: populated.warnings,
+      missingCallIds: missing.calls.map((call) => call.entryId),
+      missingWarnings: missing.warnings,
+    }));
+  `;
+  const { stdout } = await promisify(execFile)(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module", "--eval", script],
+    {
+      env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+      timeout: 30_000,
+    },
+  );
+  const result = JSON.parse(stdout);
+  assert.deepEqual(result.callIds, ["global-call", "linked-call", "sibling-call"]);
+  assert.deepEqual(result.reads, [global, linked, sibling].sort());
+  assert.deepEqual(result.warnings, []);
+  assert.deepEqual(result.missingCallIds, ["sibling-call"]);
+  assert.deepEqual(result.missingWarnings, []);
+});
+
+test("rejects nonfinite, nonpositive, and over-limit history durations before discovery", async () => {
+  for (const durationMs of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, HISTORY_MAX_AGE_MS + 1]) {
+    await assert.rejects(
+      loadHistory(context(manager({ dir: "/unused" })), {
+        durationMs,
+        listAll: async () => {
+          assert.fail("Invalid ranges must not discover sources");
+        },
+      }),
+      RangeError,
+    );
+  }
+});
+
+test("keeps older rows in a recent source for lineage while deriving only the selected range", async (t) => {
+  const root = await workspace(t);
+  const session = join(root, "recent.jsonl");
+  await writeJsonl(session, [
+    header("recent"),
+    assistant("older-call", null, "provider-a", "model-a", NOW - 10 * HISTORY_DEFAULT_RANGE_MS),
+    assistant("recent-call", "older-call"),
+  ]);
+  await utimes(session, new Date(NOW), new Date(NOW));
+  const history = await loadHistory(context(manager({ dir: root })), {
+    now: NOW,
+    outputRoot: join(root, "outputs"),
+    listAll: async () => [info(session)],
+  });
+  const older = history.calls.find((call) => call.entryId === "older-call");
+  const recent = history.calls.find((call) => call.entryId === "recent-call");
+  assert.ok(older);
+  assert.ok(recent);
+  assert.equal(recent.predecessorKey, older.key);
+  assert.equal(deriveHistoryRange(history, HISTORY_DEFAULT_RANGE_MS).overview.totals.calls, 1);
+});
+
 test("prunes source files using filesystem mtime beyond the boundary tolerance", async (t) => {
   const root = await workspace(t);
   const stale = join(root, "stale.jsonl");
   const boundary = join(root, "boundary.jsonl");
   await writeJsonl(stale, [header("stale"), assistant("stale-call", null)]);
   await writeJsonl(boundary, [header("boundary"), assistant("boundary-call", null)]);
-  const cutoff = NOW - 30 * 24 * 60 * 60 * 1000 - 30 * 60 * 1000;
+  const cutoff = NOW - HISTORY_MAX_AGE_MS - HISTORY_BOUNDARY_TOLERANCE_MS;
   await utimes(stale, new Date(cutoff - 1), new Date(cutoff - 1));
   await utimes(boundary, new Date(cutoff), new Date(cutoff));
 
   const result = await loadHistory(context(manager({ dir: root })), {
     now: NOW,
+    durationMs: HISTORY_MAX_AGE_MS,
     outputRoot: join(root, "outputs"),
     listAll: async () => [info(stale), info(boundary)],
   });
@@ -549,6 +697,7 @@ test("output-only subagents use timestamp-only non-assistant rows for range coun
 
   const history = await loadHistory(context(manager({ dir: root })), {
     now: NOW,
+    durationMs: HISTORY_MAX_AGE_MS,
     outputRoot: outputs,
     listAll: async () => [],
   });

@@ -324,12 +324,15 @@ resolved-auth origin inspection.
 ## Historical usage
 
 Choose **Statistics** from `/usage` to inspect a compact inline, read-only
-historical panel. It opens on **Models** for the rolling **1d** range. Up/Down
+historical panel. It opens on **Models** and collects only the rolling last
+**24 hours** (**1d**). Wider ranges are collected only when selected; **30d** is
+never preloaded. Loaded data is reused when switching back to a covered range.
+Escape during collection cancels it and keeps the previous range. Up/Down
 selects the Tabs and Range rows; Left/Right changes that row's choice.
 Ctrl+Up/Down scrolls the report, and Escape returns to `/usage`. Tab and
 Shift+Tab remain shortcuts for changing tabs, while 1–7 remain hidden range
-shortcuts. The range ends at one fixed time captured when history is
-loaded. The three tabs answer different questions:
+shortcuts. All ranges end at one fixed time captured when the panel is opened.
+The three tabs answer different questions:
 
 - **Models** groups token and recorded-cost totals by exact `provider/model`
   route.

@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import {
   type ExtensionContext,
+  getAgentDir,
   type SessionInfo,
-  SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { isCodexProvider } from "./providers/codex.ts";
 import { SNAPSHOT_ENTRY_TYPE } from "./snapshot.ts";
@@ -18,7 +18,8 @@ import type {
   UsageUnit,
 } from "./types.ts";
 
-export const HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+export const HISTORY_DEFAULT_RANGE_MS = 24 * 60 * 60 * 1000;
+export const HISTORY_MAX_AGE_MS = 30 * HISTORY_DEFAULT_RANGE_MS;
 export const HISTORY_BOUNDARY_TOLERANCE_MS = 30 * 60 * 1000;
 
 export type HistorySourceKind = "active" | "session" | "output";
@@ -112,15 +113,17 @@ export interface LoadedHistory {
   subagents: Array<{ id: string; timestamps: number[] }>;
 }
 
-type ListedSession = Pick<SessionInfo, "path" | "modified">;
+type ListedSession = Pick<SessionInfo, "path">;
 type ListAll = (sessionDir?: string) => Promise<ListedSession[]>;
 
 export interface LoadHistoryOptions {
   signal?: AbortSignal;
   now?: number;
+  /** Source recency window; defaults to 24 hours and cannot exceed 30 days. */
+  durationMs?: number;
   /** Additional Pi session roots or individual project session directories. */
   extraSessionDirs?: readonly string[];
-  /** Test seam for Pi's public, read-only session listing API. */
+  /** Test seam for session discovery; the default lists paths without reading contents. */
   listAll?: ListAll;
   /** Test seam; defaults to pi-subagents' platform-safe temporary root. */
   outputRoot?: string;
@@ -1369,6 +1372,7 @@ async function listExtraSessionPaths(
   root: string,
   warnings: HistoryWarning[],
   signal?: AbortSignal,
+  ignoreMissingRoot = false,
 ): Promise<string[]> {
   const paths: string[] = [];
   const scan = async (dir: string, includeProjectDirs: boolean, symlink = false) => {
@@ -1379,6 +1383,7 @@ async function listExtraSessionPaths(
     } catch (error) {
       checkAbort(signal);
       if (symlink && (error as NodeJS.ErrnoException).code === "ENOTDIR") return;
+      if (ignoreMissingRoot && dir === root && object(error)?.code === "ENOENT") return;
       warning(
         warnings,
         "unreadable-source",
@@ -1391,8 +1396,9 @@ async function listExtraSessionPaths(
     for (const entry of entries) {
       checkAbort(signal);
       const path = join(dir, entry.name);
-      if (entry.isFile() && entry.name.endsWith(".jsonl")) paths.push(path);
-      else if (includeProjectDirs && (entry.isDirectory() || entry.isSymbolicLink())) {
+      if ((entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".jsonl")) {
+        paths.push(path);
+      } else if (includeProjectDirs && (entry.isDirectory() || entry.isSymbolicLink())) {
         await scan(path, false, entry.isSymbolicLink());
       }
     }
@@ -1401,14 +1407,18 @@ async function listExtraSessionPaths(
   return paths;
 }
 
-/** Load and deduplicate all range-independent historical records without writing sources. */
+/** Select recent sources while retaining older rows needed for lineage and range boundaries. */
 export async function loadHistory(
   ctx: Pick<ExtensionContext, "cwd" | "sessionManager">,
   options: LoadHistoryOptions = {},
 ): Promise<LoadedHistory> {
   const signal = options.signal;
   const now = options.now ?? Date.now();
-  const cutoff = now - HISTORY_MAX_AGE_MS - HISTORY_BOUNDARY_TOLERANCE_MS;
+  const durationMs = options.durationMs ?? HISTORY_DEFAULT_RANGE_MS;
+  if (!Number.isFinite(durationMs) || durationMs <= 0 || durationMs > HISTORY_MAX_AGE_MS) {
+    throw new RangeError(`History durationMs must be positive and at most ${HISTORY_MAX_AGE_MS}`);
+  }
+  const cutoff = now - durationMs - HISTORY_BOUNDARY_TOLERANCE_MS;
   const warnings: HistoryWarning[] = [];
   checkAbort(signal);
 
@@ -1432,7 +1442,14 @@ export async function loadHistory(
   const listAll: ListAll =
     options.listAll ??
     (async (sessionDir?: string) =>
-      sessionDir ? SessionManager.listAll(sessionDir) : SessionManager.listAll());
+      (
+        await listExtraSessionPaths(
+          sessionDir ?? join(getAgentDir(), "sessions"),
+          warnings,
+          signal,
+          true,
+        )
+      ).map((path) => ({ path })));
   const listed = await listAll();
   checkAbort(signal);
   const paths = new Set<string>();
