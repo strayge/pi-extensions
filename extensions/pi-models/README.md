@@ -8,8 +8,8 @@ being left and restores the level previously used with the selected model.
 For partial command input such as `/m` or `/mo`, `/models` is suggested before the built-in `/model`.
 
 Rows display `[provider] Model Name`, falling back to the model ID when no name is available.
-Use Up/Down and Enter to select, Ctrl+S to select and save the global default, Ctrl+F to toggle a
-favorite, Ctrl+D to hide/unhide, and Escape to close. The default shortcut follows pi's
+Use Up/Down and Enter to select, Ctrl+S to select and save the global default, Alt+S to star/unstar,
+Alt+H to hide/unhide, and Escape to close. The shortcut for saving the default follows pi's
 `app.models.save` keybinding and leaves thinking-level settings unchanged.
 Favorite and visibility changes are saved even when closing without selecting a model.
 Typing filters the current view by provider, model ID, provider/model ID, or model name.

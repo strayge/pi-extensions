@@ -97,7 +97,7 @@ export class ModelSelector implements Component {
           ? "  No matching models"
           : "  No matching visible models. Tab shows all.",
       position,
-      `Ctrl+F favorite | Ctrl+D ${visibilityAction} | Tab ${this.showHidden ? "show visible" : "show all"}`,
+      `Alt+S star/unstar | Alt+H ${visibilityAction} | Tab ${this.showHidden ? "show visible" : "show all"}`,
       `Enter select${saveHint ? ` | ${saveHint} set default` : ""} | Esc close`,
     ];
     return lines.map((line) => truncateToWidth(line, safe, ""));
@@ -128,11 +128,11 @@ export class ModelSelector implements Component {
         });
         return;
       }
-    } else if (matchesKey(data, Key.ctrl("f")) || matchesKey(data, Key.ctrl("d"))) {
+    } else if (matchesKey(data, Key.alt("s")) || matchesKey(data, Key.alt("h"))) {
       const model = this.models[this.selected];
       if (model) {
         const key = modelKey(model);
-        const field = matchesKey(data, Key.ctrl("f")) ? "favorite" : "hidden";
+        const field = matchesKey(data, Key.alt("s")) ? "favorite" : "hidden";
         const value = !this.options.states[key]?.[field];
         this.options.states[key] = { ...this.options.states[key], [field]: value };
         if (field === "favorite") this.favorites[key] = value;

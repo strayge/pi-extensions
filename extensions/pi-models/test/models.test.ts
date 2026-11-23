@@ -140,8 +140,10 @@ test("favorite toggle retains the highlighted model after resorting", () => {
     },
   });
   selector.handleInput("\x1b[B");
-  selector.handleInput("\x06");
-  assert.ok(selector.render(80).some((line) => line.startsWith("> *[p] second")));
+  selector.handleInput("\x1bs");
+  const lines = selector.render(80);
+  assert.ok(lines.some((line) => line.startsWith("> *[p] second")));
+  assert.ok(lines.some((line) => line.includes("Alt+S star/unstar | Alt+H hide")));
   selector.handleInput("\r");
   assert.deepEqual(result, {
     model: { provider: "p", id: "second" },
@@ -164,8 +166,10 @@ test("saving a default selects the highlighted model and retains preference chan
   });
   selector.handleInput("\x1b[B");
   selector.handleInput("\x06");
+  selector.handleInput("\x1bs");
   selector.handleInput("\t");
   selector.handleInput("\x04");
+  selector.handleInput("\x1bh");
   selector.handleInput("\x13");
   assert.deepEqual(result, {
     model: { provider: "p", id: "b" },
@@ -223,13 +227,13 @@ test("hiding selects the next row, falls back at the end, and saves changes on E
     },
   });
   selector.handleInput("\x1b[B");
-  selector.handleInput("\x04");
+  selector.handleInput("\x1bh");
   assert.ok(selector.render(80).some((line) => line.startsWith(">  [p] c")));
-  selector.handleInput("\x04");
+  selector.handleInput("\x1bh");
   assert.ok(selector.render(80).some((line) => line.startsWith(">  [p] a")));
-  selector.handleInput("\x04");
+  selector.handleInput("\x1bh");
   assert.ok(selector.render(80).some((line) => line.includes("Tab shows all")));
-  selector.handleInput("\x04");
+  selector.handleInput("\x1bh");
   selector.handleInput("\x1b");
   assert.deepEqual(result, {
     favorites: {},
@@ -276,7 +280,7 @@ test("visibility toggles in All dim the row, keep the cursor clear, and preserve
     },
   });
   selector.handleInput("\t");
-  selector.handleInput("\x04");
+  selector.handleInput("\x1bh");
   const hiddenRow = selector.render(80).find((line) => line.startsWith(">"));
   assert.ok(hiddenRow);
   assert.ok(hiddenRow.startsWith("> \x1b[2m*[p] a ✓\x1b[22m"));
@@ -284,7 +288,7 @@ test("visibility toggles in All dim the row, keep the cursor clear, and preserve
   for (const width of [1, 3, 20, 80]) {
     for (const line of selector.render(width)) assert.ok(visibleWidth(line) <= width);
   }
-  selector.handleInput("\x04");
+  selector.handleInput("\x1bh");
   const visibleRow = selector.render(80).find((line) => line.startsWith(">"));
   assert.ok(visibleRow);
   assert.ok(visibleRow.startsWith("> *[p] a ✓"));
@@ -308,7 +312,7 @@ test("allowance suffixes are dim, preserve selection markers, and fit narrow wid
     for (const line of selector.render(width)) assert.ok(visibleWidth(line) <= width);
   }
   selector.handleInput("\t");
-  selector.handleInput("\x04");
+  selector.handleInput("\x1bh");
   assert.ok(
     selector
       .render(100)
